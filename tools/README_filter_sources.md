@@ -1,0 +1,74 @@
+# filter_sources — фильтрация мусорных подписок
+
+Standalone-утилита для очистки `sources.txt` от подписок, которые не отдали
+ни одного конфига, прошедшего первый пинг-тест.
+
+## Что делает
+
+Оставляет в `sources.txt` только те подписки, которые отдали хотя бы один
+конфиг, прошедший первый пинг-тест. Критерий "прошёл пинг":
+
+- узел в `xray_working.json` (прошёл полную проверку, включая пинг), **ИЛИ**
+- узел в `xray_rejected.json` с `latency_ms` не `None` (отклонён на
+  стресс-тесте, а не на пинге).
+
+Мусорные подписки удаляются, чтобы не тратить время на их проверку в
+следующих запусках.
+
+## Требования
+
+- **Windows** (готовый `.exe` в `dist/filter_sources.exe`).
+- Рядом с `.exe` должны лежать (или передаваться аргументами):
+  - `sources.txt` — список подписок для фильтрации;
+  - `xray_working.json` — узлы, прошедшие полную проверку;
+  - `xray_rejected.json` — отклонённые узлы.
+
+> `.exe` собран через PyInstaller и не требует установленного Python.
+
+## Использование
+
+### Быстрый запуск (в проекте sub_generator)
+
+Двойной клик по `run_filter_sources.bat` — скрипт сам подставит пути к данным
+проекта и обновит `sources.txt`.
+
+### Запуск .exe напрямую
+
+По умолчанию `.exe` ищет файлы **рядом с собой**:
+
+```bat
+filter_sources.exe
+```
+
+Можно указать пути явно:
+
+```bat
+filter_sources.exe --sources sources.txt --working xray_working.json --rejected xray_rejected.json
+```
+
+### Режим предпросмотра (без изменения файла)
+
+```bat
+filter_sources.exe --dry-run --sources sources.txt --working xray_working.json --rejected xray_rejected.json
+```
+
+Покажет статистику и список подписок, которые будут удалены, но **не**
+перезапишет `sources.txt`.
+
+## Аргументы
+
+| Аргумент      | Описание                                        | По умолчанию            |
+|---------------|-------------------------------------------------|-------------------------|
+| `--sources`   | Путь к `sources.txt`                            | рядом с `.exe`          |
+| `--working`   | Путь к `xray_working.json`                      | рядом с `.exe`          |
+| `--rejected`  | Путь к `xray_rejected.json`                     | рядом с `.exe`          |
+| `--dry-run`   | Только показать статистику, не изменять файл    | выключено              |
+
+## Пересборка .exe (для разработчика)
+
+```bat
+python -m PyInstaller --onefile --name filter_sources --distpath dist --workpath build --specpath build --noconfirm tools/_filter_sources.py
+```
+
+Исходник: `tools/_filter_sources.py` (только стандартная библиотека Python).
+

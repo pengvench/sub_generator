@@ -1,0 +1,1 @@
+"""Страницы GUI SubGenerator."""

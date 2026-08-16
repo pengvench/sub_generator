@@ -8,7 +8,9 @@ binaries = []
 hiddenimports = [
     'xray_runtime', 'subgen.pipeline', 'subgen.refresh', 'subgen.geo',
     'subgen.output', 'subgen.logging', 'subgen.progress', 'subgen.config',
+    'subgen.checker_thresholds', 'subgen.checker_cache',
     'checkers.dpi', 'checkers.cidr', 'checkers.zapret', 'checkers.base',
+    'checkers.initial_check', 'checkers.telegram_pro', 'checkers.route',
 ]
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

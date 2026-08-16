@@ -32,8 +32,6 @@ class PipelineOptions:
     dpi_cidr: bool = False
     dpi_active: bool = False
     dpi_active_timeout: float = 4.0
-    video_check: bool = False
-    route_check: bool = False
     zapret_check: bool = False
 
     zapret_targets: int = 8
@@ -42,6 +40,8 @@ class PipelineOptions:
     zapret_no_http: bool = False
     start_stage: str = "ping"
     use_cache: bool = False
+    custom_file: str = ""
+
 
 
 
@@ -132,10 +132,6 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
         args.append("--dpi-active")
         if options.dpi_active_timeout != 4.0:
             args += ["--dpi-active-timeout", str(options.dpi_active_timeout)]
-    if options.video_check:
-        args.append("--video-check")
-    if options.route_check:
-        args.append("--route-check")
     if options.zapret_check:
         args += ["--zapret-check"]
         if options.zapret_targets != 8:
@@ -148,9 +144,12 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
             args.append("--zapret-no-http")
     if options.start_stage != "ping":
         args += ["--start-stage", options.start_stage]
+    if options.custom_file:
+        args += ["--custom-file", options.custom_file]
     if sources:
         args += ["--sources"] + sources
     return args
+
 
 
 class PipelineRunner:

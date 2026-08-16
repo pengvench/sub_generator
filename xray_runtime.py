@@ -2004,8 +2004,28 @@ def _fetch_text(
     log_sink: Callable[[str], None] | None = None,
 ) -> str:
     clean_url = str(url or "").strip()
+
+    # Локальный файл (кастомный кеш конфигов, выбранный пользователем):
+    # читаем как есть, а декодирование base64 / извлечение только ссылок
+    # выполняет _subscription_lines ниже по конвейеру.
+    if clean_url.startswith("file://"):
+        local_path = Path(clean_url[len("file://"):])
+    else:
+        local_path = Path(clean_url)
+    if clean_url and local_path.exists() and local_path.is_file():
+        try:
+            data = local_path.read_bytes()
+            if log_sink is not None:
+                log_sink(f"[xray] reading local config file: {local_path}")
+            return _decode_subscription_body(data)
+        except OSError as exc:
+            if log_sink is not None:
+                log_sink(f"[xray] cannot read local config file {local_path}: {exc}")
+            raise RuntimeError("local config file read failed") from exc
+
     errors: list[str] = []
     for candidate_url in _subscription_candidate_urls(clean_url):
+
         headers = _subscription_headers(candidate_url)
         for current_timeout in _subscription_timeouts(timeout):
             for context in _subscription_ssl_contexts():

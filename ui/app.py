@@ -273,14 +273,18 @@ class SubGenApp(ctk.CTk):
             self._show_page("settings")
             return
 
-        if not sources:
+        # Кастомный файл конфигов (страница «Тестирование») заменяет подписки:
+        # можно запускать проверку вообще без sources.txt.
+        if not sources and not options.custom_file:
             self.show_status("Список подписок пуст. Добавьте подписки на странице «Подписки».", error=True)
             self._show_page("sources")
             return
 
 
         # Сохраняем актуальный список подписок перед запуском.
-        self._save_sources_silent(sources)
+        if sources:
+            self._save_sources_silent(sources)
+
 
         args = build_pipeline_args(options, sources)
         # В собранной сборке ps1 лежит рядом с exe, в исходниках — в scripts/.

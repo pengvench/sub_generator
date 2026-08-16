@@ -1,3 +1,9 @@
 /.clinerules
 /build/
 
+# Python-кеш
+__pycache__/
+*.pyc
+
+# Рабочие данные и кеш прогонов (data/ целиком не нужен в git)
+/data/

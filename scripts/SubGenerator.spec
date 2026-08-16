@@ -9,7 +9,9 @@ binaries = []
 hiddenimports = [
     'xray_runtime', 'subgen.pipeline', 'subgen.refresh', 'subgen.geo',
     'subgen.output', 'subgen.logging', 'subgen.progress', 'subgen.config',
+    'subgen.checker_thresholds', 'subgen.checker_cache',
     'checkers.dpi', 'checkers.cidr', 'checkers.zapret', 'checkers.base',
+    'checkers.initial_check', 'checkers.telegram_pro', 'checkers.route',
     'ui.app', 'ui.runner', 'ui.paths', 'ui.tooltip', 'ui.theme', 'ui.main',
     'ui.pages.start_page', 'ui.pages.sources_page', 'ui.pages.log_page',
     'ui.pages.settings_page',

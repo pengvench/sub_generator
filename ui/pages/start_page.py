@@ -29,13 +29,16 @@ HELP = {
     "zapret": "Проверка обхода блокировок по методу zapret.",
     "telegram": "Проверка Telegram: медиа, MTProto, скорость. Узлы без Telegram отбрасываются.",
     "dpi_active": "Активная DPI-проверка протокола узла (SNI, ClientHello, ECH, TLS 1.2/1.3).",
-    "video_check": "Видео-тестирование: YouTube + DASH-сегменты, скорость и джиттер.",
-    "route_check": "Стабильность маршрута: RTT, джиттер и packet loss.",
     "use_cache": "Запустить проверку с сохранённого кеша прошлого прогона "
                  "(data/.runtime_cache): пинг и стресс-тест не повторяются, "
                  "проверки запускаются с выбранного в «Настройках» этапа. "
                  "Если сохранённых конфигов нет — тумблер выключен.",
+    "custom_file": "Загрузить конфиги из локального файла (например, сохранённый "
+                   "кеш с прошлого прогона). Base64 декодируется, берутся только "
+                   "ссылки-конфиги (vless/vmess/trojan/ss/hy2), остальной текст "
+                   "игнорируется.",
 }
+
 
 
 
@@ -83,8 +86,6 @@ class StartPage(ctk.CTkFrame):
         self.toggle_zapret = self._make_toggle(inner_what, 1, 1, "Zapret (обход DPI)", HELP["zapret"], default=False)
         self.toggle_telegram = self._make_toggle(inner_what, 2, 0, "Telegram (загрузка/выгрузка)", HELP["telegram"], default=True)
         self.toggle_dpi_active = self._make_toggle(inner_what, 2, 1, "DPI-актив (SNI/ECH/TLS)", HELP["dpi_active"], default=False)
-        self.toggle_video_check = self._make_toggle(inner_what, 3, 0, "Видео (YouTube/DASH)", HELP["video_check"], default=False)
-        self.toggle_route_check = self._make_toggle(inner_what, 3, 1, "Стабильность маршрута", HELP["route_check"], default=False)
 
 
         # --- содержимое: «Скорость тестирования» (2 столбика) ---
@@ -103,7 +104,39 @@ class StartPage(ctk.CTkFrame):
         self.toggle_no_stress = self._make_toggle(inner_extra, 0, 0, "Без нагрузочного теста", HELP["no_stress"], default=False)
         self.toggle_plain = self._make_toggle(inner_extra, 0, 1, "Только обычные подключения", HELP["plain"], default=False)
         self.toggle_use_cache = self._make_toggle(inner_extra, 1, 0, "С сохранённого кеша", HELP["use_cache"], default=False)
+        self.toggle_custom_file = self._make_toggle(inner_extra, 1, 1, "Свой файл конфигов", HELP["custom_file"], default=False)
         self.limit = self._make_entry(inner_extra, 2, 0, "Лимит узлов (0 = без лимита)", "0", help=HELP["limit"])
+
+        # Строка выбора файла (столбец 2, строка 2): label + entry + «Обзор…» + «✕».
+        # Entry доступен только при включённом toggle_custom_file.
+        frame_custom = ctk.CTkFrame(inner_extra, fg_color="transparent")
+        frame_custom.grid(row=2, column=1, padx=6, pady=4, sticky="ew")
+        frame_custom.grid_columnconfigure(0, weight=1)
+
+        self.custom_file_entry = ctk.CTkEntry(frame_custom, width=110, justify="left", placeholder_text="путь к файлу")
+        self.custom_file_entry.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+
+        self.btn_custom_browse = ctk.CTkButton(
+            frame_custom, text="Обзор…", width=70, height=26,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER, text_color="#0C1014",
+            font=ctk.CTkFont(size=11),
+            command=self._browse_custom_file,
+        )
+        self.btn_custom_browse.grid(row=0, column=1, padx=(0, 4))
+
+        self.btn_custom_clear = ctk.CTkButton(
+            frame_custom, text="✕", width=28, height=26,
+            fg_color="transparent", hover_color=theme.BORDER, text_color=theme.MUTED,
+            font=ctk.CTkFont(size=12),
+            command=self._clear_custom_file,
+        )
+        self.btn_custom_clear.grid(row=0, column=2)
+
+        self.toggle_custom_file.configure(
+            command=lambda _=None: self._sync_custom_file_controls()
+        )
+        self._sync_custom_file_controls()
+
 
 
         # ---------------- Кнопка запуска ----------------
@@ -227,6 +260,39 @@ class StartPage(ctk.CTkFrame):
         entry.insert(0, default)
         return entry
 
+    # ------------------------------------------------------------ custom file
+    def _browse_custom_file(self) -> None:
+        """Открыть диалог выбора файла с конфигами и подставить путь в entry."""
+        from tkinter import filedialog
+
+
+        path = filedialog.askopenfilename(
+            title="Выберите файл с конфигами",
+            filetypes=[
+                ("Все файлы", "*.*"),
+                ("Текстовые файлы", "*.txt"),
+                ("Подписки", "*.txt;*.conf;*.list"),
+            ],
+        )
+        if path:
+            self.custom_file_entry.delete(0, "end")
+            self.custom_file_entry.insert(0, path)
+
+    def _clear_custom_file(self) -> None:
+        """Очистить путь к файлу и выключить тумблер."""
+        self.custom_file_entry.delete(0, "end")
+        if self.toggle_custom_file.get():
+            self.toggle_custom_file.deselect()
+        self._sync_custom_file_controls()
+
+    def _sync_custom_file_controls(self) -> None:
+        """Включать/блокировать элементы выбора файла по состоянию тумблера."""
+        enabled = bool(self.toggle_custom_file.get())
+        state = "normal" if enabled else "disabled"
+        self.custom_file_entry.configure(state=state)
+        self.btn_custom_browse.configure(state=state)
+        self.btn_custom_clear.configure(state=state)
+
     # ------------------------------------------------------------ options
     @staticmethod
     def _int_value(entry, default: int) -> int:
@@ -246,6 +312,9 @@ class StartPage(ctk.CTkFrame):
         dpi_check = bool(self.toggle_dpi.get())
         # Страховка: siberian/cidr учитываются только при включённой DPI-проверке
         # (тумблеры физически заблокированы, но защищаемся от программных select).
+        custom_file = ""
+        if self.toggle_custom_file.get():
+            custom_file = self.custom_file_entry.get().strip()
         return PipelineOptions(
             workers=self._int_value(self.workers, 32),
             timeout=self._float_value(self.timeout, 15.0),
@@ -260,10 +329,10 @@ class StartPage(ctk.CTkFrame):
             dpi_cidr=bool(self.toggle_cidr.get()) if dpi_check else False,
             zapret_check=self.toggle_zapret.get(),
             dpi_active=bool(self.toggle_dpi_active.get()),
-            video_check=bool(self.toggle_video_check.get()),
-            route_check=bool(self.toggle_route_check.get()),
             use_cache=bool(self.toggle_use_cache.get()),
+            custom_file=custom_file,
         )
+
 
     def refresh_cache_toggle(self) -> None:
         """Включить/выключить тумблер запуска с сохранённого кеша.

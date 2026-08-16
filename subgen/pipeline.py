@@ -11,10 +11,10 @@ from typing import Any
 
 from checkers import DPI_DEFAULT_TARGET, check_node_dpi_detailed
 from checkers.base import run_with_node
+from checkers.initial_check import run_initial_check, format_result as format_initial_check_result
 from checkers.dpi_active import DPI_ACTIVE_MIN_SCORE, DpiActiveResult, check_node_dpi_active_detailed
 
 from checkers.telegram_pro import TG_TIMEOUT, TelegramProResult, check_node_telegram_pro_detailed
-from checkers.video import VIDEO_SEGMENT_TIMEOUT, VideoCheckResult, check_node_video_detailed
 from checkers.route import (
     ROUTE_PROBE_TIMEOUT,
     ROUTE_PROBES,
@@ -40,6 +40,8 @@ from subgen.output import (
 )
 from subgen.progress import _PowerShellProgress
 from subgen.refresh import run_refresh
+from subgen.checker_thresholds import get_threshold
+from subgen.checker_cache import check_cached, cache_result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", default="report.json", help="JSON-отчёт.")
     parser.add_argument("--geo-cache", default="geo_cache.json", help="Файл кеша geoip.")
     parser.add_argument("--sources", nargs="*", default=None, help="Список URL подписок.")
+    parser.add_argument("--custom-file", default="", help="Локальный файл с конфигами (например, сохранённый кеш с прошлого прогона). Файл читается как есть: base64 декодируется, извлекаются только ссылки-конфиги.")
+
     parser.add_argument("--workers", type=int, default=4, help="Потоков стресс-теста (по умолчанию 4).")
     parser.add_argument("--timeout", type=float, default=8.0, help="Таймаут проверки, сек (по умолчанию 8).")
     parser.add_argument("--limit", type=int, default=0, help="Максимум узлов после проверки (0 = без лимита).")
@@ -68,9 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dpi-active", action="store_true", help="Включить активную DPI-проверку протокола узла (SNI-варианты, фрагментация/большой ClientHello, ECH, TLS 1.2/1.3).")
     parser.add_argument("--dpi-active-timeout", type=float, default=4.0, help="Таймаут одного варианта активной DPI-проверки, сек (по умолчанию 4).")
     parser.add_argument("--telegram-pro", action="store_true", help="УСТАРЕЛО: продвинутые Telegram-проверки (MTProto connect/auth, upload/download) и telegram_score теперь выполняются автоматически при включённом Telegram. Флаг оставлен для обратной совместимости (игнорируется, если не задан --no-telegram).")
-    parser.add_argument("--video-check", action="store_true", help="Включить потоковое видео-тестирование (YouTube + DASH-сегменты).")
-    parser.add_argument("--route-check", action="store_true", help="Включить проверку стабильности маршрута (RTT, jitter, loss).")
     parser.add_argument("--zapret-check", action="store_true", help="Включить Zapret-проверку (DPI suite tcp 16-20 + HTTP test, методика C:\\Zapret).")
+    parser.add_argument("--initial-check-timeout", type=float, default=3.0, help="Таймаут начальной проверки доступности (TCP+HTTP HEAD), сек (по умолчанию 3).")
 
     parser.add_argument("--zapret-out", default="subs_zapret.txt", help="Подписка узлов, прошедших Zapret-проверку.")
     parser.add_argument("--zapret-working", default="working_zapret.txt", help="Рабочие конфиги, прошедшие Zapret-проверку.")
@@ -100,6 +103,11 @@ def _resolve_path(value: str) -> Path:
 
 
 def _load_sources(args: argparse.Namespace) -> list[str]:
+    custom = str(args.custom_file or "").strip()
+    if custom:
+        path = Path(custom).expanduser().resolve()
+        log(f"[sub] custom config file: {path}")
+        return [str(path)]
     if args.sources is not None:
         return [str(u).strip() for u in args.sources if str(u).strip()]
     try:
@@ -111,6 +119,7 @@ def _load_sources(args: argparse.Namespace) -> list[str]:
     except OSError:
         log(f"[sub] WARNING: не найден {DEFAULT_SOURCES_FILE}, используем --sources или пустой список")
         return []
+
 
 
 def _load_cached_working() -> list[Any]:
@@ -175,19 +184,17 @@ def run(
     # ---------------------------------------------------------------------
     progress = _PowerShellProgress()
     progress.add_stage("load", 0.05, total=len(sources))
-    progress.add_stage("ping", 0.30, total=1)
+    progress.add_stage("ping", 0.25, total=1)
     if not args.no_stress:
-        progress.add_stage("stress", 0.40, total=1)
+        progress.add_stage("stress", 0.35, total=1)
+    progress.add_stage("initial_check", 0.10, total=1)
     if args.dpi_check:
         progress.add_stage("dpi", 0.15, total=1)
     if args.dpi_active:
         progress.add_stage("dpi_active", 0.10, total=1)
     if not args.no_telegram:
         progress.add_stage("telegram_pro", 0.10, total=1)
-    if args.video_check:
-        progress.add_stage("video", 0.10, total=1)
-    if args.route_check:
-        progress.add_stage("route", 0.10, total=1)
+    progress.add_stage("route", 0.10, total=1)
     if args.zapret_check:
         progress.add_stage("zapret", 0.15, total=1)
     progress.add_stage("recheck", 0.05, total=1)
@@ -195,10 +202,10 @@ def run(
 
     ping_idx = progress.stage_index("ping")
     stress_idx = progress.stage_index("stress")
+    initial_idx = progress.stage_index("initial_check")
     dpi_idx = progress.stage_index("dpi")
     dpi_active_idx = progress.stage_index("dpi_active")
     telegram_pro_idx = progress.stage_index("telegram_pro")
-    video_idx = progress.stage_index("video")
     route_idx = progress.stage_index("route")
     zapret_idx = progress.stage_index("zapret")
     recheck_idx = progress.stage_index("recheck")
@@ -281,25 +288,88 @@ def run(
             progress.finish_stage(stress_idx, f"[stress] пропущен (перепроверка с {start_stage})")
 
         # Если начинаем с zapret/recheck — пропускаем все предшествующие проверки
-        # (обычную DPI, активную DPI, Telegram-pro, видео, маршрут).
+        # (обычную DPI, активную DPI, Telegram-pro).
         if start_stage in ("zapret", "recheck"):
             args.dpi_check = False
             args.dpi_active = False
             args.no_telegram = True
-            args.video_check = False
-            args.route_check = False
+            for _stage_name, _stage_idx in (
+                ("dpi", dpi_idx),
+                ("dpi_active", dpi_active_idx),
+                ("telegram_pro", telegram_pro_idx),
+            ):
+                if _stage_idx >= 0 and not progress.is_completed(_stage_idx):
+                    progress.finish_stage(_stage_idx, f"[{_stage_name}] пропущен (перепроверка с {start_stage})")
         # Если начинаем с recheck — пропускаем также Zapret.
         if start_stage == "recheck":
             args.zapret_check = False
 
+    # ---------------------------------------------------------------------
+    # Initial Check: быстрая проверка доступности (TCP + HTTP HEAD).
+    # Обязательный системный этап первичного отсева (Fail Fast): отсеивает
+    # мёртвые узлы за 2-3 сек ДО дорогих проверок. Выполняется при полном
+    # прогоне; при перепроверке с этапа узлы уже проверены — пропускаем.
+    # ---------------------------------------------------------------------
+    initial_check_report: dict[str, Any] = {}
+    if start_stage == "ping":
+        initial_orig_count = len(working)
+        log(f"[sub] Initial check enabled, timeout={args.initial_check_timeout}s, checking {initial_orig_count} nodes...")
+        if initial_idx >= 0:
+            progress.start_stage(initial_idx, f"Initial check {initial_orig_count} узлов")
+            progress.set_total(initial_idx, initial_orig_count)
 
+        checked_initial: list[Any] = []
+        failed_initial = 0
+        initial_node_details: dict[str, Any] = {}
+        for idx, w in enumerate(working, 1):
+            if cancel_event and cancel_event.is_set():
+                raise RuntimeError("refresh_cancelled")
+            while pause_event and pause_event.is_set():
+                if cancel_event and cancel_event.is_set():
+                    raise RuntimeError("refresh_cancelled")
+                time.sleep(0.2)
+            if initial_idx >= 0:
+                progress.update(idx, f"Initial {w.node.title()}")
+
+            proxy_url = w.node.raw_url
+            res = run_initial_check({}, proxy_url, timeout=args.initial_check_timeout)
+            initial_node_details[w.node.title()] = res
+            if res["passed"]:
+                checked_initial.append(w)
+                log(f"[initial] PASS {idx}/{initial_orig_count}: {w.node.title()} ({format_initial_check_result(res)})")
+            else:
+                failed_initial += 1
+                log(f"[initial] FAIL {idx}/{initial_orig_count}: {w.node.title()} ({format_initial_check_result(res)})")
+
+        if initial_idx >= 0:
+            progress.finish_stage(
+                initial_idx,
+                f"[initial] done: {len(checked_initial)} passed, {failed_initial} failed",
+            )
+
+        working = checked_initial
+        if failed_initial > 0:
+            log(f"[sub] filtered out {failed_initial} nodes that failed initial check")
+
+        initial_check_report = {
+            "enabled": True,
+            "checked": initial_orig_count,
+            "passed": len(checked_initial),
+            "failed": failed_initial,
+            "nodes": initial_node_details,
+        }
+    else:
+        if initial_idx >= 0 and not progress.is_completed(initial_idx):
+            progress.finish_stage(initial_idx, f"[initial] пропущен (перепроверка с {start_stage})")
 
     # DPI-проверка (обход блокировок) через XrayCoreRuntime.
     if args.dpi_check:
+        timeout = get_threshold("dpi", "timeout", 10.0)
+        require_siberian = args.dpi_siberian or get_threshold("dpi", "require_siberian", False)
+        require_cidr = args.dpi_cidr or get_threshold("dpi", "require_cidr", False)
+        
         orig_dpi_count = len(working)
         target = args.dpi_target or DPI_DEFAULT_TARGET
-        require_siberian = args.dpi_siberian
-        require_cidr = args.dpi_cidr
         log(
             f"[sub] DPI check enabled, target={target}, siberian={'on' if require_siberian else 'info'} "
             f"cidr={'on' if require_cidr else 'info'}, checking {orig_dpi_count} nodes..."
@@ -320,6 +390,10 @@ def run(
             "unlikely": "unlikely ⚠️",
             "detected": "detected ❗️",
         }
+        
+        # Проверяем кэш если включён
+        cache_enabled = get_threshold("cache", "enabled", True)
+        
         for idx, w in enumerate(working, 1):
             if cancel_event and cancel_event.is_set():
                 raise RuntimeError("refresh_cancelled")
@@ -330,21 +404,40 @@ def run(
             if dpi_idx >= 0:
                 progress.update(idx, f"DPI {w.node.title()}")
 
-            res = check_node_dpi_detailed(
-                w.node.raw_url,
-                target_host=target,
-                timeout=10.0,
-                require_siberian=require_siberian,
-                require_cidr=require_cidr,
-            )
-            tcp_label = _tcp_labels.get(res.tcp1620_level, res.tcp1620_level)
-            if res.accepted:
+            # Проверка кэша
+            cached_passed = None
+            if cache_enabled:
+                cached_passed, _ = check_cached(w.node.raw_url, "dpi")
+            
+            if cached_passed is not None:
+                # Используем кэшированный результат
+                res = None  # заглушка, т.к. нет детального результата из кэша
+                passed = cached_passed
+                log(f"[dpi] CACHED {'PASS' if passed else 'FAIL'} {idx}/{orig_dpi_count}: {w.node.title()}")
+            else:
+                # Выполняем реальную проверку
+                res = check_node_dpi_detailed(
+                    w.node.raw_url,
+                    target_host=target,
+                    timeout=timeout,
+                    require_siberian=require_siberian,
+                    require_cidr=require_cidr,
+                )
+                passed = res.accepted
+                
+                # Сохраняем в кэш
+                if cache_enabled:
+                    cache_result(w.node.raw_url, "dpi", passed, res.row() if res else {})
+            
+            tcp_label = _tcp_labels.get(res.tcp1620_level, res.tcp1620_level) if res else "cached"
+            if passed:
                 checked.append(w)
                 append_text(working_dpi_path, w.node.raw_url + "\n")
-                log(f"[dpi] PASS {idx}/{orig_dpi_count}: {w.node.title()} (tcp 16-20: {tcp_label}, siberian={res.siberian}, cidr={res.cidr})")
+                log(f"[dpi] PASS {idx}/{orig_dpi_count}: {w.node.title()} (tcp 16-20: {tcp_label})")
             else:
                 failed += 1
-                log(f"[dpi] FAIL {idx}/{orig_dpi_count}: {w.node.title()} (tcp 16-20: {tcp_label}, siberian={res.siberian}, cidr={res.cidr}, reason={res.reason})")
+                reason = res.reason if res else "cached_fail"
+                log(f"[dpi] FAIL {idx}/{orig_dpi_count}: {w.node.title()} (reason={reason})")
         if dpi_idx >= 0:
             progress.finish_stage(dpi_idx, f"[dpi] done: {len(checked)} passed, {failed} failed")
 
@@ -485,83 +578,22 @@ def run(
             "nodes": telegram_pro_node_details,
         }
 
-    # Потоковое видео-тестирование (YouTube 1080p/4K доступность + 20 DASH-сегментов):
-    # средняя скорость, джиттер, количество таймаутов.
-    video_report: dict[str, Any] = {}
-    if args.video_check:
-        video_orig_count = len(working)
-        log(
-            f"[sub] VIDEO check enabled, segments=20x2MB, checking {video_orig_count} nodes..."
-        )
-        if video_idx >= 0:
-            progress.start_stage(video_idx, f"видео-проверка {video_orig_count} узлов")
-            progress.set_total(video_idx, video_orig_count)
-
-        checked_video: list[Any] = []
-        failed_video = 0
-        video_node_details: dict[str, Any] = {}
-        for idx, w in enumerate(working, 1):
-            if cancel_event and cancel_event.is_set():
-                raise RuntimeError("refresh_cancelled")
-            while pause_event and pause_event.is_set():
-                if cancel_event and cancel_event.is_set():
-                    raise RuntimeError("refresh_cancelled")
-                time.sleep(0.2)
-            if video_idx >= 0:
-                progress.update(idx, f"Video {w.node.title()}")
-
-            res: VideoCheckResult = check_node_video_detailed(
-                w.node.raw_url,
-                timeout=VIDEO_SEGMENT_TIMEOUT,
-            )
-            video_node_details[w.node.title()] = res.row()
-            if res.accepted:
-                checked_video.append(w)
-                log(
-                    f"[video] PASS {idx}/{video_orig_count}: {w.node.title()} "
-                    f"(youtube={res.youtube} avg={res.avg_speed_kbps}KB/s "
-                    f"jitter={res.jitter_kbps}KB/s timeouts={res.timeouts}/{res.segments_total})"
-                )
-            else:
-                failed_video += 1
-                log(
-                    f"[video] FAIL {idx}/{video_orig_count}: {w.node.title()} "
-                    f"(youtube={res.youtube} avg={res.avg_speed_kbps}KB/s "
-                    f"jitter={res.jitter_kbps}KB/s timeouts={res.timeouts}/{res.segments_total} "
-                    f"reason={res.reason})"
-                )
-        if video_idx >= 0:
-            progress.finish_stage(
-                video_idx,
-                f"[video] done: {len(checked_video)} passed, {failed_video} failed",
-            )
-
-        working = checked_video
-        if failed_video > 0:
-            log(f"[sub] filtered out {failed_video} nodes that failed video check")
-
-        video_report = {
-            "enabled": True,
-            "checked": video_orig_count,
-            "passed": len(checked_video),
-            "failed": failed_video,
-            "nodes": video_node_details,
-        }
-
+    # ---------------------------------------------------------------------
     # Проверка стабильности маршрута (RTT: ping_avg/ping_p95/jitter/loss).
-    # Скорость 300 Мбит/с ничего не значит при loss = 8%.
+    # Системный этап: не фильтрует узлы (Pass/Fail), а только обогащает отчёт
+    # метаданными маршрута (для geo-тегирования и диагностики). Всегда включён
+    # при полном прогоне, скрыт из UI.
+    # ---------------------------------------------------------------------
     route_report: dict[str, Any] = {}
-    if args.route_check:
+    if start_stage == "ping":
         route_orig_count = len(working)
         log(
-            f"[sub] ROUTE check enabled, probes={ROUTE_PROBES}, checking {route_orig_count} nodes..."
+            f"[sub] ROUTE trace enabled, probes={ROUTE_PROBES}, checking {route_orig_count} nodes..."
         )
         if route_idx >= 0:
-            progress.start_stage(route_idx, f"стабильность маршрута {route_orig_count} узлов")
+            progress.start_stage(route_idx, f"трассировка маршрута {route_orig_count} узлов")
             progress.set_total(route_idx, route_orig_count)
 
-        checked_route: list[Any] = []
-        failed_route = 0
         route_node_details: dict[str, Any] = {}
         for idx, w in enumerate(working, 1):
             if cancel_event and cancel_event.is_set():
@@ -578,37 +610,25 @@ def run(
                 timeout=ROUTE_PROBE_TIMEOUT,
             )
             route_node_details[w.node.title()] = res.row()
-            if res.accepted:
-                checked_route.append(w)
-                log(
-                    f"[route] PASS {idx}/{route_orig_count}: {w.node.title()} "
-                    f"(avg={res.ping_avg}ms p95={res.ping_p95}ms jitter={res.jitter}ms "
-                    f"loss={res.loss} {res.probes_ok}/{res.probes_total})"
-                )
-            else:
-                failed_route += 1
-                log(
-                    f"[route] FAIL {idx}/{route_orig_count}: {w.node.title()} "
-                    f"(avg={res.ping_avg}ms p95={res.ping_p95}ms jitter={res.jitter}ms "
-                    f"loss={res.loss} {res.probes_ok}/{res.probes_total} reason={res.reason})"
-                )
+            log(
+                f"[route] {idx}/{route_orig_count}: {w.node.title()} "
+                f"(avg={res.ping_avg}ms p95={res.ping_p95}ms jitter={res.jitter}ms "
+                f"loss={res.loss} {res.probes_ok}/{res.probes_total} reason={res.reason})"
+            )
         if route_idx >= 0:
             progress.finish_stage(
                 route_idx,
-                f"[route] done: {len(checked_route)} passed, {failed_route} failed",
+                f"[route] done: {route_orig_count} nodes traced",
             )
-
-        working = checked_route
-        if failed_route > 0:
-            log(f"[sub] filtered out {failed_route} nodes that failed route stability check")
 
         route_report = {
             "enabled": True,
             "checked": route_orig_count,
-            "passed": len(checked_route),
-            "failed": failed_route,
             "nodes": route_node_details,
         }
+    else:
+        if route_idx >= 0 and not progress.is_completed(route_idx):
+            progress.finish_stage(route_idx, f"[route] пропущен (перепроверка с {start_stage})")
 
     # Zapret-проверка (методика C:\Zapret: DPI suite tcp 16-20 + HTTP test).
     zapret_report: dict[str, Any] = {}
@@ -904,9 +924,9 @@ def run(
         "rejected": len(rejected),
         "exported": len(rows),
         "geo_unknown": sum(1 for r in rows if r["country_code"] == GEOIP_FALLBACK_CODE),
+        "initial_check": initial_check_report,
         "dpi_active": dpi_active_report,
         "telegram_pro": telegram_pro_report,
-        "video": video_report,
         "route": route_report,
         "zapret": zapret_report,
         "recheck": recheck_report,

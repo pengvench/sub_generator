@@ -10,7 +10,6 @@
   (SNI-варианты, фрагментация/большой ClientHello, ECH, TLS 1.2/1.3);
 - ``checkers.telegram_pro`` — продвинутые Telegram-проверки (MTProto
   connect/auth, upload/download) и ``telegram_score``;
-- ``checkers.video`` — потоковое видео-тестирование (YouTube/DASH);
 - ``checkers.route`` — стабильность маршрута (RTT, jitter, loss).
 """
 
@@ -49,11 +48,6 @@ from .telegram_pro import (
     check_node_telegram_pro,
     check_node_telegram_pro_detailed,
 )
-from .video import (
-    VideoCheckResult,
-    check_node_video,
-    check_node_video_detailed,
-)
 from .route import (
     RouteCheckResult,
     check_node_route,
@@ -68,7 +62,6 @@ __all__ = [
     "check_node_dpi",
     "check_node_dpi_detailed",
     "CidrCheckResult",
-
     "check_node_cidr",
     "check_node_cidr_detailed",
     "DPI_SUITE_URL",
@@ -86,9 +79,6 @@ __all__ = [
     "TelegramProResult",
     "check_node_telegram_pro",
     "check_node_telegram_pro_detailed",
-    "VideoCheckResult",
-    "check_node_video",
-    "check_node_video_detailed",
     "RouteCheckResult",
     "check_node_route",
     "check_node_route_detailed",

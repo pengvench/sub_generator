@@ -40,6 +40,14 @@ logger = logging.getLogger(__name__)
 
 # URL suite-целей (как Get-DpiSuite в Zapret).
 DPI_SUITE_URL = "https://hyperion-cs.github.io/dpi-checkers/ru/tcp-16-20/suite.v2.json"
+# Резервный источник того же suite: GitHub Pages у hyperion-cs периодически
+# не отвечает (TLS handshake таймаутит). Файл в репозитории идентичен.
+DPI_SUITE_URL_RAW = "https://raw.githubusercontent.com/hyperion-cs/dpi-checkers/main/ru/tcp-16-20/suite.v2.json"
+# Локальная копия suite (скачана на случай недоступности GitHub — например,
+# когда сам GitHub временно лежит). Используется после сетевых источников
+# и перед встроенным fallback.
+_LOCAL_SUITE_PATH = Path(__file__).resolve().parent / "suite.v2.json"
+
 # Таймаут на один протокол-тест одной цели (сек).
 ZAPRET_TIMEOUT = 5.0
 # Размер payload (как `--range 0-65535` в Zapret, 64KB).
@@ -193,6 +201,70 @@ class ZapretCheckResult:
         }
 
 
+def _parse_suite(data: list) -> list[ZapretTarget]:
+    """Распарсить suite.v2.json в список ZapretTarget (без пустых хостов)."""
+    targets: list[ZapretTarget] = []
+    for item in data:
+        host = str(item.get("host", "")).strip()
+        if not host:
+            continue
+        targets.append(
+            ZapretTarget(
+                id=str(item.get("id", "")),
+                provider=str(item.get("provider", "")),
+                country=str(item.get("country", "")),
+                host=host,
+            )
+        )
+    return targets
+
+
+def _fetch_suite_json(url: str, fetch_timeout: float) -> list | None:
+    """Скачать suite.v2.json по url, вернуть список целей или None."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "SubGenerator/1.0"})
+        with urllib.request.urlopen(req, timeout=fetch_timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, list):
+            return None
+        return _parse_suite(data)
+    except Exception as exc:
+        logger.warning("DPI suite: источник %s недоступен (%s)", url, exc)
+        return None
+
+
+def _select_targets(targets: list[ZapretTarget], max_targets: int) -> list[ZapretTarget]:
+    """Равномерно выбрать до max_targets целей разных провайдеров."""
+    selected: list[ZapretTarget] = []
+    seen: set[str] = set()
+    for t in targets:
+        if t.provider not in seen:
+            selected.append(t)
+            seen.add(t.provider)
+        if len(selected) >= max_targets:
+            break
+    if len(selected) < max_targets:
+        for t in targets:
+            if all(t.host != s.host for s in selected):
+                selected.append(t)
+            if len(selected) >= max_targets:
+                break
+    return selected[:max_targets]
+
+
+def _load_local_suite() -> list[ZapretTarget] | None:
+    """Прочитать локальную копию suite.v2.json (запас на случай падения GitHub)."""
+    try:
+        with _LOCAL_SUITE_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, list):
+            return None
+        return _parse_suite(data)
+    except Exception as exc:
+        logger.warning("DPI suite: локальный файл %s недоступен (%s)", _LOCAL_SUITE_PATH, exc)
+        return None
+
+
 def load_dpi_suite(
     url: str = DPI_SUITE_URL,
     max_targets: int = ZAPRET_MAX_TARGETS,
@@ -200,55 +272,34 @@ def load_dpi_suite(
 ) -> list[ZapretTarget]:
     """Загрузить suite-цели (как Get-DpiSuite в Zapret).
 
-    Пытается получить suite.v2.json с GitHub Pages. При недоступности
-    (нет прямого интернета) использует встроенные хосты.
-
-    Из всего списка выбирается ``max_targets`` целей так, чтобы охватить
-    как можно больше разных провайдеров (равномерное распределение).
+    Порядок источников:
+    1. GitHub Pages (DPI_SUITE_URL) — актуальный suite.
+    2. raw.githubusercontent.com (DPI_SUITE_URL_RAW) — тот же файл.
+    3. Локальная копия (_LOCAL_SUITE_PATH) — запас на случай падения GitHub.
+    4. Встроенные хосты (_FALLBACK_TARGETS) — совсем без сети.
     """
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "SubGenerator/1.0"})
-        with urllib.request.urlopen(req, timeout=fetch_timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        targets: list[ZapretTarget] = []
-        for item in data:
-            host = str(item.get("host", "")).strip()
-            if not host:
-                continue
-            targets.append(
-                ZapretTarget(
-                    id=str(item.get("id", "")),
-                    provider=str(item.get("provider", "")),
-                    country=str(item.get("country", "")),
-                    host=host,
-                )
-            )
+    for source_url in (url, DPI_SUITE_URL_RAW):
+        targets = _fetch_suite_json(source_url, fetch_timeout)
         if targets:
-            # Равномерно выбираем разных провайдеров.
-            selected: list[ZapretTarget] = []
-            seen: set[str] = set()
-            for t in targets:
-                if t.provider not in seen:
-                    selected.append(t)
-                    seen.add(t.provider)
-                if len(selected) >= max_targets:
-                    break
-            # Если провайдеров меньше лимита — добираем оставшимися.
-            if len(selected) < max_targets:
-                for t in targets:
-                    if all(t.host != s.host for s in selected):
-                        selected.append(t)
-                    if len(selected) >= max_targets:
-                        break
-            logger.info("DPI suite: %d целей (из %d)", len(selected), len(targets))
-            return selected[:max_targets]
-        logger.warning("DPI suite пуст, использую встроенные цели")
-    except Exception as exc:
-        logger.warning("DPI suite недоступен (%s), использую встроенные цели", exc)
+            selected = _select_targets(targets, max_targets)
+            logger.info("DPI suite: %d целей (из %d) из %s", len(selected), len(targets), source_url)
+            return selected
+    targets = _load_local_suite()
+    if targets:
+        selected = _select_targets(targets, max_targets)
+        logger.info(
+            "DPI suite: %d целей (из %d) из локального файла %s",
+            len(selected),
+            len(targets),
+            _LOCAL_SUITE_PATH,
+        )
+        return selected
+    logger.warning("DPI suite недоступен, использую встроенные цели")
     return [
         ZapretTarget(id=t[0], provider=t[1], country=t[2], host=t[3])
         for t in _FALLBACK_TARGETS[:max_targets]
     ]
+
 
 
 def _classify_tls_error(exc: ssl.SSLError, result: ZapretProbeResult) -> ZapretProbeResult:

@@ -51,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Путь к xray_rejected.json")
     parser.add_argument("--dry-run", action="store_true",
                         help="Не перезаписывать sources.txt, только показать статистику")
+    parser.add_argument("--force", action="store_true",
+                        help="Перезаписать sources.txt, даже если не совпало ни одной подписки")
     args = parser.parse_args(argv)
 
     sources_path = Path(args.sources)
@@ -91,7 +93,28 @@ def main(argv: list[str] | None = None) -> int:
     kept = [ln for ln in lines if norm(ln) in good_norm]
     removed = [ln for ln in lines if norm(ln) not in good_norm]
 
-    if not args.dry_run:
+    # Защита от массовой отбраковки: если xray_working.json/xray_rejected.json —
+    # старый кеш (например, от прогона с --limit или с другим набором подписок),
+    # в нём просто нет источников из текущего sources.txt. Перезаписывать файл
+    # (и фактически вычищать его) можно только явно через --force.
+    mass_removal = lines and len(kept) == 0
+    if not args.dry_run and mass_removal and not args.force:
+        print(
+            "ВНИМАНИЕ: ни одна подписка из sources.txt не найдена в результатах проверки.",
+            file=sys.stderr,
+        )
+        print(
+            "Возможно, xray_working.json/xray_rejected.json — это кеш от прогона с другим "
+            "набором подписок или с --limit (в кеш попадают только источники проверенных "
+            "узлов). Файл НЕ изменён.",
+            file=sys.stderr,
+        )
+        print(
+            "Чтобы всё же перезаписать sources.txt, запустите с флагом --force.",
+            file=sys.stderr,
+        )
+        print()
+    elif not args.dry_run:
         with open(sources_path, "w", encoding="utf-8") as f:
             f.write("\n".join(kept) + ("\n" if kept else ""))
 
@@ -101,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Уникальных источников, давших конфиг: {len(good_sources)}")
     if args.dry_run:
         print("(dry-run: файл не изменён)")
+    if not args.dry_run and mass_removal and not args.force:
+        print("(файл НЕ изменён: защита от массовой отбраковки)")
     print("\n--- Убранные подписки ---")
     for u in removed:
         print(u)

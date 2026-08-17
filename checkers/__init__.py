@@ -9,7 +9,7 @@
 - ``checkers.dpi_active`` — активное DPI-тестирование протокола узла
   (SNI-варианты, фрагментация/большой ClientHello, ECH, TLS 1.2/1.3);
 - ``checkers.telegram_pro`` — продвинутые Telegram-проверки (MTProto
-  connect/auth, upload/download) и ``telegram_score``;
+  connect/auth, upload) и ``telegram_score``;
 - ``checkers.route`` — стабильность маршрута (RTT, jitter, loss).
 """
 

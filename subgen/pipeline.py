@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=0, help="Максимум узлов после проверки (0 = без лимита).")
     parser.add_argument("--max-ping", type=int, default=1000, help="Максимальный пинг в мс (0 - без ограничения).")
     parser.add_argument("--no-stress", action="store_true", help="Пропустить стресс-тест (оставить только пропингованных).")
-    parser.add_argument("--no-telegram", action="store_true", help="Отключить все Telegram-проверки: медиа-проверку (загрузку/выгрузку) в стресс-тесте и продвинутую MTProto-проверку (connect/auth, upload/download, telegram_score). Узлы принимаются только по спид-тесту.")
+    parser.add_argument("--no-telegram", action="store_true", help="Отключить все Telegram-проверки: медиа-проверку (загрузку/выгрузку) в стресс-тесте и продвинутую MTProto-проверку (connect/auth, upload, telegram_score). Узлы принимаются только по спид-тесту.")
     parser.add_argument("--plain", action="store_true", help="Не кодировать подписку в base64.")
     parser.add_argument("--dpi-check", action="store_true", help="Включить DPI-проверку через Xray (обход блокировок).")
     parser.add_argument("--dpi-target", default=DPI_DEFAULT_TARGET, help="Целевой хост для DPI-проверки (по умолчанию instagram.com).")
@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dpi-cidr", action="store_true", help="DPI: CIDR-whitelist проверка как обязательная отсеивающая.")
     parser.add_argument("--dpi-active", action="store_true", help="Включить активную DPI-проверку протокола узла (SNI-варианты, фрагментация/большой ClientHello, ECH, TLS 1.2/1.3).")
     parser.add_argument("--dpi-active-timeout", type=float, default=4.0, help="Таймаут одного варианта активной DPI-проверки, сек (по умолчанию 4).")
-    parser.add_argument("--telegram-pro", action="store_true", help="УСТАРЕЛО: продвинутые Telegram-проверки (MTProto connect/auth, upload/download) и telegram_score теперь выполняются автоматически при включённом Telegram. Флаг оставлен для обратной совместимости (игнорируется, если не задан --no-telegram).")
+    parser.add_argument("--telegram-pro", action="store_true", help="УСТАРЕЛО: продвинутые Telegram-проверки (MTProto connect/auth, upload) и telegram_score теперь выполняются автоматически при включённом Telegram. Флаг оставлен для обратной совместимости (игнорируется, если не задан --no-telegram).")
     parser.add_argument("--zapret-check", action="store_true", help="Включить Zapret-проверку (DPI suite tcp 16-20 + HTTP test, методика C:\\Zapret).")
     parser.add_argument("--initial-check-timeout", type=float, default=3.0, help="Таймаут начальной проверки доступности (TCP+HTTP HEAD), сек (по умолчанию 3).")
 
@@ -516,7 +516,7 @@ def run(
             "nodes": dpi_active_node_details,
         }
 
-    # Продвинутая Telegram-проверка (MTProto connect/auth, upload/download)
+    # Продвинутая Telegram-проверка (MTProto connect/auth, upload)
     # с расчётом telegram_score.
     telegram_pro_report: dict[str, Any] = {}
     if not args.no_telegram:
@@ -551,14 +551,14 @@ def run(
                 log(
                     f"[telegram-pro] PASS {idx}/{telegram_pro_orig_count}: {w.node.title()} "
                     f"(score={res.telegram_score} connect={res.connect}({res.connect_ms}ms) "
-                    f"auth={res.auth} up={res.upload_kbps}KB/s down={res.download_kbps}KB/s)"
+                    f"auth={res.auth} up={res.upload_kbps}KB/s)"
                 )
             else:
                 failed_telegram_pro += 1
                 log(
                     f"[telegram-pro] FAIL {idx}/{telegram_pro_orig_count}: {w.node.title()} "
                     f"(score={res.telegram_score} connect={res.connect} auth={res.auth} "
-                    f"up={res.upload_kbps}KB/s down={res.download_kbps}KB/s reason={res.reason})"
+                    f"up={res.upload_kbps}KB/s reason={res.reason})"
                 )
         if telegram_pro_idx >= 0:
             progress.finish_stage(
@@ -766,15 +766,18 @@ def run(
             return _download_speed_probe(socks_host, socks_port, _BIG_TIMEOUT)
 
         def _speed_probe(socks_host: str, socks_port: int) -> float | None:
-            # Несколько попыток: Worker-узлы капризны, берём максимум.
+            # 3 полные попытки (без раннего выхода), берём максимум.
+            # На заново поднятом core-процессе первый замер сильно занижен
+            # (холодный старт TCP/TLS, ramp-up у Worker-узлов) — ровно поэтому
+            # узел проходит стресс-тест (там 3 раунда на прогретом core + медиана),
+            # но вылетает на финальном recheck (там раньше бралось первое значение).
             samples: list[float] = []
-            for _ in range(2):
+            for _ in range(3):
                 val = _probe_download(socks_host, socks_port)
                 if val is not None and val > 0:
                     samples.append(val)
-                if samples:
-                    break
             return max(samples) if samples else None
+
 
         def _alive_probe(socks_host: str, socks_port: int) -> bool:
             # Проверка живости через простой HEAD на несколько хостов.

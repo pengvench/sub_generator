@@ -31,19 +31,19 @@ DEFAULT_THRESHOLDS = {
     },
     
     # Telegram-проверка (checkers/telegram_pro.py)
+    # Download-компонент удалён: его хост (cdn4.telegram.org) недоступен во
+    # многих сетях даже без VPN, поэтому download всегда давал None и
+    # искусственно резал telegram_score до 80. Вес перенесён на upload.
     "telegram": {
         "timeout": 5.0,
         "upload_bytes": 4 * 1024 * 1024,  # 4 МБ
-        "download_bytes": 4 * 1024 * 1024,  # 4 МБ
         "upload_sample_sec": 3.0,
-        "download_sample_sec": 3.0,
         "good_kbps": 2048.0,  # порог хорошей скорости
         "min_score": 60.0,  # минимальный telegram_score для принятия
         "weights": {
             "connect": 0.30,
             "auth": 0.30,
-            "upload": 0.20,
-            "download": 0.20,
+            "upload": 0.40,
         },
     },
     

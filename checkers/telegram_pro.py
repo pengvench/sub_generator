@@ -1,8 +1,8 @@
 """Продвинутые Telegram-проверки узла и расчёт ``telegram_score``.
 
 Telegram важен для пользователя не только скоростью: сюда входят установка
-соединения, авторизация на транспортном уровне (MTProto auth), загрузка и
-скачивание медиа-данных. Один общий speedtest не отражает качество Telegram.
+соединения, авторизация на транспортном уровне (MTProto auth) и загрузка
+медиа-данных. Один общий speedtest не отражает качество Telegram.
 
 Здесь для каждого узла выполняются:
 
@@ -13,11 +13,15 @@ Telegram важен для пользователя не только скоро
    транспортный слой MTProto жив и принимает клиентские пакеты.
 3. **Upload (загрузка файла)** — реальная передача данных от клиента к
    инфраструктуре Telegram (POST api.telegram.org с измерением скорости).
-4. **Download (скачивание файла)** — реальная передача данных от Telegram к
-   клиенту (GET к CDN/media-хосту Telegram с измерением скорости).
 
 ``telegram_score`` (0..100) — взвешенная сумма компонентов. Узел с высокой
 скоростью, но обрывающимся MTProto, получает низкий балл.
+
+Download-компонент удалён: он тестировал GET ``cdn4.telegram.org/``, но этот
+хост (149.154.167.99) недоступен во многих сетях даже без VPN (TCP-коннект
+не проходит), а код требовал HTTP 2xx при фактическом 404. В результате
+download всегда давал ``None``, а ``telegram_score`` был искусственно
+ограничен 80. Вес download перенесён на upload.
 """
 
 from __future__ import annotations
@@ -53,10 +57,6 @@ TELEGRAM_MT_PROTO_DCS: tuple[tuple[str, int], ...] = (
     ("91.108.56.130", 443),  # DC5
 )
 
-# Хост для «скачивания файла» (медиа-контент Telegram).
-TELEGRAM_MEDIA_DOWNLOAD_HOST = "cdn4.telegram.org"  # используется для теста скорости
-TELEGRAM_MEDIA_DOWNLOAD_PATH = "/"  # 404 ок, главное — скорость передачи
-
 # Хост для «загрузки файла» (приём данных Telegram-инфраструктурой).
 TELEGRAM_UPLOAD_HOST = "api.telegram.org"
 TELEGRAM_UPLOAD_PATH = "/file/bot0/sendDocument"
@@ -65,16 +65,13 @@ TELEGRAM_UPLOAD_PATH = "/file/bot0/sendDocument"
 TG_WEIGHTS = {
     "connect": 0.30,  # MTProto connect (установка соединения)
     "auth": 0.30,  # MTProto auth (транспортный обмен)
-    "upload": 0.20,  # загрузка файла
-    "download": 0.20,  # скачивание файла
+    "upload": 0.40,  # загрузка файла
 }
 
 # Таймауты.
 TG_TIMEOUT = 5.0
 TG_UPLOAD_BYTES = 4 * 1024 * 1024  # 4 МБ «загрузка файла»
-TG_DOWNLOAD_BYTES = 4 * 1024 * 1024  # 4 МБ «скачивание файла»
 TG_UPLOAD_SAMPLE_SEC = 3.0
-TG_DOWNLOAD_SAMPLE_SEC = 3.0
 # Порог скорости для «хорошего» Telegram (КБ/с), как медиа-порог Xray.
 TG_GOOD_KBPS = 2048.0
 
@@ -177,7 +174,7 @@ def _socks_mtproto_auth(
 
 
 # ---------------------------------------------------------------------------
-# Upload / Download через SOCKS+SSL (инфраструктура Telegram).
+# Upload через SOCKS+SSL (инфраструктура Telegram).
 # ---------------------------------------------------------------------------
 
 def _socks_https_upload_kbps(
@@ -231,76 +228,6 @@ def _socks_https_upload_kbps(
                 raw_sock.close()
 
 
-def _socks_https_download_kbps(
-    socks_host: str,
-    socks_port: int,
-    target_host: str,
-    target_port: int,
-    server_name: str,
-    path: str,
-    max_bytes: int,
-    timeout: float,
-    *,
-    sample_seconds: float,
-) -> float | None:
-    """GET-загрузка через SOCKS+SSL (аналог ``_socks_https_download_kbps``)."""
-    raw_sock: socket.socket | None = None
-    try:
-        raw_sock = base._socks_open_connection(socks_host, socks_port, target_host, target_port, timeout)
-        if raw_sock is None:
-            return None
-        raw_sock.settimeout(timeout)
-        context = ssl.create_default_context()
-        with context.wrap_socket(raw_sock, server_hostname=server_name) as tls_sock:
-            raw_sock = None
-            request = (
-                f"GET {path} HTTP/1.1\r\n"
-                f"Host: {server_name}\r\n"
-                f"User-Agent: MTProxyAutoSwitch/1.0\r\n"
-                f"Connection: close\r\n\r\n"
-            ).encode("ascii")
-            tls_sock.sendall(request)
-            buffer = b""
-            body_bytes = 0
-            started: float | None = None
-            deadline = time.perf_counter() + timeout
-            sample_deadline: float | None = None
-            while body_bytes < max_bytes and time.perf_counter() < deadline:
-                chunk = tls_sock.recv(min(65536, max_bytes - body_bytes + 4096))
-                if not chunk:
-                    break
-                if started is None:
-                    buffer += chunk
-                    header_end = buffer.find(b"\r\n\r\n")
-                    if header_end < 0:
-                        continue
-                    headers = buffer[:header_end]
-                    if not headers.startswith(b"HTTP/"):
-                        return None
-                    status = headers.split(b" ", 2)[1:2]
-                    if not status or not status[0].startswith(b"2"):
-                        return None
-                    body = buffer[header_end + 4 :]
-                    body_bytes += len(body)
-                    started = time.perf_counter()
-                    sample_deadline = started + max(0.5, float(sample_seconds))
-                    buffer = b""
-                else:
-                    body_bytes += len(chunk)
-                if sample_deadline is not None and time.perf_counter() >= sample_deadline:
-                    break
-            if started is None or body_bytes <= 0:
-                return None
-            elapsed = max(0.001, time.perf_counter() - started)
-            return (body_bytes / 1024.0) / elapsed
-    except Exception:
-        return None
-    finally:
-        if raw_sock is not None:
-            with contextlib.suppress(Exception):
-                raw_sock.close()
-
-
 # ---------------------------------------------------------------------------
 # Основная проверка.
 # ---------------------------------------------------------------------------
@@ -341,25 +268,11 @@ def _run_telegram_pro(
     )
     upload_ok = upload_kbps is not None and upload_kbps >= TG_GOOD_KBPS * 0.25
 
-    download_kbps = _socks_https_download_kbps(
-        socks_host,
-        socks_port,
-        TELEGRAM_MEDIA_DOWNLOAD_HOST,
-        443,
-        TELEGRAM_MEDIA_DOWNLOAD_HOST,
-        TELEGRAM_MEDIA_DOWNLOAD_PATH,
-        TG_DOWNLOAD_BYTES,
-        timeout,
-        sample_seconds=TG_DOWNLOAD_SAMPLE_SEC,
-    )
-    download_ok = download_kbps is not None and download_kbps >= TG_GOOD_KBPS * 0.25
-
     # telegram_score = взвешенная сумма компонентов (0..100).
     score = 0.0
     score += TG_WEIGHTS["connect"] * 100.0 if connect_ok else 0.0
     score += TG_WEIGHTS["auth"] * 100.0 if auth_ok else 0.0
     score += TG_WEIGHTS["upload"] * 100.0 if upload_ok else 0.0
-    score += TG_WEIGHTS["download"] * 100.0 if download_ok else 0.0
 
     # Порог: connect+auth обязательны, score >= 60.
     accepted = connect_ok and auth_ok and score >= 60.0
@@ -374,12 +287,11 @@ def _run_telegram_pro(
         auth=auth_ok,
         upload=upload_ok,
         upload_kbps=round(upload_kbps, 1) if upload_kbps is not None else None,
-        download=download_ok,
-        download_kbps=round(download_kbps, 1) if download_kbps is not None else None,
+        download=False,
+        download_kbps=None,
         details={
             "dcs_tried": len(TELEGRAM_MT_PROTO_DCS),
             "upload_bytes": TG_UPLOAD_BYTES,
-            "download_bytes": TG_DOWNLOAD_BYTES,
             "weights": TG_WEIGHTS,
             "good_kbps": TG_GOOD_KBPS,
         },
@@ -398,7 +310,7 @@ def check_node_telegram_pro_detailed(
     def _run(host: str, port: int) -> TelegramProResult:
         return _run_telegram_pro(host, port, timeout)
 
-    # connect(до 5 DC) + auth(до 5 DC) + upload + download.
+    # connect(до 5 DC) + auth(до 5 DC) + upload.
     budget = max(20.0, timeout * 16.0)
     result = base.run_with_node(node_url, _run, timeout=timeout, root_dir=root_dir, budget=budget)
     if result is None:

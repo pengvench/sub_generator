@@ -444,22 +444,132 @@ class SubGenApp(ctk.CTk):
         alive_urls |= {r.node.source_url for r in rejected if r.node.source_url and r.latency_ms is not None}
 
         total = self.page_sources.get_sources()
-        dead = {u for u in total if u not in alive_urls}
+        # Подписки, реально отдавшие узлы при импорте (импорт прошёл успешно).
+        imported_urls: set[str] = {n.source_url for n in discovered if n.source_url}
+        # Импортировалась, но ни один узел не прошёл пинг/telegram-проверку.
+        imported_dead = sorted(imported_urls - alive_urls)
+        # Не отдала ни одного узла: сеть/404/пустое тело/битый URL.
+        failed = sorted({u for u in total if u not in imported_urls})
+        dead = sorted({u for u in total if u not in alive_urls})
 
         self.page_log.append_log("─" * 96)
         self.page_log.append_log(
-            f"[живучесть] Завершено за {elapsed:.1f} сек: "
-            f"подписок {len(total)}, живых {len(alive_urls)}, мёртвых/пустых {len(dead)}"
+            f"[живучесть] Завершено за {elapsed:.1f} сек: подписок {len(total)}, "
+            f"живых {len(alive_urls)}, импортировалось но без живых {len(imported_dead)}, "
+            f"не импортировалось/пустых {len(failed)}"
         )
-        for u in sorted(dead):
-            self.page_log.append_log(f"✗ не отдала живых конфигов: {u}")
         for u in sorted(alive_urls):
             self.page_log.append_log(f"✓ живая: {u}")
+        for u in imported_dead:
+            self.page_log.append_log(f"✗ импортировалась, но без живых конфигов: {u}")
+        for u in failed:
+            self.page_log.append_log(f"✗ не импортировалась/пустая: {u}")
         if dead:
             self.page_log.append_log("Совет: удалите мёртвые подписки кнопкой «🧹 Отсеять мусорные» на странице «Подписки».")
 
         self._set_progress(100, "проверка живучести завершена")
         self.show_status(f"Живых подписок: {len(alive_urls)} из {len(total)}")
+
+
+    def on_export_clicked(self) -> None:
+        if self._busy:
+            self.show_status("Уже выполняется задача — дождитесь завершения.", error=True)
+            return
+        sources = self.page_sources.get_sources()
+        if not sources:
+            self.show_status("Список подписок пуст. Добавьте подписки.", error=True)
+            return
+
+        self._set_busy(True)
+        self.page_log.clear_log()
+        self._set_progress(0, "Экспорт конфигов…")
+        self._show_page("log")
+        self.show_status("Экспорт конфигов из подписок…")
+        self.page_log.append_log("[экспорт] Инициализация экспорта...")
+
+        def _export_worker():
+            import traceback
+            try:
+                from types import SimpleNamespace
+
+                from xray_runtime import collect_subscription_nodes
+
+                def _log(msg: str) -> None:
+                    self._post(lambda: self.page_log.append_log(msg))
+
+                def _progress(index: int, total: int, url: str) -> None:
+                    pct = int(index / total * 40) if total else 0
+                    short = (url or "").split("/")[-1][:48] if url else ""
+                    self._post(lambda: self._set_progress(pct, f"Загрузка подписок {index}/{total} {short}"))
+
+                self._post(lambda: self.page_log.append_log("[экспорт] Начало загрузки подписок..."))
+
+                # Тот же синхронный fetch-код, что используется в начале теста:
+                # collect_subscription_nodes сам многопоточно собирает узлы.
+                discovered = collect_subscription_nodes(
+                    sources,
+                    timeout=30.0,
+                    max_servers=0,
+                    log_sink=_log,
+                    on_progress=_progress,
+                    cancel_event=self.runner.cancel_event,
+                    pause_event=self.runner.pause_event,
+                )
+                self._post(lambda: self.page_log.append_log(f"[экспорт] Загружено {len(discovered)} узлов"))
+                self._post(lambda: self._set_progress(50, f"Загружено {len(discovered)} узлов"))
+
+                all_configs = set()
+                per_source: dict[str, int] = {}
+                for node in discovered:
+                    uri = getattr(node, "raw_url", "") or (
+                        node.to_uri() if hasattr(node, "to_uri") else ""
+                    )
+                    if uri:
+                        all_configs.add(uri)
+                    source = getattr(node, "source_url", "") or "unknown"
+                    per_source[source] = per_source.get(source, 0) + 1
+
+                # Блок «Конфиги по подпискам» на странице лога.
+                stats = [
+                    SimpleNamespace(
+                        url=source,
+                        discovered=count,
+                        ping_passed=0,
+                        working=count,
+                        rejected=0,
+                    )
+                    for source, count in sorted(per_source.items())
+                ]
+                self._post(lambda s=stats: self.page_log.set_stats(s))
+
+                self._post(lambda: self.page_log.append_log(f"[экспорт] Собрано {len(all_configs)} уникальных конфигов"))
+                for source, count in sorted(per_source.items()):
+                    self._post(lambda src=source, cnt=count: self.page_log.append_log(f"[экспорт]  - {src}: {cnt} конфигов"))
+                self._post(lambda: self._set_progress(80, f"Собрано {len(all_configs)} конфигов"))
+
+                export_path = paths.app_root() / "preload.txt"
+                try:
+                    export_path.write_text("\n".join(sorted(all_configs)) + ("\n" if all_configs else ""), encoding="utf-8")
+                    self._post(lambda: self.show_status(f"Экспортировано {len(all_configs)} конфигов в {export_path}"))
+                    self._post(lambda: self.page_log.append_log(f"[экспорт] Сохранено {len(all_configs)} конфигов в {export_path}"))
+                    self._post(lambda: self._set_progress(100, "Экспорт завершён"))
+                except Exception as e:
+                    self._post(lambda: self.show_status(f"Ошибка сохранения: {e}", error=True))
+                    self._post(lambda: self.page_log.append_log(f"[экспорт] Ошибка сохранения: {e}"))
+            except Exception as e:
+                self._post(lambda: self.show_status(f"Ошибка экспорта: {e}", error=True))
+                self._post(lambda: self.page_log.append_log(f"[экспорт] Ошибка: {e}"))
+                tb = traceback.format_exc()
+                self._post(lambda: self.page_log.append_log(f"[экспорт] Трассировка:\n{tb}"))
+            finally:
+                self._post(lambda: self._set_busy(False))
+
+        threading.Thread(target=_export_worker, daemon=True).start()
+
+    def on_combined_clicked(self) -> None:
+        # Сначала отсеять мусорные подписки, затем проверить живучесть оставшихся.
+        self.on_cleanup_clicked()
+        self.on_liveness_clicked()
 
     # ------------------------------------------------------------ helpers
     def _post(self, fn) -> None:

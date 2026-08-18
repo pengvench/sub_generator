@@ -24,6 +24,14 @@ def sources_file() -> Path:
     return app_root() / "sources.txt"
 
 
+def ensure_sources_file() -> Path:
+    """Вернуть путь к sources.txt, создав пустой файл, если его нет."""
+    path = sources_file()
+    if not path.exists():
+        path.write_text("", encoding="utf-8")
+    return path
+
+
 def bin_dir() -> Path:
     return app_root() / "bin"
 

@@ -107,7 +107,7 @@ class SourcesPage(ctk.CTkFrame):
         actions.grid(row=4, column=0, padx=24, pady=(0, 20), sticky="ew")
 
         self.btn_save = ctk.CTkButton(
-            actions, text="💾 Сохранить", width=140,
+            actions, text=" Сохранить", width=140,
             command=self._save_all,
         )
         self.btn_save.grid(row=0, column=0, padx=(0, 8))
@@ -120,22 +120,21 @@ class SourcesPage(ctk.CTkFrame):
         self.btn_reload.grid(row=0, column=1, padx=(0, 8))
         CTkToolTip(self.btn_reload, "Перечитать sources.txt с диска (отменить несохранённые изменения).")
 
-        self.btn_cleanup = ctk.CTkButton(
-            actions, text="🧹 Отсеять мусорные", width=190,
+        self.btn_combined = ctk.CTkButton(
+            actions, text=" Проверить и отсеять", width=220,
             fg_color=theme.WARNING_BTN, hover_color=theme.WARNING_BTN_HOVER,
-            command=self.app.on_cleanup_clicked,
+            command=self.app.on_combined_clicked,
         )
-        self.btn_cleanup.grid(row=0, column=2, padx=(0, 8))
-        CTkToolTip(self.btn_cleanup, "Удалить подписки, не отдавшие живых конфигов в прошлых прогонах (по данным data/).")
+        self.btn_combined.grid(row=0, column=2, padx=(0, 8))
+        CTkToolTip(self.btn_combined, "Сначала отсеять мусорные подписки, затем проверить живучесть оставшихся.")
 
-        self.btn_liveness = ctk.CTkButton(
-            actions, text="🔍 Проверить живучесть", width=210,
-            fg_color=theme.INFO, hover_color=theme.ACCENT_HOVER,
-            text_color="#0C1014",
-            command=self.app.on_liveness_clicked,
+        self.btn_export = ctk.CTkButton(
+            actions, text=" Экспорт", width=140,
+            fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
+            command=self.app.on_export_clicked,
         )
-        self.btn_liveness.grid(row=0, column=3, padx=(0, 0))
-        CTkToolTip(self.btn_liveness, "Быстрая проверка (пинг без полного теста), какие подписки отдают живые конфиги.")
+        self.btn_export.grid(row=0, column=3, padx=(0, 0))
+        CTkToolTip(self.btn_export, "Скачать все подписки, собрать все конфиги и сохранить в preload.txt с дедупликацией.")
 
         self.reload()
 
@@ -278,6 +277,6 @@ class SourcesPage(ctk.CTkFrame):
 
     def set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
-        for btn in (self.btn_add, self.btn_remove, self.btn_save, self.btn_reload, self.btn_cleanup, self.btn_liveness):
+        for btn in (self.btn_add, self.btn_remove, self.btn_save, self.btn_reload, self.btn_combined, self.btn_export):
             btn.configure(state=state)
 

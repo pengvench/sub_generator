@@ -9,6 +9,8 @@ import argparse
 import os
 import sys
 
+from ui.paths import ensure_sources_file
+
 
 def _run_cli(argv):
     from subgen.encoding import setup_console_encoding
@@ -22,6 +24,7 @@ def _run_cli(argv):
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    ensure_sources_file()
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-c", "--cli", action="store_true", help="Консольный режим (без GUI): полный конвейер.")

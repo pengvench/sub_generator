@@ -1,12 +1,35 @@
-/.clinerules
-/build/
-
-# Python-кеш
+```gitignore
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Рабочие данные и кеш прогонов (data/ целиком не нужен в git)
-/data/
+# Dependencies
+.venv/
+venv/
+.env
+.env.local
+*.env.*
 
-# Локальный список подписок: создаётся/редактируется пользователем, не хранится в git
-/sources.txt
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+
+# Editors
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+target/
+
+# Testing and coverage
+.coverage
+coverage/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+```

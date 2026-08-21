@@ -74,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--telegram-pro", action="store_true", help="УСТАРЕЛО: продвинутые Telegram-проверки (MTProto connect/auth, upload) и telegram_score теперь выполняются автоматически при включённом Telegram. Флаг оставлен для обратной совместимости (игнорируется, если не задан --no-telegram).")
     parser.add_argument("--zapret-check", action="store_true", help="Включить Zapret-проверку (DPI suite tcp 16-20 + HTTP test, методика C:\\Zapret).")
     parser.add_argument("--initial-check-timeout", type=float, default=3.0, help="Таймаут начальной проверки доступности (TCP+HTTP HEAD), сек (по умолчанию 3).")
+    parser.add_argument("--resilience-check", action="store_true", default=True, help="Включить проверку живучести узлов в условиях блокировок (multi-target ping, WHITE-SNI, альтернативные цели). Включено по умолчанию для работы на заблокированных мобильных сетях.")
+    parser.add_argument("--no-resilience-check", action="store_false", dest="resilience_check", help="Отключить проверку живучести (не рекомендуется для мобильных сетей РФ).")
+    parser.add_argument("--resilience-timeout", type=float, default=4.0, help="Таймаут одного теста resilience-проверки, сек (по умолчанию 4).")
 
     parser.add_argument("--zapret-out", default="subs_zapret.txt", help="Подписка узлов, прошедших Zapret-проверку.")
     parser.add_argument("--zapret-working", default="working_zapret.txt", help="Рабочие конфиги, прошедшие Zapret-проверку.")
@@ -197,6 +200,10 @@ def run(
     progress.add_stage("route", 0.10, total=1)
     if args.zapret_check:
         progress.add_stage("zapret", 0.15, total=1)
+    # Resilience check теперь всегда включён (по умолчанию), но можно отключить через --no-resilience-check
+    resilience_enabled = getattr(args, 'resilience_check', True)
+    if resilience_enabled:
+        progress.add_stage("resilience", 0.10, total=1)
     progress.add_stage("recheck", 0.05, total=1)
     progress.add_stage("geo", 0.10, total=1)
 
@@ -208,6 +215,7 @@ def run(
     telegram_pro_idx = progress.stage_index("telegram_pro")
     route_idx = progress.stage_index("route")
     zapret_idx = progress.stage_index("zapret")
+    resilience_idx = progress.stage_index("resilience") if resilience_enabled else -1
     recheck_idx = progress.stage_index("recheck")
     geo_idx = progress.stage_index("geo")
 
@@ -723,6 +731,71 @@ def run(
             "min_score": min_score,
             "nodes": zapret_node_details,
         }
+
+    # Resilience check: проверка живучести узлов в условиях блокировок (теперь всегда включена по умолчанию).
+    # Выполняется ПЕРЕД стресс-тестом для отсеивания мёртвых узлов до дорогих проверок.
+    resilience_report: dict[str, Any] = {}
+
+    resilience_enabled = getattr(args, 'resilience_check', True)
+    if resilience_enabled:
+        from checkers.resilience import check_node_resilience_detailed
+
+        resilience_orig_count = len(working)
+        resilience_timeout = max(3.0, args.resilience_timeout)
+
+        log(
+            f"[sub] Resilience check enabled (default), timeout={resilience_timeout}s, "
+            f"checking {resilience_orig_count} nodes..."
+        )
+        if resilience_idx >= 0:
+            progress.start_stage(resilience_idx, f"Resilience-проверка {resilience_orig_count} узлов")
+            progress.set_total(resilience_idx, resilience_orig_count)
+
+        checked_resilience: list[Any] = []
+        failed_resilience = 0
+        resilience_node_details: dict[str, Any] = {}
+        for idx, w in enumerate(working, 1):
+            if cancel_event and cancel_event.is_set():
+                raise RuntimeError("refresh-cancelled")
+            while pause_event and pause_event.is_set():
+                if cancel_event and cancel_event.is_set():
+                    raise RuntimeError("refresh-cancelled")
+                time.sleep(0.2)
+            if resilience_idx >= 0:
+                progress.update(idx, f"Resilience {w.node.title()}")
+
+            res = check_node_resilience_detailed(w.node.raw_url, timeout=resilience_timeout)
+            resilience_node_details[w.node.title()] = res.to_dict()
+
+            if res.alive:
+                checked_resilience.append(w)
+                log(
+                    f"[resilience] PASS {idx}/{resilience_orig_count}: {w.node.title()} "
+                    f"(mode={res.recommended_mode}, tcp={res.tcp_works}, doh={res.doh_works}, tg={not res.telegram_blocked}, white_sni={res.white_sni_works})"
+                )
+            else:
+                failed_resilience += 1
+                log(
+                    f"[resilience] FAIL {idx}/{resilience_orig_count}: {w.node.title()} "
+                    f"(completely_dead)"
+                )
+
+            if resilience_idx >= 0:
+                progress.finish_stage(resilience_idx, f"[resilience] done: {len(checked_resilience)} passed, {failed_resilience} failed")
+
+        working = checked_resilience
+        resilience_urls = "\n".join(w.node.raw_url for w in working) + "\n"
+        resilience_report = {
+            "enabled": True,
+            "checked": resilience_orig_count,
+            "passed": len(checked_resilience),
+            "failed": failed_resilience,
+            "timeout_sec": resilience_timeout,
+            "nodes": resilience_node_details,
+        }
+    else:
+        log("[sub] Resilience check disabled via --no-resilience-check")
+        resilience_report = {"enabled": False}
 
     if args.limit > 0:
         working = working[: args.limit]

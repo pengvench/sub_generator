@@ -3,7 +3,7 @@ https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 https://raw.githubusercontent.com/flaafix/AetrisVPN/refs/heads/main/AetrisVPN.txt
 https://yax.nenadoblokirowatgnidda.ru/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2FdGdnZ2dnLDE3ODcyODgzNzkPrhHdXr7Qg
-https://mifa.world/magic
+https://mifa.world/mars
 https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt
 https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt
 https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt
@@ -32,3 +32,7 @@ https://p.kfwl.lol/https://freevpnhappcluchi.duckdns.org/sub/o20pq89rdo9e7afo
 https://raw.githubusercontent.com/bobrinaw/vlessforu/refs/heads/main/working_configs.txt
 https://212.192.210.192:2096/sub/tfzn89j99y12wuqa
 https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all
+https://sub.orpheous.ru/sub/Zadyeut4EJZQCBg5
+https://github.com/sirex010/1/raw/main/harcho.txt
+https://gitverse.ru/api/repos/bikinitw22/apelsintel/raw/branch/main/alive_bs.txt
+https://raw.githubusercontent.com/Diversan313/apex-parser/main/alive_bl.txt

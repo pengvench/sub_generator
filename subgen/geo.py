@@ -44,10 +44,10 @@ _EGRESS_PROBES = (
 )
 _EGRESS_SAMPLE_SECONDS = 1.5
 
-# Порог скорости (КБ/с) для пометки узла как скоростного ("HS") в имени.
-# Узлы с download_kbps >= порога получают суффикс "HS" в конце имени.
-HS_SPEED_THRESHOLD_KBPS = 4000.0
-HS_NAME_SUFFIX = "HS"
+# Порог скорости (КБ/с) для пометки узла как скоростного ("⚡") в имени.
+# Узлы с download_kbps >= порога получают суффикс "⚡" в конце имени.
+HS_SPEED_THRESHOLD_KBPS = 6000.0
+HS_NAME_SUFFIX = "⚡"
 
 
 
@@ -339,8 +339,8 @@ def serialize_working(
             new_name = " peppo"
         else:
             new_name = f"{flag} {code} peppo"
-        # Скоростной узел (download >= 4000 КБ/с) помечаем суффиксом "HS":
-        # например "🇩🇪 DE peppo HS".
+        # Скоростной узел (download >= 6000 КБ/с) помечаем суффиксом "⚡":
+        # например "🇩🇪 DE peppo ⚡".
         download_kbps = getattr(item, "download_kbps", None)
         if download_kbps is not None and float(download_kbps) >= HS_SPEED_THRESHOLD_KBPS:
             new_name = f"{new_name} {HS_NAME_SUFFIX}"

@@ -1,21 +1,16 @@
-"""Страница «Настройки» — описание/префикс конфигов и перепроверка с этапа."""
-from __future__ import annotations
+"""Страница «Настройки» — описание/префикс конфигов.
 
-import json
+Карточка «Перепроверка с этапа» перенесена на отдельную страницу
+«🔁 Перепроверка» в сайдбаре (см. recheck_page.py), где объединена с
+бывшим тумблером «С сохранённого кеша».
+"""
+from __future__ import annotations
 
 import customtkinter as ctk
 
-from .. import paths, theme
+from .. import theme
 from ..tooltip import CTkToolTip, info_label
 from subgen.settings import load_settings, save_settings
-
-
-STAGES = {
-    "ping": "Сначала (полный прогон)",
-    "dpi": "С этапа DPI (после пинга и стресс-теста)",
-    "zapret": "С этапа Zapret",
-    "recheck": "С этапа перепроверки",
-}
 
 
 class SettingsPage(ctk.CTkFrame):
@@ -51,7 +46,8 @@ class SettingsPage(ctk.CTkFrame):
             anchor="w", text_color=theme.TEXT,
         )
         lbl.grid(row=0, column=0, padx=6, pady=(6, 0), sticky="w")
-        info = info_label(inner, "Строка, добавляемая в начало подписки перед описанием.")
+        info = info_label(inner, "Строка, добавляемая в начало подписки перед описанием. "
+                                  "Автоматически комментируется '#', чтобы не ломать парсеры happ/Hiddify.")
         info.grid(row=0, column=1, padx=(4, 0), pady=(6, 0), sticky="w")
 
         self.entry_prefix = ctk.CTkEntry(inner, height=34)
@@ -62,47 +58,12 @@ class SettingsPage(ctk.CTkFrame):
             anchor="w", text_color=theme.TEXT,
         )
         lbl2.grid(row=2, column=0, padx=6, pady=(6, 0), sticky="w")
-        info2 = info_label(inner, "Описание, добавляемое в подписку после префикса.")
+        info2 = info_label(inner, "Описание, добавляемое в подписку после префикса. "
+                                  "Используйте '#', чтобы клиент игнорировал строку.")
         info2.grid(row=2, column=1, padx=(4, 0), pady=(6, 0), sticky="w")
 
         self.text_desc = ctk.CTkTextbox(inner, height=70, wrap="word")
         self.text_desc.grid(row=3, column=0, columnspan=2, padx=6, pady=(4, 8), sticky="ew")
-
-        # ---------------- Карточка: перепроверка с этапа ----------------
-        card_stage = self._make_card(self.scroll, 1, "Перепроверка с этапа")
-        inner2 = card_stage.inner
-        inner2.grid_columnconfigure(0, weight=1)
-
-        lbl3 = ctk.CTkLabel(
-            inner2, text="Начать проверку с этапа",
-            anchor="w", text_color=theme.TEXT,
-        )
-        lbl3.grid(row=0, column=0, padx=6, pady=(6, 0), sticky="w")
-        info3 = info_label(
-            inner2,
-            "После пинга и стресс-теста рабочие конфиги сохраняются. "
-            "Можно перезапустить проверку с любого более позднего этапа, "
-            "не повторяя пинг и стресс-тест.",
-        )
-        info3.grid(row=0, column=1, padx=(4, 0), pady=(6, 0), sticky="w")
-
-        self.stage_var = ctk.StringVar(value="ping")
-        self._stage_radios: dict[str, ctk.CTkRadioButton] = {}
-        for i, (key, label) in enumerate(STAGES.items()):
-            rb = ctk.CTkRadioButton(
-                inner2, text=label, value=key, variable=self.stage_var,
-                text_color=theme.TEXT, font=ctk.CTkFont(size=13),
-            )
-            rb.grid(row=1 + i, column=0, columnspan=2, padx=10, pady=3, sticky="w")
-            self._stage_radios[key] = rb
-
-        self.lbl_stage_warn = ctk.CTkLabel(
-            inner2, text="", text_color=theme.WARNING,
-            font=ctk.CTkFont(size=12), justify="left", anchor="w",
-        )
-        self.lbl_stage_warn.grid(row=1 + len(STAGES), column=0, columnspan=2,
-                                 padx=10, pady=(4, 0), sticky="w")
-
 
         # ---------------- Кнопка сохранения ----------------
         self.btn_save = ctk.CTkButton(
@@ -117,7 +78,7 @@ class SettingsPage(ctk.CTkFrame):
             command=self._save,
         )
         self.btn_save.grid(row=2, column=0, padx=12, pady=(8, 14), sticky="ew")
-        CTkToolTip(self.btn_save, "Сохранить описание, префикс и этап перепроверки.")
+        CTkToolTip(self.btn_save, "Сохранить описание и префикс подписки.")
 
         self.lbl_saved = ctk.CTkLabel(
             self.scroll, text="", text_color=theme.SUCCESS,
@@ -126,7 +87,6 @@ class SettingsPage(ctk.CTkFrame):
         self.lbl_saved.grid(row=3, column=0, padx=12, pady=(0, 6), sticky="w")
 
         self._load()
-        self.refresh_stage_availability()
 
     # ------------------------------------------------------------ helpers
 
@@ -153,9 +113,10 @@ class SettingsPage(ctk.CTkFrame):
     def _load(self) -> None:
         settings = load_settings()
         self.entry_prefix.delete(0, "end")
-        self.entry_prefix.insert(0, settings.get("prefix", ""))
+        self.entry_prefix.insert(0, str(settings.get("prefix", "")))
         self.text_desc.delete("1.0", "end")
-        self.text_desc.insert("1.0", settings.get("description", ""))
+        desc = settings.get("description", "")
+        self.text_desc.insert("1.0", str(desc))
 
     def _save(self) -> None:
         settings = load_settings()
@@ -166,47 +127,6 @@ class SettingsPage(ctk.CTkFrame):
         self.app.show_status("Настройки сохранены.")
 
     # ------------------------------------------------------------ API
-    def get_start_stage(self) -> str:
-        return self.stage_var.get()
-
     def set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
         self.btn_save.configure(state=state)
-
-    # ------------------------------------------------------------ кеш этапов
-    def has_cached_working(self) -> bool:
-        """Есть ли сохранённые рабочие конфиги (после пинга и стресс-теста)."""
-        path = paths.data_dir() / ".runtime_cache" / "xray_working.json"
-        if not path.exists():
-            return False
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return False
-        if not isinstance(data, list):
-            return False
-        return any(row.get("fully_checked") for row in data)
-
-    def refresh_stage_availability(self) -> None:
-        """Включает/отключает выбор этапов перепроверки в зависимости от кеша.
-
-        Если проверка ещё ни разу не проводилась (нет сохранённых рабочих
-        конфигов), этапы dpi/zapret/recheck недоступны, а выбор сбрасывается
-        на «Сначала (полный прогон)».
-        """
-        available = self.has_cached_working()
-        for key, rb in self._stage_radios.items():
-            if key == "ping":
-                continue
-            rb.configure(state="normal" if available else "disabled")
-        if not available and self.stage_var.get() != "ping":
-            self.stage_var.set("ping")
-        if available:
-            self.lbl_stage_warn.configure(text="")
-        else:
-            self.lbl_stage_warn.configure(
-                text="⚠ Проверка ещё не проводилась. Сначала запустите полный "
-                     "прогон (пинг и стресс-тест), чтобы появилась возможность "
-                     "перепроверки с этапа."
-            )
-

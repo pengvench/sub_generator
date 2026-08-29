@@ -3,13 +3,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import socket
+import ssl
 import threading
 import time
+import urllib.request
 
 from pathlib import Path
 from typing import Any
 
 from checkers import DPI_DEFAULT_TARGET, check_node_dpi_detailed
+from checkers.net_diagnostic import run_network_diagnostic
 from checkers.base import run_with_node
 from checkers.initial_check import run_initial_check, format_result as format_initial_check_result
 from checkers.dpi_active import DPI_ACTIVE_MIN_SCORE, DpiActiveResult, check_node_dpi_active_detailed
@@ -93,6 +98,45 @@ def build_parser() -> argparse.ArgumentParser:
         "'dpi'/'zapret'/'recheck' — пропустить распинговку и стресс-тест и начать "
         "с указанного этапа, используя сохранённые рабочие конфиги (data/.runtime_cache).",
     )
+    parser.add_argument(
+        "--tun-check",
+        action="store_true",
+        help="Тестировать через TUN (Karing-стиль): весь трафик проверок идёт через "
+        "виртуальный TUN-адаптер, системные настройки DNS/HTTP не влияют на результаты. "
+        "DNS-резолвинг выполняет сам прокси-сервер узла (через outbound). "
+        "Требует прав администратора на Windows и wintun.dll для xray-TUN "
+        "(sing-box с gvisor работает без внешнего драйвера). "
+        "При отсутствии пререквизитов — автоматический fallback на SOCKS-only.",
+    )
+    parser.add_argument(
+        "--add-warp",
+        action="store_true",
+        help="После завершения тестирования добавить WARP-конфиг в конец подписки. "
+        "Запрашивает конфиг у cyb-portal.com /api/warp, конвертирует в warp:// URL "
+        "и добавляет в subs.txt/working.txt. WARP не тестируется (Cloudflare стабилен) — "
+        "работает как fallback, если все vless-узлы упали.",
+    )
+    parser.add_argument(
+        "--warp-preset",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Пресет(ы) генерации WARP (с --add-warp). Можно указать "
+        "несколько через пробел — все выбранные добавятся в подписку. "
+        "0 = Авто (1 конфиг от cyb-portal), "
+        "1 = Мобильный интернет (3 конфига, порты 2408/500/4500), "
+        "2 = Нейросети ChatGPT (2 конфига, WARP+ IP), "
+        "3 = Максимальный обход (6 конфигов, все порты). "
+        "По умолчанию 0 (Авто). Пример: --warp-preset 1 2 3."
+    )
+    parser.add_argument(
+        "--warp-dns",
+        type=str,
+        default="",
+        help="Кастомный DNS для WARP-конфигов (через запятую). "
+        "Например: --warp-dns 111.88.96.50,111.88.96.51 (xbox-dns.ru). "
+        "Если не указан — используется DNS из пресета.",
+    )
     return parser
 
 
@@ -159,6 +203,58 @@ def _load_cached_working() -> list[Any]:
 
 
 
+def _preflight_dns_doh(timeout: float = 5.0) -> dict[str, bool]:
+    """Проверить доступность системного DNS и DoH перед тестированием узлов.
+
+    Модель — Karing: перед проверкой узлов убеждаемся, что локальная сеть
+    вообще может резолвить имена. Это не даёт системным настройкам DNS
+    испортить результаты тестов (например, когда DoH-сервер core резолвится
+    через системный DNS, а тот не работает).
+
+    Возвращает {"system_dns": bool, "doh": bool}.
+    """
+    result = {"system_dns": False, "doh": False}
+
+    # 1) Системный DNS — обычный UDP-запрос A-записи google.com к 8.8.8.8.
+    import contextlib as _cl
+
+    udp_sock: socket.socket | None = None
+    try:
+        transaction_id = b"\xab\xcd"
+        qname = b"\x06google\x03com\x00"
+        query = (
+            transaction_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+            + qname + b"\x00\x01\x00\x01"
+        )
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.settimeout(min(timeout, 3.0))
+        udp_sock.sendto(query, ("8.8.8.8", 53))
+        response, _ = udp_sock.recvfrom(512)
+        if len(response) >= 12 and response[:2] == transaction_id:
+            result["system_dns"] = True
+    except Exception:
+        pass
+    finally:
+        if udp_sock is not None:
+            with _cl.suppress(Exception):
+                udp_sock.close()
+
+    # 2) DoH — HTTPS GET к cloudflare-dns.com/dns-query (JSON API).
+    try:
+        url = "https://cloudflare-dns.com/dns-query?name=google.com&type=A"
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/dns-json", "User-Agent": "SubGenerator/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=min(timeout, 5.0)) as resp:
+            if resp.status == 200:
+                result["doh"] = True
+    except Exception:
+        pass
+
+    return result
+
+
 def run(
     argv: list[str] | None = None,
     cancel_event: threading.Event | None = None,
@@ -202,9 +298,47 @@ def run(
         progress.add_stage("zapret", 0.15, total=1)
     # Resilience check теперь всегда включён (по умолчанию), но можно отключить через --no-resilience-check
     resilience_enabled = getattr(args, 'resilience_check', True)
+    # TUN-полная проверка: один core на узел, все проверки через TUN+SOCKS
+    # (Karing-стиль). Включается через --tun-check (по умолчанию ON из UI).
+    tun_full_enabled = bool(getattr(args, 'tun_check', False))
+
+    # ---------------------------------------------------------------------
+    # Когда включён --tun-check, probe_node_full внутри себя уже прогоняет
+    # ВСЕ базовые проверки через один core с TUN+SOCKS:
+    #   - ping (HTTPS к gstatic/cloudflare/google/microsoft/apple)
+    #   - telegram (HEAD api.telegram.org + MTProto DC)
+    #   - chatgpt (HTTPS HEAD chatgpt.com + chat.openai.com)
+    #   - instagram (HTTPS HEAD instagram.com)
+    #   - speed (download/upload через SOCKS)
+    #   - TUN-связность (системный HTTPS/DNS через TUN)
+    # Дублирующие SOCKS-only этапы ниже (initial_check, telegram_pro,
+    # route, resilience, recheck) поднимали бы ОТДЕЛЬНЫЙ core на каждый
+    # узел, повторяя ту же работу. На 100 узлах × 5 этапов = 500 лишних
+    # старт-стопов xray.exe/sing-box.exe = ~8 минут чистого оверхеда.
+    # Поэтому при --tun-check их пропускаем. DPI/DPI-active/Zapret — НЕ
+    # дублируются (это отдельные проверки обхода блокировок), их оставляем.
+    # ---------------------------------------------------------------------
+    _skip_initial_when_tun = False
+    _skip_telegram_pro_when_tun = False
+    _skip_route_when_tun = False
+    _skip_recheck_when_tun = False
+    if tun_full_enabled:
+        log("[sub] TUN-check включён: initial_check, telegram_pro, route, "
+            "resilience и финальный recheck пропускаются — они дублируются "
+            "внутри probe_node_full (один TUN+SOCKS core на узел, все "
+            "базовые проверки через него).")
+        resilience_enabled = False
+        _skip_initial_when_tun = True
+        _skip_telegram_pro_when_tun = True
+        _skip_route_when_tun = True
+        _skip_recheck_when_tun = True
+
     if resilience_enabled:
         progress.add_stage("resilience", 0.10, total=1)
-    progress.add_stage("recheck", 0.05, total=1)
+    if tun_full_enabled:
+        progress.add_stage("tun_full", 0.30, total=1)
+    if not _skip_recheck_when_tun:
+        progress.add_stage("recheck", 0.05, total=1)
     progress.add_stage("geo", 0.10, total=1)
 
     ping_idx = progress.stage_index("ping")
@@ -216,6 +350,7 @@ def run(
     route_idx = progress.stage_index("route")
     zapret_idx = progress.stage_index("zapret")
     resilience_idx = progress.stage_index("resilience") if resilience_enabled else -1
+    tun_full_idx = progress.stage_index("tun_full") if tun_full_enabled else -1
     recheck_idx = progress.stage_index("recheck")
     geo_idx = progress.stage_index("geo")
 
@@ -232,6 +367,29 @@ def run(
     # ---------------------------------------------------------------------
     start_stage = args.start_stage
     if start_stage == "ping":
+        # Предварительная проверка доступности DNS и DoH (модель Karing).
+        # Если оба недоступны, останавливаемся до запуска тестов: иначе
+        # системные настройки DNS испортят результаты проверок узлов.
+        preflight = run_network_diagnostic(
+            dns_timeout=min(2.0, args.timeout),
+            doh_timeout=min(4.0, args.timeout),
+            http_timeout=min(4.0, args.timeout),
+        )
+        log(
+            f"[sub] preflight network: udp_dns={preflight.udp_dns_ok} "
+            f"doh={preflight.doh_ok} http={preflight.http_ok} "
+            f"tun={preflight.tun_present} internet={preflight.internet_ok}"
+        )
+        if not preflight.internet_ok:
+            log(
+                "[sub] ERROR: локальная сеть не готова (DNS/HTTPS недоступны). "
+                "Проверьте подключение к сети и настройки DNS."
+            )
+            for err in preflight.errors:
+                log(f"[sub] preflight error: {err}")
+            progress.close()
+            return 1
+
         progress.start_stage(0, f"загрузка {len(sources)} подписок")
 
         working, rejected, discovered = run_refresh(
@@ -308,9 +466,13 @@ def run(
             ):
                 if _stage_idx >= 0 and not progress.is_completed(_stage_idx):
                     progress.finish_stage(_stage_idx, f"[{_stage_name}] пропущен (перепроверка с {start_stage})")
-        # Если начинаем с recheck — пропускаем также Zapret.
+        # Если начинаем с recheck — пропускаем также Zapret и TUN-full.
         if start_stage == "recheck":
             args.zapret_check = False
+            if getattr(args, 'tun_check', False):
+                args.tun_check = False
+                if tun_full_idx >= 0 and not progress.is_completed(tun_full_idx):
+                    progress.finish_stage(tun_full_idx, "[tun_full] пропущен (перепроверка с recheck)")
 
     # ---------------------------------------------------------------------
     # Initial Check: быстрая проверка доступности (TCP + HTTP HEAD).
@@ -319,7 +481,7 @@ def run(
     # прогоне; при перепроверке с этапа узлы уже проверены — пропускаем.
     # ---------------------------------------------------------------------
     initial_check_report: dict[str, Any] = {}
-    if start_stage == "ping":
+    if start_stage == "ping" and not _skip_initial_when_tun:
         initial_orig_count = len(working)
         log(f"[sub] Initial check enabled, timeout={args.initial_check_timeout}s, checking {initial_orig_count} nodes...")
         if initial_idx >= 0:
@@ -368,7 +530,7 @@ def run(
         }
     else:
         if initial_idx >= 0 and not progress.is_completed(initial_idx):
-            progress.finish_stage(initial_idx, f"[initial] пропущен (перепроверка с {start_stage})")
+            progress.finish_stage(initial_idx, f"[initial] пропущен (TUN-check или перепроверка с {start_stage})")
 
     # DPI-проверка (обход блокировок) через XrayCoreRuntime.
     if args.dpi_check:
@@ -527,7 +689,7 @@ def run(
     # Продвинутая Telegram-проверка (MTProto connect/auth, upload)
     # с расчётом telegram_score.
     telegram_pro_report: dict[str, Any] = {}
-    if not args.no_telegram:
+    if not args.no_telegram and not _skip_telegram_pro_when_tun:
         telegram_pro_orig_count = len(working)
         log(
             f"[sub] Telegram-PRO check enabled, checking {telegram_pro_orig_count} nodes..."
@@ -593,7 +755,7 @@ def run(
     # при полном прогоне, скрыт из UI.
     # ---------------------------------------------------------------------
     route_report: dict[str, Any] = {}
-    if start_stage == "ping":
+    if start_stage == "ping" and not _skip_route_when_tun:
         route_orig_count = len(working)
         log(
             f"[sub] ROUTE trace enabled, probes={ROUTE_PROBES}, checking {route_orig_count} nodes..."
@@ -636,7 +798,7 @@ def run(
         }
     else:
         if route_idx >= 0 and not progress.is_completed(route_idx):
-            progress.finish_stage(route_idx, f"[route] пропущен (перепроверка с {start_stage})")
+            progress.finish_stage(route_idx, f"[route] пропущен (TUN-check или перепроверка с {start_stage})")
 
     # Zapret-проверка (методика C:\Zapret: DPI suite tcp 16-20 + HTTP test).
     zapret_report: dict[str, Any] = {}
@@ -734,9 +896,15 @@ def run(
 
     # Resilience check: проверка живучести узлов в условиях блокировок (теперь всегда включена по умолчанию).
     # Выполняется ПЕРЕД стресс-тестом для отсеивания мёртвых узлов до дорогих проверок.
+    # При включённом --tun-check resilience дублируется внутри probe_node_full,
+    # поэтому пропускается (resilience_enabled = False выставлено выше).
     resilience_report: dict[str, Any] = {}
 
-    resilience_enabled = getattr(args, 'resilience_check', True)
+    if not tun_full_enabled:
+        # Только если TUN-check не включён, читаем флаг из args. Иначе
+        # оставляем значение False, выставленное выше (TUN-check дублирует
+        # resilience внутри probe_node_full).
+        resilience_enabled = getattr(args, 'resilience_check', True)
     if resilience_enabled:
         from checkers.resilience import check_node_resilience_detailed
 
@@ -797,14 +965,122 @@ def run(
         log("[sub] Resilience check disabled via --no-resilience-check")
         resilience_report = {"enabled": False}
 
+    # ---------------------------------------------------------------------
+    # TUN-полная проверка (Karing-стиль): один core на узел с TUN+SOCKS,
+    # все проверки через один SOCKS-порт. Это ЗАМЕНЯЕТ множество отдельных
+    # поднятий ядра (раньше: initial_check, dpi, telegram_pro, route, zapret,
+    # resilience — каждое поднимало свой core). Теперь: один core, прогоняем
+    # ping + telegram + chatgpt + instagram + speed + TUN-связность.
+    #
+    # DNS-резолвинг выполняет сам прокси-сервер (через outbound), а не
+    # локальный резолвер — это критично для заблокированных сетей, где
+    # локальный DNS режется провайдером.
+    # ---------------------------------------------------------------------
+    tun_full_report: dict[str, Any] = {"enabled": tun_full_enabled}
+    if tun_full_enabled:
+        from xray_runtime import XrayCoreRuntime, XrayRuntimeConfig
+
+        tun_full_orig_count = len(working)
+        log(f"[sub] TUN-full check enabled, checking {tun_full_orig_count} nodes through virtual TUN adapter...")
+        if tun_full_idx >= 0:
+            progress.start_stage(tun_full_idx, f"TUN-проверка {tun_full_orig_count} узлов")
+            progress.set_total(tun_full_idx, tun_full_orig_count)
+
+        tun_config = XrayRuntimeConfig(
+            subscription_urls=[],
+            probe_workers=1,
+            probe_timeout_sec=max(2.0, args.timeout),
+            min_speed_kbps=float(args.min_speed),
+            telegram_media_check=not args.no_telegram,
+        )
+        tun_runtime = XrayCoreRuntime(
+            tun_config,
+            root_dir=ROOT,
+            out_dir=DATA_DIR / ".runtime_cache" / "tun",
+            log_sink=log,
+        )
+        tun_node_details: dict[str, Any] = {}
+        tun_passed = 0
+        tun_failed = 0
+        # Результаты TUN-проверки обновляют поля в working (latency, chatgpt, etc).
+        checked_tun: list[Any] = []
+        try:
+            for idx, w in enumerate(working, 1):
+                if cancel_event and cancel_event.is_set():
+                    raise RuntimeError("refresh_cancelled")
+                while pause_event and pause_event.is_set():
+                    if cancel_event and cancel_event.is_set():
+                        raise RuntimeError("refresh_cancelled")
+                    time.sleep(0.2)
+                if tun_full_idx >= 0:
+                    progress.update(idx, f"TUN {w.node.title()}")
+
+                # probe_node_full: один core на узел, все проверки через него.
+                # tun=True → поднимает TUN+SOCKS, гоняет системный трафик через TUN.
+                # speed_test=not args.no_stress → спид-тест только если стресс включён.
+                tun_res = tun_runtime.probe_node_full(
+                    w.node,
+                    tun=True,
+                    speed_test=not args.no_stress,
+                    karing_log=True,
+                )
+                tun_node_details[w.node.title()] = {
+                    "title": w.node.title(),
+                    "accepted": tun_res.accepted,
+                    "reason": tun_res.reason,
+                    "latency_ms": tun_res.latency_ms,
+                    "dc_latency_ms": tun_res.dc_latency_ms,
+                    "chatgpt_ok": not tun_res.chatgpt_blocked,
+                    "chatgpt_latency_ms": tun_res.chatgpt_latency_ms,
+                    "instagram_ok": not tun_res.instagram_blocked,
+                    "instagram_latency_ms": tun_res.instagram_latency_ms,
+                    "download_kbps": tun_res.download_kbps,
+                    "upload_kbps": tun_res.upload_kbps,
+                }
+                if tun_res.accepted:
+                    tun_passed += 1
+                    checked_tun.append(w)
+                    log(
+                        f"[tun_full] PASS {idx}/{tun_full_orig_count}: {w.node.title()} "
+                        f"(ping={tun_res.latency_ms:.0f}ms"
+                        + (f", dl={tun_res.download_kbps:.0f}K" if tun_res.download_kbps else "")
+                        + f", chatgpt={'ok' if not tun_res.chatgpt_blocked else 'blocked'}"
+                        + f", instagram={'ok' if not tun_res.instagram_blocked else 'blocked'})"
+                    )
+                else:
+                    tun_failed += 1
+                    log(f"[tun_full] FAIL {idx}/{tun_full_orig_count}: {w.node.title()} ({tun_res.reason})")
+        finally:
+            with contextlib.suppress(Exception):
+                tun_runtime.stop()
+
+        if tun_full_idx >= 0:
+            progress.finish_stage(
+                tun_full_idx,
+                f"[tun_full] done: {tun_passed} passed, {tun_failed} failed (out of {tun_full_orig_count})",
+            )
+
+        tun_full_report = {
+            "enabled": True,
+            "checked": tun_full_orig_count,
+            "passed": tun_passed,
+            "failed": tun_failed,
+            "nodes": tun_node_details,
+        }
+        # TUN-проверка НЕ отбраковывает узлы (Karing-стиль: информационный
+        # сигнал). Рабочие узлы остаются в working, чтобы последующие этапы
+        # (recheck, geo) могли их обработать.
+
     if args.limit > 0:
         working = working[: args.limit]
 
     # Финальный спидтест (после всех проверок, включая zapret):
     # поднимаем прокси узла и реально качаем с speed.cloudflare.com, чтобы
     # закрепить скорость и отсеять узлы, которые просели к этому моменту.
+    # При включённом --tun-check пропускается: спид-тест уже выполнен
+    # внутри probe_node_full через тот же TUN+SOCKS core.
     recheck_report: dict[str, Any] = {}
-    if not args.no_stress:
+    if not args.no_stress and not _skip_recheck_when_tun:
         recheck_orig_count = len(working)
         recheck_min_speed = args.min_speed
         log(
@@ -940,6 +1216,11 @@ def run(
             "min_speed_kbps": recheck_min_speed,
             "speeds": recheck_speeds,
         }
+    elif _skip_recheck_when_tun:
+        # TUN-check: recheck пропущен — спид-тест выполнен внутри probe_node_full.
+        recheck_report = {"enabled": False, "reason": "skipped_by_tun_check"}
+        if recheck_idx >= 0 and not progress.is_completed(recheck_idx):
+            progress.finish_stage(recheck_idx, "[recheck] пропущен (TUN-check — спид-тест уже выполнен внутри probe_node_full)")
 
     # Geo-стадия (последняя): определяет имена стран для узлов.
     last_call: list[float] = [0.0]
@@ -991,6 +1272,118 @@ def run(
         plain=args.plain,
     )
 
+    # ---------------------------------------------------------------------
+    # WARP-резерв: если включён --add-warp, после завершения основного
+    # пайплайна запрашиваем WARP-конфиг у cyb-portal и добавляем warp://
+    # URL в конец subs.txt/working.txt как fallback. WARP не тестируется
+    # (Cloudflare стабилен) — он работает как «последний рубеж», если все
+    # vless-узлы упали.
+    # ---------------------------------------------------------------------
+    warp_report: dict[str, Any] = {"enabled": bool(getattr(args, "add_warp", False))}
+    if getattr(args, "add_warp", False):
+        # Список индексов пресетов (по умолчанию [0] = «Авто»).
+        preset_indices = list(getattr(args, "warp_preset", [0]) or [0])
+        if not isinstance(preset_indices, list):
+            preset_indices = [preset_indices]
+        preset_indices = [int(i) for i in preset_indices if i is not None]
+        if not preset_indices:
+            preset_indices = [0]
+
+        # Кастомный DNS (если указан через --warp-dns).
+        custom_dns_str = str(getattr(args, "warp_dns", "") or "").strip()
+        custom_dns = None
+        if custom_dns_str:
+            custom_dns = [d.strip() for d in custom_dns_str.split(",") if d.strip()]
+            log(f"[sub] WARP: кастомный DNS: {custom_dns}")
+
+        log(f"[sub] WARP: запрашиваем конфиг у Cloudflare API (пресеты: {preset_indices}) ...")
+        try:
+            from subgen.warp import (
+                WARP_PRESETS,
+                generate_warp_uri,
+                generate_warp_uris_for_presets,
+                _build_uris_for_preset,
+                fetch_warp_config_parsed,
+                warp_config_to_uri,
+            )
+            from copy import deepcopy
+
+            # Если выбран только пресет 0 (Авто) — один конфиг.
+            # Если выбраны пресеты 1-4 — несколько URL с разными endpoint:port.
+            if preset_indices == [0]:
+                cfg = fetch_warp_config_parsed(timeout=45.0)
+                if custom_dns:
+                    cfg.dns = list(custom_dns)
+                warp_uris = [warp_config_to_uri(cfg)]
+                preset_names = ["Авто"]
+            else:
+                preset_names = []
+                for idx in preset_indices:
+                    if 0 <= idx < len(WARP_PRESETS):
+                        preset_names.append(WARP_PRESETS[idx].user_facing)
+                total_expected = sum(
+                    WARP_PRESETS[idx].total for idx in preset_indices
+                    if 0 <= idx < len(WARP_PRESETS)
+                )
+                log(f"[sub] WARP: пресеты: {', '.join(preset_names)} — ожидается до {total_expected} конфигов")
+                # Если указан кастомный DNS — подменяем в пресетах.
+                if custom_dns:
+                    cfg = fetch_warp_config_parsed(timeout=45.0)
+                    cfg.dns = list(custom_dns)
+                    warp_uris = []
+                    seen_ep: set[tuple[str, int]] = set()
+                    import re
+                    endpoint_re = re.compile(r"@([^:/?#]+):(\d+)\b")
+                    for idx in preset_indices:
+                        if 0 <= idx < len(WARP_PRESETS):
+                            preset = WARP_PRESETS[idx]
+                            for uri in _build_uris_for_preset(cfg, preset):
+                                m = endpoint_re.search(uri)
+                                if m:
+                                    ep_key = (m.group(1).lower(), int(m.group(2)))
+                                    if ep_key in seen_ep:
+                                        continue
+                                    seen_ep.add(ep_key)
+                                warp_uris.append(uri)
+                else:
+                    warp_uris = generate_warp_uris_for_presets(preset_indices, timeout=45.0)
+
+            log(f"[sub] WARP: получено {len(warp_uris)} конфиг(ов), добавляем в подписку")
+
+            # Читаем текущий текст подписки и добавляем warp:// URL в конец.
+            try:
+                existing_text = working_path.read_text(encoding="utf-8") if working_path.exists() else ""
+            except Exception:
+                existing_text = ""
+            if existing_text and not existing_text.endswith("\n"):
+                existing_text += "\n"
+            for uri in warp_uris:
+                existing_text += uri + "\n"
+                log(f"[sub] WARP: + {uri[:90]}...")
+            write_file(working_path, existing_text)
+
+            # Для base64-подписки (subs.txt) — пересобираем base64 из
+            # обновлённого текста (если не --plain).
+            if not args.plain:
+                new_b64 = base64.b64encode(existing_text.encode("utf-8")).decode("ascii")
+                write_file(out_path, new_b64)
+                subscription_b64 = new_b64
+            else:
+                write_file(out_path, existing_text)
+                subscription_b64 = existing_text
+
+            warp_report["added"] = True
+            warp_report["presets"] = preset_names
+            warp_report["preset_indices"] = preset_indices
+            warp_report["uris"] = warp_uris
+            log(f"[sub] WARP: {len(warp_uris)} конфиг(ов) добавлено в подписку (пресеты: {', '.join(preset_names)})")
+        except Exception as exc:
+            warp_report["added"] = False
+            warp_report["error"] = str(exc)
+            log(f"[sub] WARP: ОШИБКА — не удалось добавить конфиг: {exc}")
+    else:
+        warp_report["added"] = False
+
     # Отчёт.
     report: dict[str, Any] = {
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1005,7 +1398,10 @@ def run(
         "telegram_pro": telegram_pro_report,
         "route": route_report,
         "zapret": zapret_report,
+        "resilience": resilience_report,
+        "tun_full": tun_full_report,
         "recheck": recheck_report,
+        "warp": warp_report,
         "nodes": rows,
     }
 

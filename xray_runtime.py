@@ -86,6 +86,54 @@ TELEGRAM_API_HEAD_TARGET = ("api.telegram.org", 443, "api.telegram.org")
 # Клиентский MTProto сервер Telegram (DC), используемый при медиа-проверке.
 TELEGRAM_MEDIA_DC = ("149.154.167.220", 443)
 
+# Дополнительные запрещённые в РФ цели: ChatGPT и Instagram.
+# Проверка не является обязательной для принятия узла (Telegram и спид-тест
+# остаются основным критерием), но позволяет отличить «живой, но частично
+# заблокированный» узел от полностью пригодного.
+CHATGPT_PROBE_TARGETS = [
+    ("chatgpt.com", 443, "chatgpt.com"),
+    ("chat.openai.com", 443, "chat.openai.com"),
+]
+INSTAGRAM_PROBE_TARGETS = [
+    ("instagram.com", 443, "instagram.com"),
+    ("www.instagram.com", 443, "www.instagram.com"),
+    ("i.instagram.com", 443, "i.instagram.com"),
+]
+BLOCKED_MEDIA_TARGETS = CHATGPT_PROBE_TARGETS + INSTAGRAM_PROBE_TARGETS
+
+# ---------------------------------------------------------------------------
+# TUN-конфигурация (тестирование через виртуальный адаптер вместо SOCKS).
+#
+# TUN-проверка поднимает ядро (xray/sing-box) с дополнительным inbound-ом
+# типа tun, перехватывает системный трафик на 53/UDP (DNS) и маршрутизирует
+# его в прокси-аутбаунд. Это позволяет гонять реальные HTTPS/DNS-запросы
+# «как их видит ОС» — модель Karing NetCheckScreen: проверка связности
+# через TUN, а не через явный SOCKS-прокси.
+#
+# На Windows для xray-TUN обязателен внешний wintun.dll рядом с бинарником.
+# sing-box 1.13.16 собран с тегом with_gvisor — его TUN-стек gvisor НЕ
+# требует внешнего драйвера, но всё равно требует прав администратора для
+# создания виртуального адаптера и модификации маршрутов.
+# ---------------------------------------------------------------------------
+TUN_INTERFACE_NAME = "sgtun0"
+TUN_INET4_ADDRESS = "172.19.0.1/30"
+TUN_INET6_ADDRESS = "fdfe:dcba:9876::1/126"
+TUN_MTU = 1500
+WINTUN_DLL_NAME = "wintun.dll"
+
+# Дополнительные HTTPS-цели для пинга (Karing-стиль). Раньше проверяли
+# только GSTATIC + IP-SB — если оба заблокированы/недоступны, узел
+# отбраковывался. Теперь перебираем все цели: GSTATIC → IP-SB → Cloudflare
+# → Google → Microsoft. Успешный ответ ЛЮБОЙ из них = узел жив.
+PING_HTTPS_TARGETS = [
+    ("www.gstatic.com", 443, "www.gstatic.com", "/generate_204"),
+    ("api.ip.sb", 443, "api.ip.sb", "/ip"),
+    ("cp.cloudflare.com", 443, "cp.cloudflare.com", "/generate_204"),
+    ("www.google.com", 443, "www.google.com", "/generate_204"),
+    ("www.microsoft.com", 443, "www.microsoft.com", "/generate_204"),
+    ("www.apple.com", 443, "www.apple.com", "/generate_204"),
+]
+
 # Фильтр «мёртвых» подписок: после N последовательных неудач источник
 # исключается из повторных попыток на cooldown, чтобы refresh не тратил
 # время (и не входил в бесконечный цикл) на гарантированно недоступные URL.
@@ -170,6 +218,10 @@ class XrayProbeResult:
     runtime: str
     api_latency_ms: float | None = None
     dc_latency_ms: float | None = None
+    chatgpt_latency_ms: float | None = None
+    instagram_latency_ms: float | None = None
+    chatgpt_blocked: bool = False
+    instagram_blocked: bool = False
     download_kbps: float | None = None
     upload_kbps: float | None = None
     # True — нода прошла ПОЛНУЮ проверку (спидтест + доступность Telegram).
@@ -189,6 +241,10 @@ class XrayProbeResult:
             "latency_ms": self.latency_ms,
             "api_latency_ms": self.api_latency_ms,
             "dc_latency_ms": self.dc_latency_ms,
+            "chatgpt_latency_ms": self.chatgpt_latency_ms,
+            "instagram_latency_ms": self.instagram_latency_ms,
+            "chatgpt_blocked": self.chatgpt_blocked,
+            "instagram_blocked": self.instagram_blocked,
             "download_kbps": self.download_kbps,
             "upload_kbps": self.upload_kbps,
             "fully_checked": self.fully_checked,
@@ -237,6 +293,10 @@ class XrayCoreRuntime:
         self._pid_path = self.out_dir / "xray_runtime.pid"
         self._shutdown_requested = False
         self._job_handle: int | None = _create_kill_on_close_job()
+        # True, если активный процесс ядра запущен в TUN-режиме. stop()
+        # сбрасывает флаг: ядро убито → TUN-адаптер и маршруты освобождены
+        # ОС автоматически (владельцем ресурсов был killed-процесс).
+        self._tun_active: bool = False
         self._cleanup_stale_processes()
         atexit.register(self.stop)
         self.active_result: XrayProbeResult | None = None
@@ -319,14 +379,20 @@ class XrayCoreRuntime:
                 stale_pid = self._read_pid_file()
                 if stale_pid:
                     _terminate_pid_tree(stale_pid, timeout=timeout)
+            # В TUN-режиме после остановки процесса ОС автоматически удаляет
+            # виртуальный адаптер и маршруты (владелец — killed-процесс).
+            was_tun = self._tun_active
             self._process = None
             self._running_node = None
+            self._tun_active = False
             self._unlink_pid_file()
             self._reset_process_job()
             if self._config_path:
                 with contextlib.suppress(Exception):
                     Path(self._config_path).unlink(missing_ok=True)
                 self._config_path = ""
+            if was_tun:
+                self._log("[xray] TUN-интерфейс освобождён вместе с остановкой ядра")
             self._emit("xray_state", running=False)
 
     def shutdown(self, timeout: float = 5.0) -> None:
@@ -502,24 +568,101 @@ class XrayCoreRuntime:
                 return
 
             # ---------- Фаза 1: быстрый параллельный пинг всех нод ----------
+            # ---------------------------------------------------------------
+            # Предварительный TCP-ping: отсеивает мёртвые узлы (закрытые порты,
+            # недоступные IP) за секунды, без поднятия ядра. Только узлы с
+            # открытым портом идут в дорогой _probe_node_ping ниже.
+            # На 10000 узлов: TCP-ping ~30 сек, xray-ping был бы ~5-8 часов.
+            # ---------------------------------------------------------------
+            # TCP-ping таймаут: 5 сек (а не 2) — это компромисс.
+            # 2 сек слишком мало для мобильных сетей с потерями и спутников
+            # (RTT 600-1500ms), а также для дальних серверов (Австралия/
+            # Сингапур). 5 сек покрывает большинство реальных сценариев
+            # и всё ещё в 3 раза быстрее, чем 15-секундный SOCKS-ping.
+            # Берём min(5.0, probe_timeout_sec) — если пользователь явно
+            # поставил короткий --timeout, уважаем его.
+            tcp_timeout_phase1 = min(5.0, float(self.config.probe_timeout_sec or 8.0))
+            # TCP/UDP-ping — дешёвый I/O (просто сокеты, без subprocess).
+            # Не зависит от RAM/CPU так, как SOCKS-ping с xray.exe.
+            # Ставим минимум 256 потоков — это безопасно даже на слабом CPU,
+            # т.к. потоки в основном ждут сети (timeout), а не крутят CPU.
+            # При workers >= 32 масштабируем до 512 — это ускорит TCP-ping
+            # на больших списках без ущерба для системы.
+            tcp_workers_phase1 = max(256, int(self.config.probe_workers or 1) * 8)
+            self._log(
+                f"[xray] TCP/UDP-ping prefilter: {len(nodes)} nodes, "
+                f"timeout={tcp_timeout_phase1}s, workers={tcp_workers_phase1} "
+                f"(TCP for vless/vmess/trojan/ss, UDP for hysteria/hy2)"
+            )
+            alive_nodes_phase1: list[XrayNode] = []
+            tcp_dead_phase1 = 0
+            tcp_started_phase1 = time.monotonic()
+            with ThreadPoolExecutor(max_workers=tcp_workers_phase1, thread_name_prefix="tcp-ping") as tcp_exec:
+                # Используем _tcp_udp_ping_node: для vless/vmess/trojan/ss
+                # это TCP-ping, для hysteria/hy2 — UDP-ping (QUIC-like probe).
+                tcp_futures = {tcp_exec.submit(_tcp_udp_ping_node, n, tcp_timeout_phase1): n for n in nodes}
+                for tcp_f in as_completed(tcp_futures):
+                    _wait_if_paused(pause_event, cancel_event)
+                    if cancel_event and cancel_event.is_set():
+                        raise RuntimeError("refresh_cancelled")
+                    n = tcp_futures[tcp_f]
+                    if tcp_f.result() is not None:
+                        alive_nodes_phase1.append(n)
+                    else:
+                        tcp_dead_phase1 += 1
+            self._log(
+                f"[xray] TCP/UDP-ping done in {time.monotonic() - tcp_started_phase1:.1f}s: "
+                f"{len(alive_nodes_phase1)} alive, {tcp_dead_phase1} dead (filtered out before xray-ping)"
+            )
+
+            # Все TCP-мёртвые узлы сразу попадают в rejected с причиной
+            # tcp_ping_failed — они не пойдут в дорогой xray-ping.
+            # Используем node.key (хешируемый tuple) для membership-проверки,
+            # т.к. XrayNode не реализует __hash__ по умолчанию.
+            alive_keys_phase1 = {n.key for n in alive_nodes_phase1}
+            tcp_rejected = [
+                XrayProbeResult(n, False, "tcp_ping_failed", None, 0, 1, n.runtime)
+                for n in nodes if n.key not in alive_keys_phase1
+            ]
+            # Заменяем nodes на TCP-живые — дальше пингуем только их.
+            nodes_for_ping = alive_nodes_phase1
+
             ping_outcomes: list[XrayProbeResult] = []
             completed = 0
             workers = max(8, int(self.config.probe_workers or 1) * 2)
+            if not nodes_for_ping:
+                self._log("[xray] WARNING: после TCP-ping не осталось живых узлов для xray-ping")
+                with self._lock:
+                    self.ping_candidates = []
+                    self.last_rejected = list(tcp_rejected)
+                    self.last_refresh_finished_at = time.time()
+                self._emit(
+                    "xray_refresh_complete",
+                    working=0,
+                    rejected=len(tcp_rejected),
+                    total=len(nodes),
+                    phase="ping",
+                    candidates=0,
+                    reason_counts={"tcp_ping_failed": len(tcp_rejected)},
+                )
+                return
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="xray-ping") as executor:
-                futures = {executor.submit(self._probe_node_ping, node): node for node in nodes}
+                futures = {executor.submit(self._probe_node_ping, node): node for node in nodes_for_ping}
                 for future in as_completed(futures):
                     _wait_if_paused(pause_event, cancel_event)
                     if cancel_event and cancel_event.is_set():
                         raise RuntimeError("refresh_cancelled")
                     node = futures[future]
                     completed += 1
-                    self._emit("xray_probe_progress", index=completed, total=len(nodes), node=node.title(), phase="ping")
+                    self._emit("xray_probe_progress", index=completed, total=len(nodes_for_ping), node=node.title(), phase="ping")
                     outcome = future.result()
                     ping_outcomes.append(outcome)
                     status = "ok" if outcome.accepted else outcome.reason
                     latency = f"{outcome.latency_ms:.0f}ms" if outcome.latency_ms is not None else "-"
                     self._log(f"[xray] ping {node.protocol} {node.host}:{node.port} -> {status} {latency}")
 
+            # Объединяем: TCP-мёртвые + xray-ping rejected.
+            ping_outcomes.extend(tcp_rejected)
             ping_accepted = sorted(
                 (item for item in ping_outcomes if item.accepted),
                 key=lambda item: (float("inf") if item.latency_ms is None else float(item.latency_ms)),
@@ -528,7 +671,7 @@ class XrayCoreRuntime:
                 self.ping_candidates = ping_accepted
                 self.last_rejected = [item for item in ping_outcomes if not item.accepted]
 
-            self._log(f"[xray] phase 1 done: {len(self.ping_candidates)}/{len(nodes)} passed ping")
+            self._log(f"[xray] phase 1 done: {len(self.ping_candidates)}/{len(nodes)} passed ping (TCP-ping filtered {len(tcp_rejected)} dead)")
 
             # Сразу включаем конфигурацию с лучшим пингом, пока идёт стресс-тест.
             if self.ping_candidates and not self.is_running():
@@ -691,10 +834,69 @@ class XrayCoreRuntime:
                     return len(self.last_working)
 
             self._log(f"[xray] quick ping sort for {len(nodes)} nodes")
+            # ---------------------------------------------------------------
+            # Предварительный TCP-ping: быстрый connect к (host, port) без
+            # поднятия ядра. Отсеивает 60-70% мёртвых узлов (закрытые порты,
+            # таймауты, недоступные IP) за ~30 сек вместо часов xray-ping.
+            # Только узлы с открытым портом идут в дорогой xray-ping ниже.
+            # ---------------------------------------------------------------
+            workers = max(8, int(self.config.probe_workers or 1) * 2)
+            # TCP-ping таймаут: 5 сек (см. комментарий в refresh() выше).
+            tcp_timeout = min(5.0, float(self.config.probe_timeout_sec or 8.0))
+            # TCP/UDP-ping — дешёвый I/O, минимум 256 потоков.
+            # (см. комментарий в refresh() — тот же подход.)
+            tcp_workers = max(256, int(self.config.probe_workers or 1) * 8)
+            self._log(f"[xray] TCP/UDP-ping prefilter: {len(nodes)} nodes, timeout={tcp_timeout}s, workers={tcp_workers} (TCP+UDP)")
+            alive_nodes: list[XrayNode] = []
+            tcp_dead = 0
+            tcp_started = time.monotonic()
+            with ThreadPoolExecutor(max_workers=tcp_workers, thread_name_prefix="tcp-ping") as tcp_executor:
+                # _tcp_udp_ping_node: TCP для vless/vmess/trojan/ss,
+                # UDP для hysteria/hy2 (см. _udp_ping_node).
+                tcp_futures = {tcp_executor.submit(_tcp_udp_ping_node, node, tcp_timeout): node for node in nodes}
+                for tcp_future in as_completed(tcp_futures):
+                    _wait_if_paused(pause_event, cancel_event)
+                    if cancel_event and cancel_event.is_set():
+                        raise RuntimeError("refresh_cancelled")
+                    node = tcp_futures[tcp_future]
+                    latency = tcp_future.result()
+                    if latency is not None:
+                        alive_nodes.append(node)
+                    else:
+                        tcp_dead += 1
+            tcp_elapsed = time.monotonic() - tcp_started
+            self._log(
+                f"[xray] TCP/UDP-ping done in {tcp_elapsed:.1f}s: "
+                f"{len(alive_nodes)} alive, {tcp_dead} dead (filtered out before xray-ping)"
+            )
+
+            # Если после TCP-ping ничего не осталось — выходим без xray-ping.
+            if not alive_nodes:
+                self._log("[xray] WARNING: после TCP-ping не осталось живых узлов")
+                with self._lock:
+                    self.ping_candidates = []
+                    self.last_rejected = [
+                        XrayProbeResult(node, False, "tcp_ping_failed", None, 0, 1, node.runtime)
+                        for node in nodes
+                    ]
+                    self.last_refresh_finished_at = time.time()
+                self._emit(
+                    "xray_refresh_complete",
+                    working=0,
+                    rejected=len(nodes),
+                    total=len(nodes),
+                    phase="ping",
+                    candidates=0,
+                    reason_counts={"tcp_ping_failed": len(nodes)},
+                )
+                return 0
+
+            # Заменяем nodes на TCP-живые — дальше пингуем только их.
+            nodes = alive_nodes
+
             previous_working = list(self.last_working)
             previous_active = self.active_result
             outcomes: list[XrayProbeResult] = []
-            workers = max(8, int(self.config.probe_workers or 1) * 2)
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="xray-ping") as executor:
 
                 futures = {executor.submit(self._probe_node_ping, node): node for node in nodes}
@@ -1137,6 +1339,41 @@ class XrayCoreRuntime:
             api_latency = min(api_latencies)
             dc_latency = min(dc_latencies)
             accepted = dc_latency < 5000
+
+            # Дополнительные запрещённые в РФ цели: ChatGPT и Instagram.
+            # Эти проверки не влияют на accepted — узел считается рабочим, если
+            # Telegram и спид-тест прошли. Но мы фиксируем доступность, чтобы
+            # отличать полностью пригодный узел от частично заблокированного.
+            chatgpt_latencies: list[float] = []
+            for host, target_port, server_name in CHATGPT_PROBE_TARGETS:
+                latency = _socks_https_latency(
+                    "127.0.0.1",
+                    port,
+                    host,
+                    target_port,
+                    server_name,
+                    min(float(self.config.probe_timeout_sec or 8.0), 3.0),
+                )
+                if latency is not None:
+                    chatgpt_latencies.append(latency)
+            chatgpt_latency = min(chatgpt_latencies) if chatgpt_latencies else None
+            chatgpt_blocked = chatgpt_latency is None
+
+            instagram_latencies: list[float] = []
+            for host, target_port, server_name in INSTAGRAM_PROBE_TARGETS:
+                latency = _socks_https_latency(
+                    "127.0.0.1",
+                    port,
+                    host,
+                    target_port,
+                    server_name,
+                    min(float(self.config.probe_timeout_sec or 8.0), 3.0),
+                )
+                if latency is not None:
+                    instagram_latencies.append(latency)
+            instagram_latency = min(instagram_latencies) if instagram_latencies else None
+            instagram_blocked = instagram_latency is None
+
             download_kbps = None
             upload_kbps = None
             if accepted:
@@ -1165,6 +1402,10 @@ class XrayCoreRuntime:
                 node.runtime,
                 api_latency_ms=api_latency,
                 dc_latency_ms=dc_latency,
+                chatgpt_latency_ms=chatgpt_latency,
+                instagram_latency_ms=instagram_latency,
+                chatgpt_blocked=chatgpt_blocked,
+                instagram_blocked=instagram_blocked,
                 download_kbps=download_kbps,
                 upload_kbps=upload_kbps,
                 fully_checked=True,
@@ -1179,6 +1420,21 @@ class XrayCoreRuntime:
                     Path(config_path).unlink(missing_ok=True)
 
     def _probe_node_ping(self, node: XrayNode) -> XrayProbeResult:
+        """Быстрый пинг узла через SOCKS-прокси.
+
+        Ключевое отличие от старой версии: пинг НЕ отбраковывает узел, если
+        Telegram недоступен. Раньше узел, который работает, но не пингует
+        api.telegram.org, отбраковывался целиком (`telegram_api_bad_status`).
+        В Karing-стиле: узел остаётся в списке с пометкой telegram_blocked=True,
+        Telegram-проверка выполняется отдельно на этапе stress/telegram_pro.
+
+        Перебор HTTPS-целей: GSTATIC → IP-SB → Cloudflare → Google → Microsoft
+        → Apple. Успешный ответ ЛЮБОЙ из них = узел жив. Это критично для
+        заблокированных сетей, где часть CDN недоступна.
+
+        time.sleep(0.5) после старта ядра — даём xray/sing-box время поднять
+        SOCKS-сервер (раньше было 0.2 — слишком мало, первый запрос падал).
+        """
         if self._shutdown_requested:
             return XrayProbeResult(node, False, "runtime_shutdown", None, 0, 0, node.runtime)
         binary = self._binary_for_node(node)
@@ -1190,90 +1446,406 @@ class XrayCoreRuntime:
         started_at = time.monotonic()
         try:
             config_path = _write_temp_config(self._build_config(node, port))
+            # stderr=PIPE: при core exited читаем последние строки, чтобы
+            # понять причину (битый конфиг, неподдерживаемый шифр, кривой
+            # Reality pbk и т.д.). Без этого мы видели только «core exited»
+            # без объяснения, и не могли понять, почему 7-10% узлов падают.
             proc = subprocess.Popen(
                 [binary, "run", "-c", config_path],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 creationflags=_subprocess_no_window(),
             )
             self._assign_to_process_job(proc)
-            time.sleep(0.2)
+            # 0.5 сек — xray/sing-box не успевает поднять SOCKS быстрее,
+            # особенно с TUN+DNS-секцией. Раньше было 0.2 → первый запрос падал.
+            time.sleep(0.5)
             if proc.poll() is not None:
-                return XrayProbeResult(node, False, "core exited", None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_IP), node.runtime)
+                # Ядро упало при старте — читаем stderr и логируем.
+                stderr_tail = ""
+                try:
+                    stderr_bytes, _ = proc.communicate(timeout=2.0)
+                    stderr_text = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
+                    if stderr_text:
+                        stderr_tail = "\n".join(stderr_text.splitlines()[-3:])
+                except Exception:
+                    pass
+                if stderr_tail:
+                    self._log(f"[xray] {node.protocol} {node.host}:{node.port} core exited — {stderr_tail}")
+                return XrayProbeResult(node, False, "core exited", None, 0, len(PING_HTTPS_TARGETS), node.runtime)
+
+            # Перебор HTTPS-целей: берём первую успешную, остальные не ждём.
+            # Таймаут на цель — половина probe_timeout_sec, чтобы успеть
+            # попробовать несколько целей.
+            per_target_timeout = min(4.0, float(self.config.probe_timeout_sec or 8.0))
             ping_latencies: list[float] = []
-            for host, target_port, server_name, path in (GSTATIC_GENERATE_204, IP_SB_IP):
+            for host, target_port, server_name, path in PING_HTTPS_TARGETS:
                 latency = _socks_https_latency(
                     "127.0.0.1",
                     port,
                     host,
                     target_port,
                     server_name,
-                    float(self.config.probe_timeout_sec or 8.0),
+                    per_target_timeout,
                     path=path,
                 )
                 if latency is not None:
                     ping_latencies.append(latency)
+                    # Первой успешной достаточно — узел жив.
+                    break
             if not ping_latencies:
-                return XrayProbeResult(node, False, "quick_ping_failed", None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_IP), node.runtime)
+                return XrayProbeResult(node, False, "quick_ping_failed", None, 0, len(PING_HTTPS_TARGETS), node.runtime)
             ping_latency = min(ping_latencies)
             accepted = ping_latency < 5000
 
-            # Медиа-проверка Bot API: HEAD api.telegram.org (200/302) + MTProto DC.
+            # Telegram-проверка — НЕ блокирующая. Если недоступен, помечаем
+            # telegram_blocked=True, но узел остаётся в ping_candidates.
+            # Полная Telegram-проверка (MTProto DC + upload) выполняется
+            # отдельно на этапе telegram_pro.
             head_result = _socks_https_head_status(
                 "127.0.0.1",
                 port,
                 *TELEGRAM_API_HEAD_TARGET,
-                float(self.config.probe_timeout_sec or 8.0),
+                per_target_timeout,
             )
-            if head_result is None or head_result[0] not in (200, 302):
-                return XrayProbeResult(node, False, "telegram_api_bad_status", None, len(ping_latencies), len(GSTATIC_GENERATE_204) + len(IP_SB_IP), node.runtime)
-            dc_ok = False
-            for host, target_port in TELEGRAM_DCS:
-                latency = _socks_mtproto_latency(
-                    "127.0.0.1",
-                    port,
-                    host,
-                    target_port,
-                    float(self.config.probe_timeout_sec or 8.0),
-                )
-                if latency is not None:
-                    dc_ok = True
-                    break
-            if not dc_ok:
-                return XrayProbeResult(node, False, "telegram_dc_unreachable", None, len(ping_latencies), len(GSTATIC_GENERATE_204) + len(IP_SB_IP), node.runtime)
+            telegram_ok = head_result is not None and head_result[0] in (200, 302)
+            dc_latency: float | None = None
+            if telegram_ok:
+                for tg_host, tg_port in TELEGRAM_DCS:
+                    latency = _socks_mtproto_latency(
+                        "127.0.0.1",
+                        port,
+                        tg_host,
+                        tg_port,
+                        per_target_timeout,
+                    )
+                    if latency is not None:
+                        dc_latency = latency
+                        break
 
-            # Быстрая сортировка — только пинг и доступность Telegram, без спид-теста.
-            # Спид-тест выполняется отдельно при полной проверке (_probe_node),
-            # чтобы авто-переключение по высокой латентности не ждало замеров скорости.
             return XrayProbeResult(
                 node,
                 accepted,
                 "ready" if accepted else "slow",
                 ping_latency,
-                len(ping_latencies) + (2 if head_result is not None and dc_ok else 0),
-                len(GSTATIC_GENERATE_204) + len(IP_SB_IP),
+                len(ping_latencies) + (1 if telegram_ok else 0) + (1 if dc_latency is not None else 0),
+                len(PING_HTTPS_TARGETS) + 1 + len(TELEGRAM_DCS),
                 node.runtime,
-                dc_latency_ms=ping_latency,
+                dc_latency_ms=dc_latency,
                 download_kbps=None,
             )
         except Exception as exc:
-            return XrayProbeResult(node, False, str(exc), None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_IP), node.runtime)
+            return XrayProbeResult(node, False, str(exc), None, 0, len(PING_HTTPS_TARGETS), node.runtime)
 
         finally:
             if proc is not None and proc.poll() is None:
                 _terminate_process_tree(proc, timeout=max(0.2, 2.0 - (time.monotonic() - started_at)))
+            # Закрываем stderr-PIPE (см. probe_node_full для подробностей).
+            if proc is not None and proc.stderr is not None:
+                with contextlib.suppress(Exception):
+                    proc.stderr.close()
             if config_path:
                 with contextlib.suppress(Exception):
                     Path(config_path).unlink(missing_ok=True)
 
-    def _start_node(self, node: XrayNode, port: int) -> None:
+    def probe_node_full(
+        self,
+        node: XrayNode,
+        *,
+        tun: bool = False,
+        speed_test: bool = True,
+        karing_log: bool = True,
+    ) -> XrayProbeResult:
+        """Полная проверка узла через ОДИН core-процесс.
+
+        При ``tun=True`` (галочка «Тестировать через TUN» включена) —
+        **весь трафик проверки** (ping, telegram, chatgpt, instagram, speed)
+        идёт через СИСТЕМНЫЙ сетевой стек, который ядро заворачивает в TUN
+        (sing-box: ``auto_route=True``; xray: ``strictRoute=True``).
+        SOCKS-проверки в этом режиме НЕ используются — TUN-хелперы
+        (_tun_https_latency, _tun_mtproto_latency, _tun_download_speed и т.д.)
+        гоняют urllib/socket без SOCKS, и трафик автоматически уходит в TUN.
+
+        При ``tun=False`` (галочка выключена) — все проверки идут через
+        SOCKS-прокси как раньше (режим совместимости).
+
+        Архитектурное отличие от _probe_node + _stress_probe_node:
+        раньше для каждого этапа (ping, stress, telegram, chatgpt, instagram)
+        поднимался ОТДЕЛЬНЫЙ core-процесс. На 100 узлах × 5 этапов = 500
+        старт-стоп циклов xray.exe/sing-box.exe, ~8 минут чистого оверхеда.
+        Теперь: один core на узел, все проверки через один процесс, потом stop.
+
+        Karing-лог: структурированный вывод в log_sink.
+        """
+        if self._shutdown_requested:
+            return XrayProbeResult(node, False, "runtime_shutdown", None, 0, 0, node.runtime)
+        binary = self._binary_for_node(node)
+        if not binary:
+            return XrayProbeResult(node, False, f"{node.runtime} binary not found", None, 0, 0, node.runtime)
+
+        # Пререквизиты TUN: права администратора + wintun.dll (для xray).
+        # Если не выполнены — fallback на SOCKS-only с предупреждением.
+        use_tun = bool(tun)
+        if use_tun:
+            try:
+                _check_tun_prerequisites(node.runtime, binary, self.root_dir)
+            except RuntimeError as exc:
+                self._log(f"[diag] TUN недоступен, fallback на SOCKS-only: {exc}")
+                use_tun = False
+
+        port = _find_free_port()
+        config_path = ""
+        proc: subprocess.Popen | None = None
+        started_at = time.monotonic()
+        timeout = float(self.config.probe_timeout_sec or 8.0)
+
+        # Karing-лог: собираем строки, выводим в конце.
+        diag_lines: list[str] = []
+        def diag(line: str) -> None:
+            if karing_log:
+                diag_lines.append(line)
+
+        diag(f"=== Узел: {node.title()} ({node.runtime}) ===")
+        diag(f"Прокси-сервер: {node.protocol}://{node.host}:{node.port}")
+        diag(f"Режим: {'TUN (системный стек через auto_route)' if use_tun else 'SOCKS-only'}")
+
+        try:
+            config_path = _write_temp_config(self._build_config(node, port, tun=use_tun))
+            # stderr ядра в PIPE, а не DEVNULL: при падении ядра (например
+            # из-за кривого TUN-конфига) мы сможем прочитать сообщение об
+            # ошибке и залогировать его, а не гадать вслепую.
+            # stdout всё равно DEVNULL — он шумный и неинформативен.
+            proc = subprocess.Popen(
+                [binary, "run", "-c", config_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=_subprocess_no_window(),
+            )
+            self._assign_to_process_job(proc)
+            # TUN поднимается дольше SOCKS — даём 1.2 сек на auto_route
+            # и создание виртуального адаптера.
+            time.sleep(1.2 if use_tun else 0.5)
+            if proc.poll() is not None:
+                # Ядро упало при старте — читаем stderr и логируем.
+                diag("Прокси-сервер: НЕ запущен (core exited)")
+                stderr_output = ""
+                try:
+                    stderr_bytes, _ = proc.communicate(timeout=2.0)
+                    stderr_output = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                if stderr_output:
+                    # Берём последние ~5 строк — обычно там причина падения.
+                    tail = "\n".join(stderr_output.splitlines()[-5:])
+                    diag(f"Прокси-сервер: stderr: {tail}")
+                    self._log(f"[diag] {node.title()}: core exited — {tail}")
+                return XrayProbeResult(node, False, "core exited", None, 0, 0, node.runtime)
+            diag("Прокси-сервер: Соединение установлено успешно")
+
+            # Для TUN-режима: убеждаемся, что виртуальный адаптер создан.
+            # Без него системный трафик не пойдёт в TUN — все проверки упадут.
+            if use_tun:
+                iface_ok = _tun_interface_exists(TUN_INTERFACE_NAME)
+                if not iface_ok:
+                    diag(f"TUN: [ON] {TUN_INTERFACE_NAME}, интерфейс НЕ создан — проверка трафика пропущена")
+                    self._log(f"[diag] {node.title()}: TUN interface not created after start")
+                    return XrayProbeResult(node, False, "tun_iface_not_created", None, 0, 0, node.runtime)
+                diag(f"TUN: [ON] {TUN_INTERFACE_NAME}, интерфейс создан: OK")
+
+            # ---------------------------------------------------------------
+            # 1. PING: перебор HTTPS-целей.
+            #    TUN: через системный стек (auto_route заворачивает в TUN).
+            #    SOCKS: через SOCKS-прокси ядра.
+            # ---------------------------------------------------------------
+            per_target_timeout = min(4.0, timeout)
+            ping_latencies: list[float] = []
+            ping_target_hit = ""
+            for host, target_port, server_name, path in PING_HTTPS_TARGETS:
+                if use_tun:
+                    latency = _tun_https_latency(host, target_port, server_name, per_target_timeout, path=path)
+                else:
+                    latency = _socks_https_latency(
+                        "127.0.0.1", port, host, target_port, server_name,
+                        per_target_timeout, path=path,
+                    )
+                if latency is not None:
+                    ping_latencies.append(latency)
+                    ping_target_hit = host
+                    break
+            if not ping_latencies:
+                diag("HTTP через прокси: ВСЕ цели недоступны (ping failed)")
+                return XrayProbeResult(node, False, "quick_ping_failed", None, 0, len(PING_HTTPS_TARGETS), node.runtime)
+            ping_latency = min(ping_latencies)
+            diag(f"HTTP через прокси (ping): [{ping_target_hit}] [{ping_latency:.0f} ms] OK")
+
+            # ---------------------------------------------------------------
+            # 2. TELEGRAM: HEAD api.telegram.org + MTProto DC.
+            # НЕ блокирующий — узел остаётся, но telegram_blocked=True.
+            # ---------------------------------------------------------------
+            if use_tun:
+                head_result = _tun_https_head_status(
+                    *TELEGRAM_API_HEAD_TARGET, per_target_timeout,
+                )
+            else:
+                head_result = _socks_https_head_status(
+                    "127.0.0.1", port, *TELEGRAM_API_HEAD_TARGET, per_target_timeout,
+                )
+            telegram_ok = head_result is not None and head_result[0] in (200, 302)
+            dc_latency: float | None = None
+            if telegram_ok:
+                for tg_host, tg_port in TELEGRAM_DCS:
+                    if use_tun:
+                        latency = _tun_mtproto_latency(tg_host, tg_port, per_target_timeout)
+                    else:
+                        latency = _socks_mtproto_latency(
+                            "127.0.0.1", port, tg_host, tg_port, per_target_timeout,
+                        )
+                    if latency is not None:
+                        dc_latency = latency
+                        break
+            if telegram_ok:
+                dc_str = f", DC=[{dc_latency:.0f} ms]" if dc_latency is not None else ", DC=unreachable"
+                diag(f"HTTP через прокси (telegram): [api.telegram.org] OK{dc_str}")
+            else:
+                diag("HTTP через прокси (telegram): [api.telegram.org] BLOCKED")
+
+            # ---------------------------------------------------------------
+            # 3. CHATGPT: HTTPS HEAD chatgpt.com + chat.openai.com.
+            # ---------------------------------------------------------------
+            chatgpt_latencies: list[float] = []
+            for host, target_port, server_name in CHATGPT_PROBE_TARGETS:
+                if use_tun:
+                    latency = _tun_https_latency(host, target_port, server_name, min(timeout, 3.0))
+                else:
+                    latency = _socks_https_latency(
+                        "127.0.0.1", port, host, target_port, server_name,
+                        min(timeout, 3.0),
+                    )
+                if latency is not None:
+                    chatgpt_latencies.append(latency)
+            chatgpt_latency = min(chatgpt_latencies) if chatgpt_latencies else None
+            chatgpt_blocked = chatgpt_latency is None
+            if chatgpt_blocked:
+                diag("HTTP через прокси (chatgpt): [chatgpt.com] BLOCKED")
+            else:
+                diag(f"HTTP через прокси (chatgpt): [chatgpt.com] [{chatgpt_latency:.0f} ms] OK")
+
+            # ---------------------------------------------------------------
+            # 4. INSTAGRAM: HTTPS HEAD instagram.com.
+            # ---------------------------------------------------------------
+            instagram_latencies: list[float] = []
+            for host, target_port, server_name in INSTAGRAM_PROBE_TARGETS:
+                if use_tun:
+                    latency = _tun_https_latency(host, target_port, server_name, min(timeout, 3.0))
+                else:
+                    latency = _socks_https_latency(
+                        "127.0.0.1", port, host, target_port, server_name,
+                        min(timeout, 3.0),
+                    )
+                if latency is not None:
+                    instagram_latencies.append(latency)
+            instagram_latency = min(instagram_latencies) if instagram_latencies else None
+            instagram_blocked = instagram_latency is None
+            if instagram_blocked:
+                diag("HTTP через прокси (instagram): [instagram.com] BLOCKED")
+            else:
+                diag(f"HTTP через прокси (instagram): [instagram.com] [{instagram_latency:.0f} ms] OK")
+
+            # ---------------------------------------------------------------
+            # 5. SPEED TEST: download/upload (опционально).
+            #    TUN: через системный стек (urllib, auto_route в TUN).
+            #    SOCKS: через SOCKS-прокси.
+            # ---------------------------------------------------------------
+            download_kbps: float | None = None
+            upload_kbps: float | None = None
+            if speed_test:
+                if use_tun:
+                    download_kbps = _tun_download_speed(timeout)
+                else:
+                    download_kbps = _download_speed_probe("127.0.0.1", port, timeout)
+                if download_kbps is not None:
+                    diag(f"Спид-тест (download): [{download_kbps:.0f} КБ/с]")
+                else:
+                    diag("Спид-тест (download): FAILED")
+                if use_tun:
+                    upload_kbps = _tun_upload_speed(timeout)
+                else:
+                    upload_kbps = _xray_upload_speed("127.0.0.1", port, timeout)
+                if upload_kbps is not None:
+                    diag(f"Спид-тест (upload):   [{upload_kbps:.0f} КБ/с]")
+
+            # ---------------------------------------------------------------
+            # Итог: узел принимается, если ping прошёл. Telegram/chatgpt/
+            # instagram — информационные поля, не блокирующие (Karing-стиль).
+            # ---------------------------------------------------------------
+            accepted = ping_latency < 5000
+            # Если включён speed_test и скорость ниже порога — отбраковываем.
+            min_speed = float(getattr(self.config, "min_speed_kbps", XRAY_MIN_MEDIA_KBPS) or XRAY_MIN_MEDIA_KBPS)
+            if accepted and speed_test and download_kbps is not None and download_kbps < min_speed:
+                accepted = False
+                reason = f"slow_download ({download_kbps:.0f} < {min_speed:.0f})"
+            elif accepted and speed_test and upload_kbps is not None and upload_kbps < min_speed:
+                accepted = False
+                reason = f"slow_upload ({upload_kbps:.0f} < {min_speed:.0f})"
+            elif accepted:
+                reason = "ready"
+            else:
+                reason = "slow"
+
+            diag(f"=== Итог: {'ACCEPTED' if accepted else 'REJECTED'} ({reason}), ping={ping_latency:.0f}ms ===")
+            # Выводим собранный Karing-лог.
+            if karing_log:
+                for line in diag_lines:
+                    self._log(f"[diag] {line}")
+
+            return XrayProbeResult(
+                node,
+                accepted,
+                reason,
+                ping_latency,
+                1,
+                1,
+                node.runtime,
+                api_latency_ms=None,
+                dc_latency_ms=dc_latency,
+                chatgpt_latency_ms=chatgpt_latency,
+                instagram_latency_ms=instagram_latency,
+                chatgpt_blocked=chatgpt_blocked,
+                instagram_blocked=instagram_blocked,
+                download_kbps=download_kbps,
+                upload_kbps=upload_kbps,
+                fully_checked=True,
+            )
+        except Exception as exc:
+            diag(f"Исключение: {type(exc).__name__}: {exc}")
+            if karing_log:
+                for line in diag_lines:
+                    self._log(f"[diag] {line}")
+            return XrayProbeResult(node, False, f"exc_{type(exc).__name__}: {exc}", None, 0, 0, node.runtime)
+        finally:
+            if proc is not None and proc.poll() is None:
+                _terminate_process_tree(proc, timeout=max(0.2, 5.0 - (time.monotonic() - started_at)))
+            # Закрываем stderr-PIPE, чтобы не оставлять открытый файловый
+            # дескриптор. communicate() уже вызван выше в случае падения,
+            # здесь — для нормального пути (когда proc.poll() is None).
+            if proc is not None and proc.stderr is not None:
+                with contextlib.suppress(Exception):
+                    proc.stderr.close()
+            if config_path:
+                with contextlib.suppress(Exception):
+                    Path(config_path).unlink(missing_ok=True)
+
+    def _start_node(self, node: XrayNode, port: int, *, tun: bool = False) -> None:
         if self._shutdown_requested:
             raise RuntimeError("runtime_shutdown")
         binary = self._binary_for_node(node)
         if not binary:
             raise RuntimeError(f"{node.runtime} binary not found")
+        if tun:
+            _check_tun_prerequisites(node.runtime, binary, self.root_dir)
         self.stop()
-        config_path = _write_temp_config(self._build_config(node, port))
+        config_path = _write_temp_config(self._build_config(node, port, tun=tun))
+        self._tun_active = bool(tun)
         self._process = subprocess.Popen(
             [binary, "run", "-c", config_path],
             stdout=subprocess.DEVNULL,
@@ -1284,16 +1856,24 @@ class XrayCoreRuntime:
         self._config_path = config_path
         self._running_node = node
         self._write_pid_file(self._process, config_path, binary)
-        time.sleep(0.5)
+        time.sleep(1.2 if tun else 0.5)
         if self._process.poll() is not None:
             self._unlink_pid_file()
             self._running_node = None
+            self._tun_active = False
             raise RuntimeError(f"{node.runtime} exited during startup")
 
-    def _build_config(self, node: XrayNode, port: int, *, fp: str | None = None) -> dict[str, Any]:
+    def _build_config(
+        self,
+        node: XrayNode,
+        port: int,
+        *,
+        fp: str | None = None,
+        tun: bool = False,
+    ) -> dict[str, Any]:
         if node.runtime == "sing-box":
-            return _sing_box_config(node, "127.0.0.1", port, fp=fp)
-        return _xray_config(node, "127.0.0.1", port, fp=fp)
+            return _sing_box_config(node, "127.0.0.1", port, fp=fp, tun=tun)
+        return _xray_config(node, "127.0.0.1", port, fp=fp, tun=tun)
 
     def _binary_for_node(self, node: XrayNode) -> str:
         if node.runtime == "sing-box":
@@ -1591,10 +2171,25 @@ def collect_subscription_nodes(
                 if on_progress is not None:
                     on_progress(completed, total, url)
 
+    # Дедупликация: собираем все узлы из всех подписок в dict по node.key.
+    # Первый выигрывает (если два узла имеют одинаковый key — protocol/host/port/
+    # sha256(normalized-url) — остаётся тот, что из более ранней подписки).
+    # Логируем количество дубликатов, чтобы было видно эффективность дедупликации.
+    total_before_dedup = sum(len(source_nodes) for source_nodes in fetched)
+    duplicates_removed = 0
     for source_nodes in fetched:
         for node in source_nodes:
-            nodes.setdefault(node.key, node)
+            if node.key in nodes:
+                duplicates_removed += 1
+            else:
+                nodes[node.key] = node
     result = list(nodes.values())
+    total_after_dedup = len(result)
+    if log_sink is not None and duplicates_removed > 0:
+        log_sink(
+            f"[xray] dedup: {total_before_dedup} → {total_after_dedup} "
+            f"({duplicates_removed} duplicates removed)"
+        )
     return result[:max_servers] if max_servers > 0 else result
 
 
@@ -1947,6 +2542,10 @@ def _node_lines_from_candidate(candidate: str) -> list[str]:
     if extracted:
         return extracted
     for value in _node_links_from_json(candidate):
+        remember(value)
+    if extracted:
+        return extracted
+    for value in _node_links_from_clash_yaml(candidate):
         remember(value)
     if extracted:
         return extracted
@@ -2304,6 +2903,177 @@ def _shadowsocks_link_from_json(item: dict[str, Any]) -> str:
         return ""
 
 
+def _node_links_from_clash_yaml(text: str) -> list[str]:
+    """Извлечь node-ссылки из Clash-формата YAML (секция ``proxies``)."""
+    raw = str(text or "")
+    if "proxies:" not in raw:
+        return []
+    try:
+        import yaml  # отложенный импорт: зависимость опциональна
+    except Exception:
+        return []
+    try:
+        payload = yaml.safe_load(raw)
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    proxies = payload.get("proxies")
+    if not isinstance(proxies, list):
+        return []
+    links: list[str] = []
+    for item in proxies:
+        if not isinstance(item, dict):
+            continue
+        link = _node_link_from_clash_proxy(item)
+        if link:
+            links.append(link)
+    return links
+
+
+def _node_link_from_clash_proxy(item: dict[str, Any]) -> str:
+    """Собрать node-ссылку из одного Clash-прокси."""
+    try:
+        proxy_type = str(item.get("type") or "").strip().lower()
+        server = str(item.get("server") or item.get("host") or "").strip()
+        port = int(item.get("port") or 0)
+        name = str(item.get("name") or item.get("tag") or "").strip()
+        if not proxy_type or not server or not port:
+            return ""
+        tag = quote(name, safe="")
+        query = _clash_query(item)
+
+        if proxy_type in ("vless",):
+            uuid = str(item.get("uuid") or "").strip()
+            if not uuid:
+                return ""
+            url = f"vless://{quote(uuid, safe='')}@{server}:{port}"
+            if query:
+                url += "?" + query
+            if tag:
+                url += "#" + tag
+            return url
+
+        if proxy_type in ("trojan",):
+            password = str(item.get("password") or "").strip()
+            if not password:
+                return ""
+            url = f"trojan://{quote(password, safe='')}@{server}:{port}"
+            if query:
+                url += "?" + query
+            if tag:
+                url += "#" + tag
+            return url
+
+        if proxy_type in ("ss", "shadowsocks"):
+            method = str(item.get("cipher") or item.get("method") or "").strip()
+            password = str(item.get("password") or "").strip()
+            if not method or not password:
+                return ""
+            userinfo = base64.urlsafe_b64encode(f"{method}:{password}".encode("utf-8")).decode("ascii").rstrip("=")
+            url = f"ss://{userinfo}@{server}:{port}"
+            if tag:
+                url += "#" + tag
+            return url
+
+        if proxy_type == "vmess":
+            payload: dict[str, Any] = {
+                "v": "2",
+                "ps": name,
+                "add": server,
+                "port": str(port),
+                "id": str(item.get("uuid") or ""),
+                "aid": str(item.get("alterId") or item.get("aid") or "0"),
+                "scy": str(item.get("cipher") or item.get("security") or "auto"),
+                "net": str(item.get("network") or "tcp"),
+                "type": "none",
+                "tls": "" if not item.get("tls") else "tls",
+            }
+            host = ""
+            ws_opts = item.get("ws-opts")
+            if isinstance(ws_opts, dict):
+                if ws_opts.get("path"):
+                    payload["path"] = str(ws_opts.get("path"))
+                headers = ws_opts.get("headers")
+                if isinstance(headers, dict) and (headers.get("Host") or headers.get("host")):
+                    host = str(headers.get("Host") or headers.get("host"))
+            else:
+                if item.get("ws-path"):
+                    payload["path"] = str(item.get("ws-path"))
+            headers = item.get("headers")
+            if not host and isinstance(headers, dict):
+                host = str(headers.get("Host") or headers.get("host") or "")
+            if host:
+                payload["host"] = host
+            sni = str(item.get("servername") or item.get("sni") or "").strip()
+            if sni:
+                payload["sni"] = sni
+            encoded = base64.urlsafe_b64encode(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii")
+            url = f"vmess://{encoded}"
+            if tag:
+                url += "#" + tag
+            return url
+
+        return ""
+    except Exception:
+        return ""
+
+
+def _clash_query(item: dict[str, Any]) -> str:
+    """Собрать query-строку из транспортных полей Clash-прокси."""
+    params: dict[str, str] = {}
+    network = str(item.get("network") or "").strip().lower()
+    if network and network != "tcp":
+        params["type"] = network
+    tls = item.get("tls")
+    tls_enabled = False
+    if isinstance(tls, bool):
+        tls_enabled = tls
+    elif tls is not None:
+        tls_enabled = str(tls).strip().lower() in {"true", "1", "yes", "on"}
+    if tls_enabled:
+        params["security"] = "tls"
+    sni = str(item.get("servername") or item.get("sni") or "").strip()
+    if sni:
+        params["sni"] = sni
+    alpn = item.get("alpn")
+    if alpn:
+        params["alpn"] = ",".join(alpn) if isinstance(alpn, list) else str(alpn)
+    fp = str(item.get("client-fingerprint") or "").strip()
+    if fp:
+        params["fp"] = fp
+    if item.get("skip-cert-verify") is True:
+        params["allowInsecure"] = "1"
+    ws_opts = item.get("ws-opts")
+    if isinstance(ws_opts, dict):
+        if ws_opts.get("path"):
+            params["path"] = str(ws_opts.get("path"))
+        headers = ws_opts.get("headers")
+        if isinstance(headers, dict) and (headers.get("Host") or headers.get("host")):
+            params["host"] = str(headers.get("Host") or headers.get("host"))
+    else:
+        if item.get("ws-path"):
+            params["path"] = str(item.get("ws-path"))
+        ws_headers = item.get("ws-headers")
+        if isinstance(ws_headers, dict) and (ws_headers.get("Host") or ws_headers.get("host")):
+            params["host"] = str(ws_headers.get("Host") or ws_headers.get("host"))
+    grpc_opts = item.get("grpc-opts")
+    if isinstance(grpc_opts, dict):
+        if grpc_opts.get("grpc-service-name"):
+            params["serviceName"] = str(grpc_opts.get("grpc-service-name"))
+        if grpc_opts.get("grpc-mode"):
+            params["mode"] = str(grpc_opts.get("grpc-mode"))
+    h2_opts = item.get("h2-opts")
+    if isinstance(h2_opts, dict):
+        if h2_opts.get("path"):
+            params["path"] = str(h2_opts.get("path"))
+        if h2_opts.get("host"):
+            params["host"] = str(h2_opts.get("host"))
+    return "&".join(f"{quote(str(k), safe='')}={quote(str(v), safe='/@:')}" for k, v in params.items() if v)
+
+
 def _sanitize_node_uri(raw_uri: object) -> str:
     try:
         value = html.unescape(str(raw_uri or ""))
@@ -2325,6 +3095,65 @@ def _sanitize_node_uri(raw_uri: object) -> str:
     return value
 
 
+def _normalize_base64_padding(value: str) -> str:
+    """Привести base64-строку к каноническому виду с правильным padding.
+
+    Некоторые подписки отдают pbk/sid без '=' в конце (URL-safe без padding),
+    другие — с '='. Например:
+      pbk=abc123      (без padding)
+      pbk=abc123=     (с padding)
+
+    Это ОДИН И ТОТ ЖЕ ключ, но без нормализации они считаются разными
+    конфигами. Добавляем padding по длине (base64 должен быть кратен 4).
+    """
+    if not value:
+        return value
+    # Убираем существующий padding для пересчёта.
+    stripped = value.rstrip("=")
+    # Добавляем правильный padding.
+    pad_len = (-len(stripped)) % 4
+    return stripped + ("=" * pad_len)
+
+
+# Query-параметры, которые содержат base64-данные и нуждаются в
+# нормализации padding. Без этого один и тот же Reality-узел с
+# pbk=abc123 (без =) и pbk=abc123= (с =) считаются разными.
+_BASE64_QUERY_PARAMS = frozenset({
+    "pbk", "sid", "publickey", "public-key",
+    "privatekey", "private-key",
+    "spxfingerprint", "spx",
+})
+
+
+def _normalize_ss_userinfo(userinfo: str) -> str:
+    """Нормализовать userinfo из ss:// URL.
+
+    ss://userinfo@host:port — userinfo может быть:
+      1. base64("method:password") — стандартный v2ray-формат
+      2. "method:password" — plaintext (v2rayN/happ могут так отдавать)
+
+    Декодируем base64 в "method:password", если это возможно — так оба
+    варианта считаются одинаковыми при дедупликации.
+    """
+    if not userinfo:
+        return userinfo
+    # Если уже содержит ':' — это plaintext "method:password".
+    if ":" in userinfo:
+        return userinfo
+    # Пробуем декодировать base64 → "method:password".
+    try:
+        # URL-safe base64 decode (c padding коррекцией).
+        padded = _normalize_base64_padding(userinfo)
+        for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+            with contextlib.suppress(Exception):
+                decoded = decoder(padded).decode("utf-8", errors="replace")
+                if ":" in decoded:
+                    return decoded
+    except Exception:
+        pass
+    return userinfo
+
+
 def _node_dedup_text(raw_uri: str) -> str:
     value = _sanitize_node_uri(raw_uri)
     if not value:
@@ -2333,6 +3162,12 @@ def _node_dedup_text(raw_uri: str) -> str:
         decoded = _decode_base64_plain(value[8:].split("#", 1)[0])
         with contextlib.suppress(Exception):
             payload = json.loads(decoded)
+            # Удаляем поле ``ps`` (имя узла) перед канонизацией JSON —
+            # vmess-узлы с разными именами, но одинаковыми параметрами
+            # (add/port/id/aid/scy/net/host/sni/...) должны считаться
+            # одним конфигом при дедупликации.
+            if isinstance(payload, dict):
+                payload.pop("ps", None)
             return "vmess://" + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return value
     if "#" in value:
@@ -2346,14 +3181,38 @@ def _node_dedup_text(raw_uri: str) -> str:
         parts: list[str] = []
         for key in sorted(items):
             for item in sorted(items[key]):
-                parts.append(f"{quote(str(key), safe='')}={quote(str(item), safe='/@:')}")
+                # Нормализация base64-параметров (pbk, sid, publicKey и т.д.):
+                # добавляем padding, чтобы abc123 и abc123= считались одним ключом.
+                normalized_item = item
+                if key.lower() in _BASE64_QUERY_PARAMS:
+                    normalized_item = _normalize_base64_padding(item)
+                parts.append(f"{quote(str(key), safe='')}={quote(str(normalized_item), safe='/@:')}")
         query = "&".join(parts)
     host = (parsed.hostname or "").lower()
     netloc = host
     if parsed.port:
         netloc = f"{host}:{parsed.port}"
+    # Собираем userinfo: username и password (если есть).
+    # Для ss:// URL userinfo может быть как "method:password" (plain),
+    # так и base64("method:password"). Нормализуем base64 в plain,
+    # чтобы оба варианта считались одним конфигом.
     if parsed.username:
-        userinfo = quote(unquote(parsed.username), safe=":")
+        username = unquote(parsed.username)
+        password = unquote(parsed.password) if parsed.password else ""
+        if parsed.scheme.lower() == "ss":
+            # Для ss://: если password есть, это уже plaintext "method:password".
+            # Если нет — username может быть base64("method:password").
+            if password:
+                userinfo_str = f"{username}:{password}"
+            else:
+                userinfo_str = _normalize_ss_userinfo(username)
+        else:
+            # Для vless/trojan/hysteria — username это UUID/password,
+            # password обычно не используется.
+            userinfo_str = username
+            if password:
+                userinfo_str = f"{username}:{password}"
+        userinfo = quote(userinfo_str, safe=":")
         netloc = f"{userinfo}@{netloc}"
     path = parsed.path.rstrip("/")
     return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
@@ -2385,45 +3244,129 @@ def _decode_base64_plain(value: str) -> str:
     return value
 
 
-def _xray_config(node: XrayNode, listen_host: str, listen_port: int, *, fp: str | None = None) -> dict[str, Any]:
+def _xray_config(
+    node: XrayNode,
+    listen_host: str,
+    listen_port: int,
+    *,
+    fp: str | None = None,
+    tun: bool = False,
+) -> dict[str, Any]:
+    """Собрать конфиг Xray-core с SOCKS-inbound и опциональным TUN-inbound.
+
+    DNS-резолвинг выполняет САМ прокси-сервер (через outbound proxy), а не
+    локальный резолвер:
+      * DoH к https://1.1.1.1/dns-query (без +local, чтобы не резолвить
+        1.1.1.1 через системный DNS — это уже IP).
+      * UDP DNS к 8.8.8.8 (тоже через прокси, благодаря routing rule
+        53/UDP → proxy).
+    `localhost` убран: системный резолвер может быть отравлен на заблокированных
+    сетях. Это критично: если локальный DNS режется, узел всё равно сможет
+    резолвить домены через прокси.
+
+    В TUN-режиме дополнительно:
+      * TUN-inbound перехватывает системный трафик (включая 53/UDP).
+      * dns-out outbound + routing rule 53/UDP → dns-out, чтобы перехваченные
+        DNS-запросы уводились в xray-DNS (а не шли напрямую к провайдеру).
+    """
     outbound = _xray_outbound(node, fp=fp)
-    return {
-        "log": {"loglevel": "warning", "access": "", "error": ""},
-        "dns": {
-            "servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8", "localhost"],
-            "queryStrategy": "UseIPv4",
-            "disableFallback": False,
+    inbounds: list[dict[str, Any]] = [
+        {
+            "listen": listen_host,
+            "port": listen_port,
+            "protocol": "socks",
+            "tag": "socks-in",
+            "settings": {"udp": True, "auth": "noauth"},
+            "sniffing": {
+                "enabled": True,
+                "destOverride": ["http", "tls", "quic", "fakedns"],
+                "routeOnly": True,
+            },
+        }
+    ]
+    outbounds: list[dict[str, Any]] = [
+        outbound,
+        {
+            "protocol": "blackhole",
+            "tag": "block",
+            "settings": {"response": {"type": "none"}},
         },
-        "inbounds": [
+    ]
+    routing_rules: list[dict[str, Any]] = [
+        # Локальный трафик — в block, чтобы не уходил через прокси.
+        {
+            "type": "field",
+            "outboundTag": "block",
+            "ip": ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+        }
+    ]
+    # DNS только через прокси: DoH к Cloudflare (1.1.1.1 — это уже IP, не
+    # требует локального резолва) + UDP DNS к Google.UDP DNS сам по себе
+    # пойдёт через прокси благодаря routing rule 53/UDP → proxy ниже.
+    dns_servers = ["https://1.1.1.1/dns-query", "8.8.8.8", "1.0.0.1"]
+
+    if tun:
+        # TUN-inbound: перехватывает системный трафик (включая UDP DNS на 53).
+        # xray-TUN на Windows требует wintun.dll рядом с xray.exe.
+        # В xray-core 25+ autoRoute=True модифицирует системные маршруты
+        # (аналог sing-box auto_route), чтобы ВЕСЬ системный трафик заворачивался
+        # в TUN. Без autoRoute TUN-адаптер создаётся, но трафик в него не идёт —
+        # именно это и нужно для варианта A: тесты через TUN, а не через SOCKS.
+        inbounds.append(
             {
-                "listen": listen_host,
-                "port": listen_port,
-                "protocol": "socks",
-                "settings": {"udp": True, "auth": "noauth"},
+                "protocol": "tun",
+                "tag": "tun-in",
+                "settings": {
+                    "name": TUN_INTERFACE_NAME,
+                    "mtu": TUN_MTU,
+                    "address": [TUN_INET4_ADDRESS, TUN_INET6_ADDRESS],
+                    "autoRoute": True,
+                    "strictRoute": True,
+                    "enablePromiscuousMode": False,
+                },
                 "sniffing": {
                     "enabled": True,
                     "destOverride": ["http", "tls", "quic", "fakedns"],
                     "routeOnly": True,
                 },
             }
-        ],
-        "outbounds": [
-            outbound,
+        )
+        # dns-out: перехваченные xray-ом DNS-запросы идут сюда, а не к
+        # системному резолверу. Реальный резолв выполняет сервер
+        # https://1.1.1.1/dns-query через прокси-аутбаунд.
+        outbounds.append({"protocol": "dns", "tag": "dns-out"})
+        # Любой трафик на 53/UDP, перехваченный TUN-ом, уходит в dns-out.
+        routing_rules.insert(
+            0,
             {
-                "protocol": "blackhole",
-                "tag": "block",
-                "settings": {"response": {"type": "none"}},
+                "type": "field",
+                "inboundTag": ["tun-in"],
+                "port": 53,
+                "network": "udp,tcp",
+                "outboundTag": "dns-out",
             },
-        ],
+        )
+        # Прочий TUN-трафик — в прокси.
+        routing_rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["tun-in"],
+                "outboundTag": "proxy",
+            }
+        )
+
+    return {
+        "log": {"loglevel": "warning", "access": "", "error": ""},
+        "dns": {
+            "servers": dns_servers,
+            "queryStrategy": "UseIPv4",
+            "disableFallback": False,
+        },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
         "routing": {
             "domainStrategy": "IPIfNonMatch",
-            "rules": [
-                {
-                    "type": "field",
-                    "outboundTag": "block",
-                    "ip": ["127.0.0.0/8", "::1/128"],
-                }
-            ],
+            "rules": routing_rules,
         },
     }
 
@@ -2620,7 +3563,30 @@ def _xray_stream_settings(query: dict[str, str], *, fp: str | None = None) -> di
     return stream
 
 
-def _sing_box_config(node: XrayNode, listen_host: str, listen_port: int, *, fp: str | None = None) -> dict[str, Any]:
+def _sing_box_config(
+    node: XrayNode,
+    listen_host: str,
+    listen_port: int,
+    *,
+    fp: str | None = None,
+    tun: bool = False,
+) -> dict[str, Any]:
+    """Собрать конфиг sing-box с SOCKS-inbound и опциональным TUN-inbound.
+
+    DNS-резолвинг выполняет САМ прокси-сервер (через outbound proxy): все
+    DNS-серверы в секции `dns.servers` имеют `"detour": "proxy"`, поэтому
+    DoH/UDP DNS-запросы идут через прокси-сервер узла, а не через локальный
+    резолвер. Это критично для заблокированных сетей, где локальный DNS
+    режется провайдером.
+
+    В TUN-режиме дополнительно:
+      * TUN-inbound (stack: gvisor — не требует wintun.dll) перехватывает
+        системный трафик.
+      * auto_route=True модифицирует системные маршруты, чтобы весь трафик
+        шёл через TUN.
+      * dns-out outbound + route rule 53 → dns-out, чтобы перехваченные
+        DNS-запросы уводились в sing-box-DNS (а не к провайдеру).
+    """
     outbound: dict[str, Any] = {
         "type": node.protocol,
         "tag": "proxy",
@@ -2639,8 +3605,6 @@ def _sing_box_config(node: XrayNode, listen_host: str, listen_port: int, *, fp: 
         tls["insecure"] = True
     if node.query.get("alpn"):
         tls["alpn"] = [item.strip() for item in node.query["alpn"].split(",") if item.strip()]
-    # fp_override (fp) — принудительный fingerprint из fingerprint-матрицы.
-    # "none" — системный TLS без uTLS. None — fp из ссылки узла (безопасный).
     resolved_sing_fp = _resolve_stream_fingerprint(node.query, fp)
     if resolved_sing_fp is None:
         tls["utls"] = {"enabled": False}
@@ -2652,19 +3616,89 @@ def _sing_box_config(node: XrayNode, listen_host: str, listen_port: int, *, fp: 
         if obfs_type == "1":
             obfs_type = "salamander"
         outbound["obfs"] = {"type": obfs_type, "password": node.query.get("obfs-password") or node.query.get("obfsPassword") or node.query.get("obfs_password") or ""}
-    return {
-        "log": {"level": "warn", "disabled": False},
-        "inbounds": [
+
+    inbounds: list[dict[str, Any]] = [
+        {
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": listen_host,
+            "listen_port": listen_port,
+        }
+    ]
+    outbounds: list[dict[str, Any]] = [outbound]
+    route: dict[str, Any] = {"final": "proxy", "auto_detect_interface": True}
+
+    # DNS только через прокси: каждый сервер имеет "detour": "proxy",
+    # поэтому DoH/UDP DNS идут через outbound proxy. Если локальный DNS
+    # режется провайдером — это не влияет на проверку: узел резолвит
+    # домены через свой собственный DNS-сервер.
+    dns_block: dict[str, Any] = {
+        "servers": [
             {
-                "type": "socks",
-                "tag": "socks-in",
-                "listen": listen_host,
-                "listen_port": listen_port,
-            }
+                "tag": "proxy-doh-cf",
+                "address": "https://1.1.1.1/dns-query",
+                "detour": "proxy",
+            },
+            {
+                "tag": "proxy-doh-google",
+                "address": "https://dns.google/dns-query",
+                "detour": "proxy",
+            },
+            {
+                "tag": "proxy-udp-cf",
+                "address": "1.1.1.1",
+                "detour": "proxy",
+            },
+            {
+                "tag": "proxy-udp-google",
+                "address": "8.8.8.8",
+                "detour": "proxy",
+            },
         ],
-        "outbounds": [outbound],
-        "route": {"final": "proxy"},
+        "final": "proxy-doh-cf",
+        "strategy": "ipv4_only",
     }
+
+    if tun:
+        # sing-box 1.13.16 с тегом with_gvisor поддерживает TUN на Windows
+        # без внешнего wintun.dll: сетевой стек gvisor встроен в бинарник.
+        # ВАЖНО: в sing-box 1.10+ поля inet4_address/inet6_address удалены —
+        # используется единое поле `address` (массив CIDR). Раньше с двумя
+        # раздельными полями конфиг был невалидным, ядро падало при старте.
+        inbounds.append(
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "interface_name": TUN_INTERFACE_NAME,
+                "address": [TUN_INET4_ADDRESS, TUN_INET6_ADDRESS],
+                "mtu": TUN_MTU,
+                "auto_route": True,
+                "strict_route": True,
+                "stack": "gvisor",
+            }
+        )
+        # dns-out: перехваченные 53/UDP-запросы уводятся в sing-box DNS.
+        outbounds.append({"type": "dns", "tag": "dns-out"})
+        route_rules = [
+            # DNS-перехват: 53 из TUN-интерфейса → dns-out (резолв через
+            # удалённый DoH, который идёт через proxy).
+            {
+                "inbound": ["tun-in"],
+                "port": 53,
+                "protocol": "dns",
+                "outbound": "dns-out",
+            }
+        ]
+        route = {"rules": route_rules, "final": "proxy", "auto_detect_interface": False}
+
+    result: dict[str, Any] = {
+        "log": {"level": "warn", "disabled": False},
+        "dns": dns_block,
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": route,
+    }
+    return result
 
 
 def _write_temp_config(config: dict[str, Any]) -> str:
@@ -2781,18 +3815,22 @@ def _terminate_process_tree(proc: subprocess.Popen, *, timeout: float = 5.0) -> 
 
 
 def _terminate_pid_tree(pid: int, *, timeout: float = 5.0) -> None:
+    """Убить процесс и всех его детей БЕЗ subprocess (taskkill).
+
+    Старая версия вызывала subprocess.run(["taskkill", ...]) — это
+    spawn нового процесса на каждый terminate, что сериализовало 32
+    потока-работника через Windows kernel. На 5070 узлов × ~3 вызова
+    = 15000+ subprocess spawn-ов = минуты потерянного времени.
+
+    Новая версия: proc.kill() + прямые WinAPI вызовы через ctypes.
+    OpenProcess + TerminateProcess — без spawn subprocess, в 50-100x
+    быстрее. Дерево процессов убираем через итеративный snapshot, но
+    для нашего случая (xray/sing-box) обычно достаточно убить корень.
+    """
     if pid <= 0:
         return
     if os.name == "nt":
-        with contextlib.suppress(Exception):
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=max(1.0, timeout),
-                creationflags=_subprocess_no_window(),
-                check=False,
-            )
+        _windows_terminate_pid_tree(pid)
         return
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.kill(pid, 15)
@@ -2805,21 +3843,132 @@ def _terminate_pid_tree(pid: int, *, timeout: float = 5.0) -> None:
         os.kill(pid, 9)
 
 
+def _windows_terminate_pid_tree(root_pid: int) -> None:
+    """Убить дерево процессов через WinAPI (без subprocess).
+
+    Использует CreateToolhelp32Snapshot для обхода дерева процессов,
+    OpenProcess + TerminateProcess для убийства каждого. Это в 50-100x
+    быстрее, чем spawn subprocess на taskkill.
+    """
+    if root_pid <= 0:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        # TH32CS_SNAPPROCESS = 0x00000002
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        # PROCESSENTRY32W структура.
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        # Сначала собираем всех детей рекурсивно (BFS), потом убиваем.
+        # Сначала корень, потом детей — это безопаснее, чем наоборот.
+        pids_to_kill: list[int] = [root_pid]
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot == INVALID_HANDLE_VALUE:
+            # Snapshot не создался — хотя бы корень убьём.
+            _windows_terminate_process(root_pid)
+            return
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            # Process32FirstW / Process32NextW
+            if not kernel32.Process32FirstW(ctypes.wintypes.HANDLE(snapshot), ctypes.byref(entry)):
+                _windows_terminate_process(root_pid)
+                return
+            # Строим map: parent_pid -> [child_pids].
+            parent_to_children: dict[int, list[int]] = {}
+            while True:
+                parent = int(entry.th32ParentProcessID)
+                child = int(entry.th32ProcessID)
+                parent_to_children.setdefault(parent, []).append(child)
+                if not kernel32.Process32NextW(ctypes.wintypes.HANDLE(snapshot), ctypes.byref(entry)):
+                    break
+            # BFS от root_pid — собираем всех потомков.
+            queue = [root_pid]
+            visited: set[int] = set()
+            while queue:
+                current = queue.pop(0)
+                if current in visited:
+                    continue
+                visited.add(current)
+                pids_to_kill.append(current)
+                for child in parent_to_children.get(current, []):
+                    if child not in visited:
+                        queue.append(child)
+        finally:
+            kernel32.CloseHandle(ctypes.wintypes.HANDLE(snapshot))
+
+        # Убиваем от листьев к корню — так чище (дети не успевают создать
+        # новых детей-сирот, пока корень ещё жив). Но на практике xray
+        # не spawn-ит дочерние процессы, так что порядок не критичен.
+        for pid in reversed(pids_to_kill):
+            _windows_terminate_process(pid)
+    except Exception:
+        # Fallback на os.kill — хоть что-то.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(root_pid, 9)
+
+
+def _windows_terminate_process(pid: int) -> None:
+    """Убить один процесс по PID через TerminateProcess (без subprocess).
+
+    PROCESS_TERMINATE = 0x0001.
+    """
+    if pid <= 0:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_TERMINATE = 0x0001
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if not handle:
+            return  # процесс уже мёртв или нет прав
+        try:
+            kernel32.TerminateProcess(handle, 1)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
 def _pid_exists(pid: int) -> bool:
+    """Проверить, жив ли процесс, БЕЗ subprocess (tasklist).
+
+    Старая версия вызывала subprocess.run(["tasklist", ...]) — это spawn
+    нового процесса на каждую проверку. На 32 потоках × 5070 узлов это
+    десятки тысяч лишних subprocess spawn-ов.
+
+    Новая версия: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) — прямой
+    WinAPI вызов через ctypes, без subprocess. В 100x быстрее.
+    """
     if pid <= 0:
         return False
     if os.name == "nt":
         try:
-            output = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=2.0,
-                creationflags=_subprocess_no_window(),
-                check=False,
-            ).stdout
-            return str(pid) in output
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                # OpenProcess возвращает 0 если процесса нет или нет прав.
+                # Различаем: ERROR_INVALID_PARAMETER (87) = нет такого PID.
+                last_error = kernel32.GetLastError()
+                return last_error != 87
+            kernel32.CloseHandle(handle)
+            return True
         except Exception:
             return False
     try:
@@ -2902,6 +4051,134 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _tcp_ping_node(node: "XrayNode", timeout: float = 2.0) -> float | None:
+    """Быстрый TCP-ping: connect к (host, port) без поднятия ядра.
+
+    Возвращает latency в мс или None, если connect не удался за timeout.
+    Намного дешевле, чем поднимать xray.exe/sing-box.exe на каждый узел:
+    на 10000 узлов TCP-ping занимает ~30 сек (32 потока × 2 сек timeout),
+    тогда как xray-ping — 10000 старт-стопов ~ 5-8 часов.
+
+    Не проверяет протокол — только доступность порта. Этого достаточно для
+    отсеивания 60-70% мёртвых узлов до дорогих проверок.
+    """
+    host = node.host
+    port = int(node.port)
+    started = time.perf_counter()
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        return latency_ms
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close()
+
+
+# Протоколы, которые работают по UDP (hysteria/hy2). Для них TCP-ping
+# бесполезен — сервер слушает UDP, и TCP-порт может быть закрыт, хотя узел
+# жив. Для них используем UDP-ping: отправляем QUIC-like Initial-пакет
+# и ждём любого ответа. Это не полноценный QUIC-handshake (это сложно),
+# но достаточный для проверки «жив ли UDP-порт и отвечает ли сервер».
+UDP_PROTOCOLS = frozenset({"hysteria", "hysteria2", "hy2"})
+
+
+def _udp_ping_node(node: "XrayNode", timeout: float = 2.0) -> float | None:
+    """UDP-ping для hysteria/hy2 узлов.
+
+    Отправляет упрощённый QUIC Initial-пакет и ждёт ответа. Если сервер
+    ответил хоть чем-то за timeout — узел жив. Если нет — мёртв.
+
+    Полноценный QUIC-handshake требует реализации crypto frames, TLS 1.3
+    ClientHello и обработки retry-пакетов — это слишком сложно для
+    предфильтра. Мы используем эвристику:
+
+    1. Отправляем несколько «проб» — пустой UDP-пакет, QUIC Initial-заголовок
+       с фейковым DCID и random payload. Hysteria-сервер (на базе quic-go)
+       обычно отвечает одним из:
+         - Retry-пакетом (если требует token)
+         - Initial-пакетом (если принимает соединение)
+         - ICMP Port Unreachable (если порт закрыт — но это не приходит
+           обратно как UDP-ответ, мы этого не увидим)
+    2. Если за timeout получен ЛЮБОЙ UDP-пакет от сервера — узел жив.
+    3. Если ничего не пришло — узел мёртв (или за NAT, или порт закрыт).
+
+    Ложноположительные срабатывания: сервер мог ответить на наш мусорный
+    пакет, но реальный handshake потом упадёт (например, неверный auth_str).
+    Это нормально — отсеет следующая SOCKS/UDP-проверка через ядро.
+
+    Ложноотрицательные: сервер мог быть жив, но не ответить за timeout
+    (большой RTT, потеря пакетов). Поэтому timeout = 3 сек (больше, чем
+    у TCP, т.к. UDP может потеряться и сервер делает retransmit).
+    """
+    host = node.host
+    port = int(node.port)
+    started = time.perf_counter()
+    sock: socket.socket | None = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+
+        # Несколько пробных пакетов разной формы — повышает шанс, что
+        # хотя бы на один сервер ответит. Hysteria слушает QUIC, поэтому
+        # делаем QUIC-like пакеты:
+        probes = [
+            # 1. Минимальный QUIC Initial (Long Header, type=0xC0, DCID=8 байт).
+            #    Это не валидный QUIC, но quic-go часто отвечает на «похожее»
+            #    retry-пакетом или сразу сбрасывает соединение.
+            bytes([0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x40, 0x00])
+            + b"\x01\x02\x03\x04\x05\x06\x07\x08"  # DCID (8 байт)
+            + b"\x00" * 20,  #(payload)
+            # 2. Пустой UDP-пакет — некоторые серверы отвечают ICMP/RESET.
+            #    Мы не увидим ICMP, но если сервер использует raw-socket, может
+            #    прислать ошибку в UDP-домене.
+            b"",
+            # 3. Случайные байты — для серверов с нестандартной обработкой.
+            os.urandom(32),
+        ]
+
+        for probe in probes:
+            try:
+                sock.sendto(probe, (host, port))
+            except Exception:
+                # sendto может упасть на недоступном хосте — пробуем следующий.
+                continue
+            try:
+                # Ждём ответ. Если получен любой пакет — узел жив.
+                data, _ = sock.recvfrom(2048)
+                if data:
+                    return (time.perf_counter() - started) * 1000.0
+            except socket.timeout:
+                # Эта проба не дала ответа — пробуем следующую.
+                continue
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close()
+
+
+def _tcp_udp_ping_node(node: "XrayNode", timeout: float = 2.0) -> float | None:
+    """Универсальный предфильтр: TCP для TCP-протоколов, UDP для UDP-протоколов.
+
+    Для vless/vmess/trojan/ss — TCP-ping (узел работает по TCP).
+    Для hysteria/hy2 — UDP-ping (узел работает по UDP/QUIC).
+
+    Возвращает latency_ms или None (узел мёртв).
+    """
+    if node.protocol in UDP_PROTOCOLS:
+        # Для UDP-протоколов даём чуть больше времени (потеря пакетов).
+        return _udp_ping_node(node, timeout=max(timeout, 3.0))
+    return _tcp_ping_node(node, timeout=timeout)
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -3043,6 +4320,221 @@ def _socks_https_latency(
         if raw_sock is not None:
             with contextlib.suppress(Exception):
                 raw_sock.close()
+
+
+# ---------------------------------------------------------------------------
+# TUN-хелперы: проверки через СИСТЕМНЫЙ сетевой стек (без SOCKS).
+#
+# При `--tun-check` ядро поднимается с TUN-inbound + auto_route=True,
+# поэтому системный трафик (urllib, socket без SOCKS) автоматически
+# заворачивается в виртуальный адаптер и идёт через outbound узла.
+# Это и есть Karing-стиль «тесты через TUN»: весь трафик проверки —
+# системный, никакого SOCKS.
+#
+# Если TUN не поднят (нет прав / нет wintun.dll), эти функции упадут
+# с таймаутом — это корректно: тест через TUN невозможен.
+# ---------------------------------------------------------------------------
+
+
+def _tun_https_latency(
+    target_host: str,
+    target_port: int,
+    server_name: str,
+    timeout: float,
+    path: str = "/",
+) -> float | None:
+    """GET-запрос через системный стек (TUN auto_route). Возвращает latency_ms или None."""
+    started = time.perf_counter()
+    raw_sock: socket.socket | None = None
+    try:
+        # Прямое TCP-соединение через системный стек → TUN → outbound узла.
+        raw_sock = socket.create_connection((target_host, target_port), timeout=timeout)
+        raw_sock.settimeout(timeout)
+        context = ssl.create_default_context()
+        with context.wrap_socket(raw_sock, server_hostname=server_name) as tls_sock:
+            raw_sock = None
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {server_name}\r\n"
+                f"User-Agent: MTProxyAutoSwitch/1.0\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode("ascii")
+            tls_sock.sendall(request)
+            response = tls_sock.recv(32)
+            if not response.startswith(b"HTTP/"):
+                return None
+            return (time.perf_counter() - started) * 1000.0
+    except Exception:
+        return None
+    finally:
+        if raw_sock is not None:
+            with contextlib.suppress(Exception):
+                raw_sock.close()
+
+
+def _tun_https_head_status(
+    target_host: str,
+    target_port: int,
+    server_name: str,
+    timeout: float,
+    path: str = "/",
+) -> tuple[int, float] | None:
+    """HEAD-запрос через системный стек (TUN auto_route). Возвращает (status, latency_ms) или None."""
+    started = time.perf_counter()
+    raw_sock: socket.socket | None = None
+    try:
+        raw_sock = socket.create_connection((target_host, target_port), timeout=timeout)
+        raw_sock.settimeout(timeout)
+        context = ssl.create_default_context()
+        with context.wrap_socket(raw_sock, server_hostname=server_name) as tls_sock:
+            raw_sock = None
+            request = (
+                f"HEAD {path} HTTP/1.1\r\n"
+                f"Host: {server_name}\r\n"
+                f"User-Agent: MTProxyAutoSwitch/1.0\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode("ascii")
+            tls_sock.sendall(request)
+            response = b""
+            while b"\r\n" not in response:
+                chunk = tls_sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+                if len(response) > 65536:
+                    break
+            if not response.startswith(b"HTTP/"):
+                return None
+            line = response.split(b"\r\n", 1)[0]
+            parts = line.split(b" ", 2)
+            try:
+                status = int(parts[1])
+            except (IndexError, ValueError):
+                return None
+            return status, (time.perf_counter() - started) * 1000.0
+    except Exception:
+        return None
+    finally:
+        if raw_sock is not None:
+            with contextlib.suppress(Exception):
+                raw_sock.close()
+
+
+def _tun_mtproto_latency(
+    target_host: str,
+    target_port: int,
+    timeout: float,
+) -> float | None:
+    """MTProto DC TCP-handshake через системный стек (TUN auto_route).
+
+    Telegram DC не использует обычный HTTPS — это MTProto over TCP.
+    Замеряем только установку TCP-соединения (без TLS): для диагностики
+    этого достаточно, чтобы понять, достижим ли DC через TUN.
+    """
+    started = time.perf_counter()
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection((target_host, target_port), timeout=timeout)
+        return (time.perf_counter() - started) * 1000.0
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close()
+
+
+def _tun_download_speed(
+    timeout: float,
+) -> float | None:
+    """Замер скорости загрузки через системный стек (TUN auto_route).
+
+    Использует urllib.request.urlopen — системный трафик заворачивается
+    в TUN ядром (auto_route=True). Пробуем speed.cloudflare.com и
+    proof.ovh.net как fallback.
+    """
+    big_timeout = max(8.0, float(timeout))
+    # speed.cloudflare.com: 16MB download.
+    try:
+        url = f"https://{XRAY_SPEED_TEST_HOST}{XRAY_SPEED_TEST_PATH}"
+        req = urllib.request.Request(url, headers={"User-Agent": "MTProxyAutoSwitch/1.0"})
+        started = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=big_timeout) as resp:
+            if resp.status != 200:
+                return None
+            downloaded = 0
+            sample_seconds = XRAY_ACTIVE_SPEED_TEST_SECONDS
+            deadline = started + sample_seconds
+            while time.perf_counter() < deadline:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+            elapsed = time.perf_counter() - started
+            if elapsed <= 0 or downloaded == 0:
+                return None
+            return (downloaded / elapsed) / 1024.0  # КБ/с
+    except Exception:
+        pass
+    # Fallback: proof.ovh.net (16MB, 8s).
+    try:
+        url = "https://proof.ovh.net/files/100Mb.dat"
+        req = urllib.request.Request(url, headers={"User-Agent": "MTProxyAutoSwitch/1.0"})
+        started = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=big_timeout) as resp:
+            if resp.status != 200:
+                return None
+            downloaded = 0
+            sample_seconds = XRAY_ACTIVE_SPEED_TEST_SECONDS
+            deadline = started + sample_seconds
+            while time.perf_counter() < deadline:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+            elapsed = time.perf_counter() - started
+            if elapsed <= 0 or downloaded == 0:
+                return None
+            return (downloaded / elapsed) / 1024.0
+    except Exception:
+        pass
+    return None
+
+
+def _tun_upload_speed(
+    timeout: float,
+    *,
+    max_bytes: int = XRAY_PROBE_SPEED_TEST_BYTES,
+    sample_seconds: float = XRAY_PROBE_SPEED_TEST_SECONDS,
+) -> float | None:
+    """Замер скорости выгрузки через системный стек (TUN auto_route).
+
+    POST к speed.cloudflare.com/__up с телом max_bytes.
+    """
+    big_timeout = max(8.0, float(timeout))
+    try:
+        url = f"https://{XRAY_SPEED_TEST_HOST}{XRAY_SPEED_UPLOAD_PATH}"
+        body = b"\x00" * int(max_bytes)
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "User-Agent": "MTProxyAutoSwitch/1.0",
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(body)),
+            },
+            method="POST",
+        )
+        started = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=big_timeout) as resp:
+            if resp.status not in (200, 204):
+                return None
+            elapsed = time.perf_counter() - started
+            if elapsed <= 0:
+                return None
+            return (len(body) / elapsed) / 1024.0  # КБ/с
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -3521,3 +5013,104 @@ def _socks_mtproto_latency(
 
 def _subprocess_no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# ---------------------------------------------------------------------------
+# TUN-проверка: вспомогательные функции для запуска ядра в TUN-режиме.
+# ---------------------------------------------------------------------------
+
+def _is_elevated() -> bool:
+    """True, если текущий процесс имеет права администратора/root."""
+    if os.name == "nt":
+        try:
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            shell32.IsUserAnAdmin.restype = wintypes.BOOL
+            return bool(shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _wintun_dll_available(root_dir: Path, *, binary_path: str = "") -> bool:
+    """True, если wintun.dll доступен рядом с xray.exe или в PATH.
+
+    xray-TUN на Windows требует внешнего wintun.dll. sing-box с тегом
+    with_gvisor НЕ требует — его сетевой стек встроен в бинарник.
+    """
+    if os.name != "nt":
+        return True
+    candidates: list[Path] = []
+    if binary_path:
+        candidates.append(Path(binary_path).resolve().parent / WINTUN_DLL_NAME)
+    bundle_root = Path(str(getattr(sys, "_MEIPASS", "") or ""))
+    if bundle_root:
+        candidates.extend([bundle_root / "bin" / WINTUN_DLL_NAME, bundle_root / WINTUN_DLL_NAME])
+    module_root = Path(__file__).resolve().parent
+    candidates.extend(
+        [
+            root_dir / "bin" / WINTUN_DLL_NAME,
+            root_dir / WINTUN_DLL_NAME,
+            module_root / "bin" / WINTUN_DLL_NAME,
+            module_root / WINTUN_DLL_NAME,
+            Path(WINTUN_DLL_NAME),
+        ]
+    )
+    for path in candidates:
+        if path.exists():
+            return True
+    return bool(shutil.which(WINTUN_DLL_NAME))
+
+
+def _check_tun_prerequisites(runtime: str, binary_path: str, root_dir: Path) -> None:
+    """Проверить, что TUN-режим может быть запущен. Поднимает RuntimeError
+    с человекочитаемым сообщением при отсутствии админ-прав или wintun.dll.
+    """
+    if not _is_elevated():
+        if os.name == "nt":
+            raise RuntimeError(
+                "TUN-проверка требует прав администратора. "
+                "Запустите SubGenerator от имени администратора."
+            )
+        raise RuntimeError("TUN-проверка требует прав root. Запустите через sudo.")
+    if runtime == "xray" and os.name == "nt":
+        if not _wintun_dll_available(root_dir, binary_path=binary_path):
+            binary_dir = Path(binary_path).resolve().parent
+            raise RuntimeError(
+                f"Для TUN-проверки через xray требуется {WINTUN_DLL_NAME} "
+                f"рядом с xray.exe (ожидался в: {binary_dir}). "
+                "Скачайте wintun.dll с https://www.wintun.net/ и поместите "
+                "его в каталог bin/. Альтернатива: использовать sing-box "
+                "(его TUN не требует внешнего драйвера)."
+            )
+
+
+def _tun_interface_exists(iface: str) -> bool:
+    """Проверить, что виртуальный TUN-адаптер действительно создан в системе.
+
+    На Windows — через `netsh interface show interface` (ищем имя iface).
+    На *nix — через `ip link show` (или `ifconfig`).
+    """
+    if not iface:
+        return False
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["netsh", "interface", "show", "interface"],
+                capture_output=True, text=True, timeout=3.0,
+                encoding="utf-8", errors="replace",
+                creationflags=_subprocess_no_window(),
+            )
+            return iface.lower() in (proc.stdout or "").lower()
+        except Exception:
+            return False
+    for cmd in (["ip", "link", "show"], ["ifconfig"]):
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=3.0,
+                creationflags=_subprocess_no_window(),
+            )
+            if iface.lower() in (proc.stdout or "").lower():
+                return True
+        except Exception:
+            continue
+    return False

@@ -9,17 +9,21 @@ binaries = []
 hiddenimports = [
     'xray_runtime', 'subgen.pipeline', 'subgen.refresh', 'subgen.geo',
     'subgen.output', 'subgen.logging', 'subgen.progress', 'subgen.config',
-    'subgen.checker_thresholds', 'subgen.checker_cache',
+    'subgen.checker_thresholds', 'subgen.checker_cache', 'subgen.warp',
+    'subgen.settings',
     'checkers.dpi', 'checkers.cidr', 'checkers.zapret', 'checkers.base',
     'checkers.initial_check', 'checkers.telegram_pro', 'checkers.route',
     'ui.app', 'ui.runner', 'ui.paths', 'ui.tooltip', 'ui.theme', 'ui.main',
     'ui.pages.start_page', 'ui.pages.sources_page', 'ui.pages.log_page',
-    'ui.pages.settings_page',
+    'ui.pages.settings_page', 'ui.pages.recheck_page', 'ui.pages.warp_page',
 
 ]
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('darkdetect')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# cryptography — для генерации X25519 ключей WARP (прямой Cloudflare API).
+tmp_ret = collect_all('cryptography')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
@@ -57,4 +61,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # UAC-манифест: при запуске exe Windows автоматически показывает
+    # диалог «Запустить от имени администратора?». TUN-проверка требует
+    # прав админа для создания виртуального адаптера и модификации
+    # маршрутов (auto_route=True у sing-box, strictRoute=True у xray).
+    uac_admin=True,
 )

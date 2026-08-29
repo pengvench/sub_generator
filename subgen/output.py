@@ -100,7 +100,11 @@ def build_subscription(rows: list[dict[str, Any]]) -> str:
     description = get_description()
     header = ""
     if prefix:
-        header += prefix + "\n"
+        # Префикс-заголовок ДОЛЖЕН быть закомментирован: happ/Hiddify
+        # воспринимают незакомментированную строку как невалидный URL
+        # и вместо импорта подписки открывают файл как текст.
+        # Строки с '#' клиенты игнорируют — это стандарт для описания.
+        header += "# " + prefix + "\n"
     header += description
     return header + text
 

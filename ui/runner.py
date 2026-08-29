@@ -39,8 +39,31 @@ class PipelineOptions:
     zapret_min_score: float = 0.75
     zapret_no_http: bool = False
     start_stage: str = "ping"
-    use_cache: bool = False
     custom_file: str = ""
+    # Тумблер «Добавить WARP в подписку»: после завершения основного
+    # пайплайна (если есть хотя бы один рабочий узел) — запрашиваем
+    # WARP-конфиг у cyb-portal /api/warp и добавляем в конец subs.txt
+    # как fallback. WARP не проходит через TCP-ping/stress-test — он
+    # добавляется как есть, потому что endpoint Cloudflare стабилен.
+    add_warp: bool = False
+    # Список пресетов генерации WARP (индексы в WARP_PRESETS из subgen.warp).
+    # Можно выбрать несколько — все они будут добавлены в подписку.
+    # 0 = «Авто» (1 конфиг от cyb-portal),
+    # 1 = «🌐 Мобильный интернет» (3 конфига, порты 2408/500/4500),
+    # 2 = «🤖 Нейросети ChatGPT» (2 конфига, WARP+ IP),
+    # 3 = «🛡️ Максимальный обход» (6 конфигов, все порты).
+    # По умолчанию [0] (только Авто). Сохраняется в settings.json.
+    warp_presets: list[int] = field(default_factory=lambda: [0])
+    # Кастомный DNS для WARP-конфигов (например xbox-dns.ru или свой).
+    # Если None — используется DNS из пресета.
+    warp_dns: list[str] | None = None
+    # TUN-проверка ВКЛЮЧЕНА ПО УМОЛЧАНИЮ (Karing-стиль): весь трафик тестов
+    # идёт через виртуальный TUN-адаптер, чтобы системные настройки DNS/HTTP
+    # не влияли на результаты. Требует прав администратора на Windows и
+    # wintun.dll для xray-TUN (sing-box с gvisor работает без внешнего
+    # драйвера). Если пререквизиты не выполнены — автоматический fallback
+    # на SOCKS-only с предупреждением в логе.
+    tun_check: bool = True
 
 
 
@@ -146,6 +169,19 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
         args += ["--start-stage", options.start_stage]
     if options.custom_file:
         args += ["--custom-file", options.custom_file]
+    # TUN по умолчанию включён (PipelineOptions.tun_check=True). Передаём
+    # --tun-check только когда включён, чтобы можно было отключить.
+    if options.tun_check:
+        args.append("--tun-check")
+    # WARP-резерв: добавить warp:// URL в конец подписки после тестирования.
+    if options.add_warp:
+        args.append("--add-warp")
+        # Пресет генерации WARP (один, single-select со страницы WARP).
+        if options.warp_presets and options.warp_presets != [0]:
+            args += ["--warp-preset"] + [str(i) for i in options.warp_presets]
+        # Кастомный DNS (если выбран на странице WARP).
+        if options.warp_dns:
+            args += ["--warp-dns", ",".join(options.warp_dns)]
     if sources:
         args += ["--sources"] + sources
     return args

@@ -78,6 +78,57 @@ def _socks_open_connection(
         return None
 
 
+def _socks_udp_associate(
+    socks_host: str,
+    socks_port: int,
+    timeout: float,
+) -> tuple[socket.socket, str, int] | None:
+    """Установить SOCKS5 UDP ASSOCIATE и вернуть (tcp_sock, relay_host, relay_port).
+
+    TCP-сокет нужно держать открытым всё время жизни UDP-туннеля.
+    """
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection((socks_host, socks_port), timeout=timeout)
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")
+        if _recv_exact(sock, 2) != b"\x05\x00":
+            sock.close()
+            return None
+        # UDP ASSOCIATE, зарезервировано 0x00, ATYP IPv4, адрес 0.0.0.0, порт 0
+        sock.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+        header = _recv_exact(sock, 4)
+        if len(header) < 4 or header[1] != 0:
+            sock.close()
+            return None
+        atyp = header[3]
+        relay_host = ""
+        if atyp == 1:
+            relay_host = socket.inet_ntop(socket.AF_INET, _recv_exact(sock, 4))
+        elif atyp == 3:
+            length = _recv_exact(sock, 1)
+            if not length:
+                sock.close()
+                return None
+            relay_host = _recv_exact(sock, length[0]).decode("idna")
+        elif atyp == 4:
+            relay_host = socket.inet_ntop(socket.AF_INET6, _recv_exact(sock, 16))
+        else:
+            sock.close()
+            return None
+        port_bytes = _recv_exact(sock, 2)
+        if len(port_bytes) != 2:
+            sock.close()
+            return None
+        relay_port = int.from_bytes(port_bytes, "big")
+        return sock, relay_host, relay_port
+    except Exception:
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close()
+        return None
+
+
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
     chunks: list[bytes] = []
     remaining = size

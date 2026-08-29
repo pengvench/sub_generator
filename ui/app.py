@@ -14,9 +14,11 @@ import customtkinter as ctk
 
 from . import paths, theme
 from .pages.log_page import LogPage
+from .pages.recheck_page import RecheckPage
 from .pages.settings_page import SettingsPage
 from .pages.sources_page import SourcesPage
 from .pages.start_page import StartPage
+from .pages.warp_page import WarpPage
 
 from .runner import PipelineRunner, build_pipeline_args, filter_sources_by_history
 from .tooltip import CTkToolTip
@@ -72,6 +74,140 @@ class SubGenApp(ctk.CTk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Если есть свежий report.json от прошлого прогона (завершился
+        # недавно, в течение последних 2 часов) — показываем окно с цифрами.
+        self._maybe_show_results()
+
+    def _maybe_show_results(self) -> None:
+        """Показать окно результатов, если есть свежий report.json.
+
+        Проверяем время модификации файла: если отчёт создан/обновлён
+        менее 2 часов назад, считаем его «свежим» и показываем сводку.
+        Это срабатывает при следующем запуске GUI после того, как
+        PowerShell-окно завершилось.
+        """
+        import json as _json
+        import time as _time
+
+        report_path = self.data_dir / "report.json"
+        if not report_path.exists():
+            return
+        try:
+            mtime = report_path.stat().st_mtime
+            age_sec = _time.time() - mtime
+            # 2 часа — порог «свежести» отчёта.
+            if age_sec > 7200:
+                return
+            data = _json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        self._show_results_dialog(data)
+
+    def _show_results_dialog(self, report: dict) -> None:
+        """Показать модальное окно с результатами прогона."""
+        from tkinter import Toplevel, Label, Button
+
+        dlg = Toplevel(self)
+        dlg.title("📊 Результаты прогона")
+        dlg.geometry("520x560")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.configure(bg=str(theme.BG))
+
+        # Центрируем окно.
+        dlg.update_idletasks()
+        sw = dlg.winfo_screenwidth()
+        sh = dlg.winfo_screenheight()
+        x = (sw - 520) // 2
+        y = (sh - 560) // 2
+        dlg.geometry(f"520x560+{x}+{y}")
+
+        def _add_row(row: int, label: str, value: str, color: str = str(theme.TEXT)) -> None:
+            lbl = Label(
+                dlg, text=label, anchor="w", bg=str(theme.BG), fg=str(theme.MUTED),
+                font=("Segoe UI", 10),
+            )
+            lbl.grid(row=row, column=0, padx=(20, 6), pady=4, sticky="w")
+            val = Label(
+                dlg, text=value, anchor="e", bg=str(theme.BG), fg=color,
+                font=("Segoe UI", 11, "bold"),
+            )
+            val.grid(row=row, column=1, padx=(6, 20), pady=4, sticky="e")
+
+        header = Label(
+            dlg, text="📊 Результаты последнего прогона",
+            bg=str(theme.BG), fg=str(theme.TEXT),
+            font=("Segoe UI", 13, "bold"),
+        )
+        header.grid(row=0, column=0, columnspan=2, padx=20, pady=(16, 12), sticky="w")
+
+        generated_at = str(report.get("generated_at_utc", "?"))
+        _add_row(1, "Время (UTC):", generated_at[:19])
+        _add_row(2, "Источников (sources):", str(len(report.get("sources", []))))
+        _add_row(3, "Найдено узлов (discovered):", str(report.get("discovered", 0)))
+        _add_row(4, "Рабочих (working):", str(report.get("working", 0)),
+                 color=str(theme.SUCCESS))
+        _add_row(5, "Отбраковано (rejected):", str(report.get("rejected", 0)),
+                 color=str(theme.WARNING))
+        _add_row(6, "Экспортировано в подписку:", str(report.get("exported", 0)),
+                 color=str(theme.ACCENT))
+
+        sep = Label(dlg, text="─" * 60, bg=str(theme.BG), fg=str(theme.BORDER))
+        sep.grid(row=7, column=0, columnspan=2, padx=20, pady=(10, 4), sticky="ew")
+
+        # Этапы с количеством прошедших/отбракованных.
+        stage_row = 8
+        for stage_key, stage_label in [
+            ("initial_check", "Initial check"),
+            ("dpi", "DPI-проверка"),
+            ("dpi_active", "DPI-актив"),
+            ("telegram_pro", "Telegram-PRO"),
+            ("route", "Route"),
+            ("zapret", "Zapret"),
+            ("resilience", "Resilience"),
+            ("tun_full", "TUN-check"),
+            ("recheck", "Финальный спидтест"),
+        ]:
+            stage = report.get(stage_key)
+            if not isinstance(stage, dict) or not stage.get("enabled"):
+                continue
+            passed = stage.get("passed", 0)
+            failed = stage.get("failed", 0)
+            checked = stage.get("checked", passed + failed)
+            color = str(theme.SUCCESS) if failed == 0 else (
+                str(theme.WARNING) if passed > 0 else str(theme.ERROR)
+            )
+            _add_row(stage_row, f"{stage_label}:", f"{passed}/{checked} прошли", color)
+            stage_row += 1
+
+        # WARP-резерв: показываем статус (добавлен/ошибка/выключен).
+        warp = report.get("warp")
+        if isinstance(warp, dict) and warp.get("enabled"):
+            if warp.get("added"):
+                preset_names = warp.get("presets") or ["Авто"]
+                if isinstance(preset_names, list):
+                    preset_str = ", ".join(preset_names)
+                else:
+                    preset_str = str(preset_names)
+                uris_count = len(warp.get("uris") or [])
+                _add_row(stage_row, "WARP-резерв:",
+                         f"✓ {uris_count} конфиг(ов) добавлено ({preset_str})",
+                         str(theme.SUCCESS))
+            else:
+                err = str(warp.get("error") or "ошибка")[:50]
+                _add_row(stage_row, "WARP-резерв:", f"✗ {err}", str(theme.ERROR))
+            stage_row += 1
+
+        # Кнопки.
+        btn_close = Button(
+            dlg, text="Закрыть", width=14,
+            bg=str(theme.ACCENT), fg="#0C1014", font=("Segoe UI", 11, "bold"),
+            command=dlg.destroy,
+        )
+        btn_close.grid(row=stage_row, column=0, columnspan=2, padx=20, pady=(16, 12))
+
 
     # ------------------------------------------------------------ sidebar
     def _build_sidebar(self) -> None:
@@ -103,12 +239,16 @@ class SubGenApp(ctk.CTk):
 
         self.btn_start = self._nav_button(3, "▶ Тестирование", "start")
         self.btn_sources = self._nav_button(4, "📚 Подписки", "sources")
-        self.btn_log = self._nav_button(5, "📊 Лог", "log")
-        self.btn_settings = self._nav_button(6, "⚙ Настройки", "settings")
+        self.btn_recheck = self._nav_button(5, "🔁 Перепроверка", "recheck")
+        self.btn_warp = self._nav_button(6, "🌀 WARP", "warp")
+        self.btn_log = self._nav_button(7, "📊 Лог", "log")
+        self.btn_settings = self._nav_button(8, "⚙ Настройки", "settings")
 
         self._nav_buttons = {
             "start": self.btn_start,
             "sources": self.btn_sources,
+            "recheck": self.btn_recheck,
+            "warp": self.btn_warp,
             "log": self.btn_log,
             "settings": self.btn_settings,
         }
@@ -149,12 +289,16 @@ class SubGenApp(ctk.CTk):
 
         self.page_start = StartPage(self.pages_frame, self)
         self.page_sources = SourcesPage(self.pages_frame, self)
+        self.page_recheck = RecheckPage(self.pages_frame, self)
+        self.page_warp = WarpPage(self.pages_frame, self)
         self.page_log = LogPage(self.pages_frame, self)
         self.page_settings = SettingsPage(self.pages_frame, self)
 
         self.pages = {
             "start": self.page_start,
             "sources": self.page_sources,
+            "recheck": self.page_recheck,
+            "warp": self.page_warp,
             "log": self.page_log,
             "settings": self.page_settings,
         }
@@ -165,14 +309,14 @@ class SubGenApp(ctk.CTk):
     def _show_page(self, name: str) -> None:
         page = self.pages[name]
         page.tkraise()
-        # При показе страницы настроек обновляем доступность этапов перепроверки
+        # При показе страницы перепроверки обновляем доступность этапов
         # (после завершения прогона кеш мог появиться).
-        if name == "settings":
-            self.page_settings.refresh_stage_availability()
-        # При показе страницы тестирования обновляем доступность тумблера
-        # запуска с сохранённого кеша (появляется после первого полного прогона).
+        if name == "recheck":
+            self.page_recheck.refresh_availability()
+        # При показе страницы тестирования обновляем предупреждение о TUN
+        # (могли измениться права админа или тумблер TUN).
         if name == "start":
-            self.page_start.refresh_cache_toggle()
+            self.page_start._refresh_tun_warning()
 
         for key, btn in self._nav_buttons.items():
             active = key == name
@@ -242,6 +386,8 @@ class SubGenApp(ctk.CTk):
         self._busy = busy
         self.page_start.set_running(busy)
         self.page_sources.set_busy(busy)
+        self.page_recheck.set_busy(busy)
+        self.page_warp.set_busy(busy)
         self.page_log.set_busy(busy)
         self.page_settings.set_busy(busy)
 
@@ -252,25 +398,32 @@ class SubGenApp(ctk.CTk):
             self.show_status("Уже выполняется задача — дождитесь завершения.", error=True)
             return
         options = self.page_start.get_options()
-        options.start_stage = self.page_settings.get_start_stage()
-        # Тумблер «С сохранённого кеша»: не повторяем пинг и стресс-тест,
-        # проверки идут с сохранённых конфигов (data/.runtime_cache).
-        if options.use_cache and options.start_stage == "ping":
-            # В настройках выбран полный прогон — при включённом тумблере
-            # начинаем с DPI-проверки, чтобы прогнать все остальные этапы.
-            options.start_stage = "dpi"
+        # Сохраняем настройки тестирования (workers, timeout, тумблеры),
+        # чтобы при следующем запуске пользователь получил те же значения.
+        self.page_start.save_current_settings()
+        # Сохраняем настройки WARP (пресет, DNS, авто-добавление).
+        self.page_warp.save_current_settings()
+        # start_stage берём со страницы «Перепроверка».
+        options.start_stage = self.page_recheck.get_start_stage()
+        # WARP-настройки берём со страницы «🌀 WARP».
+        warp_opts = self.page_warp.get_warp_options()
+        options.add_warp = warp_opts["enabled"]
+        # Одиночный пресет (single-select) → список с одним элементом.
+        options.warp_presets = [warp_opts["preset"]] if warp_opts["enabled"] else [0]
+        # Кастомный DNS из страницы WARP — если выбран, передаём в pipeline.
+        # Pipeline.py применит его к пресету через _build_uris_for_preset.
+        options.warp_dns = warp_opts.get("dns")
         sources = self.page_sources.get_sources()
 
         # Перепроверка с этапа возможна только после хотя бы одного полного прогона
         # (пинг + стресс-тест), результаты которого сохранены в кеше.
-        if options.start_stage != "ping" and not self.page_settings.has_cached_working():
-
+        if options.start_stage != "ping" and not self.page_recheck.has_cached_working():
             messagebox.showwarning(
                 "Перепроверка недоступна",
                 "Проверка ещё не проводилась. Сначала запустите полный прогон "
                 "(пинг и стресс-тест), чтобы появилась возможность перепроверки с этапа.",
             )
-            self._show_page("settings")
+            self._show_page("recheck")
             return
 
         # Кастомный файл конфигов (страница «Тестирование») заменяет подписки:
@@ -518,14 +671,19 @@ class SubGenApp(ctk.CTk):
                 self._post(lambda: self.page_log.append_log(f"[экспорт] Загружено {len(discovered)} узлов"))
                 self._post(lambda: self._set_progress(50, f"Загружено {len(discovered)} узлов"))
 
-                all_configs = set()
+                # Дедупликация по node.key (protocol/host/port/sha256(normalized-url)),
+                # а не по raw_url — два узла с разным порядком query-параметров
+                # или разными именами считаются одним конфигом.
+                # node.key уже отдалён collect_subscription_nodes (дедупликация на
+                # уровне сбора), но all_configs = set() был по raw_url — некорректно.
+                all_configs: dict[tuple, str] = {}  # node.key → uri
                 per_source: dict[str, int] = {}
                 for node in discovered:
                     uri = getattr(node, "raw_url", "") or (
                         node.to_uri() if hasattr(node, "to_uri") else ""
                     )
                     if uri:
-                        all_configs.add(uri)
+                        all_configs[node.key] = uri
                     source = getattr(node, "source_url", "") or "unknown"
                     per_source[source] = per_source.get(source, 0) + 1
 
@@ -542,16 +700,17 @@ class SubGenApp(ctk.CTk):
                 ]
                 self._post(lambda s=stats: self.page_log.set_stats(s))
 
-                self._post(lambda: self.page_log.append_log(f"[экспорт] Собрано {len(all_configs)} уникальных конфигов"))
+                unique_configs = sorted(all_configs.values())
+                self._post(lambda: self.page_log.append_log(f"[экспорт] Собрано {len(unique_configs)} уникальных конфигов"))
                 for source, count in sorted(per_source.items()):
                     self._post(lambda src=source, cnt=count: self.page_log.append_log(f"[экспорт]  - {src}: {cnt} конфигов"))
-                self._post(lambda: self._set_progress(80, f"Собрано {len(all_configs)} конфигов"))
+                self._post(lambda: self._set_progress(80, f"Собрано {len(unique_configs)} конфигов"))
 
                 export_path = paths.app_root() / "preload.txt"
                 try:
-                    export_path.write_text("\n".join(sorted(all_configs)) + ("\n" if all_configs else ""), encoding="utf-8")
-                    self._post(lambda: self.show_status(f"Экспортировано {len(all_configs)} конфигов в {export_path}"))
-                    self._post(lambda: self.page_log.append_log(f"[экспорт] Сохранено {len(all_configs)} конфигов в {export_path}"))
+                    export_path.write_text("\n".join(unique_configs) + ("\n" if unique_configs else ""), encoding="utf-8")
+                    self._post(lambda: self.show_status(f"Экспортировано {len(unique_configs)} конфигов в {export_path}"))
+                    self._post(lambda: self.page_log.append_log(f"[экспорт] Сохранено {len(unique_configs)} конфигов в {export_path}"))
                     self._post(lambda: self._set_progress(100, "Экспорт завершён"))
                 except Exception as e:
                     self._post(lambda: self.show_status(f"Ошибка сохранения: {e}", error=True))

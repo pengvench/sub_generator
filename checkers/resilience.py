@@ -41,7 +41,7 @@ import struct
 import time
 from typing import Any
 
-from checkers.base import _socks_open_connection, run_with_node
+from checkers.base import _socks_open_connection, _socks_udp_associate, run_with_node
 
 
 # Цели для альтернативных проверок (обновлено на основе логов Karing)
@@ -367,8 +367,15 @@ def udp_dns_check(
     for dns_host, dns_port in dns_servers:
         started = time.perf_counter()
         udp_sock = None
+        tcp_sock = None
         try:
-            # Создаем UDP сокет
+            # Поднимаем SOCKS5 UDP ASSOCIATE, чтобы DNS-запрос шёл через узел,
+            # а не через системный DNS-резолвер.
+            assoc = _socks_udp_associate(socks_host, socks_port, timeout)
+            if assoc is None:
+                continue
+            tcp_sock, relay_host, relay_port = assoc
+
             udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp_sock.settimeout(timeout)
             
@@ -395,15 +402,37 @@ def udp_dns_check(
                 query_name + query_type + query_class
             )
             
-            # Отправляем запрос напрямую DNS серверу
-            udp_sock.sendto(dns_query, (dns_host, dns_port))
+            # Оборачиваем DNS-запрос в SOCKS5 UDP-заголовок:
+            # RSV=0000, FRAG=00, ATYP=01 (IPv4), DST.ADDR, DST.PORT, DATA.
+            socks_udp_packet = (
+                b"\x00\x00\x00\x01"
+                + socket.inet_aton(dns_host)
+                + int(dns_port).to_bytes(2, "big")
+                + dns_query
+            )
             
-            # Получаем ответ
-            response, _ = udp_sock.recvfrom(512)
+            udp_sock.sendto(socks_udp_packet, (relay_host, relay_port))
+            
+            response, _ = udp_sock.recvfrom(512 + 10)
             latency = (time.perf_counter() - started) * 1000.0
             
+            # Разбираем SOCKS5 UDP-ответ: пропускаем заголовок relay-ответа.
+            # Заголовок: RSV(2) FRAG(1) ATYP(1) + address + port(2).
+            if len(response) < 10:
+                continue
+            atyp = response[3]
+            if atyp == 1:
+                header_len = 10
+            elif atyp == 3:
+                header_len = 7 + response[4]
+            elif atyp == 4:
+                header_len = 22
+            else:
+                continue
+            dns_response = response[header_len:]
+            
             # Проверяем, что ответ содержит правильный transaction ID
-            if response[:2] == transaction_id:
+            if dns_response[:2] == transaction_id:
                 return True, latency, f"{dns_host}:{dns_port}"
                 
         except Exception:
@@ -412,6 +441,9 @@ def udp_dns_check(
             if udp_sock is not None:
                 with contextlib.suppress(Exception):
                     udp_sock.close()
+            if tcp_sock is not None:
+                with contextlib.suppress(Exception):
+                    tcp_sock.close()
     
     return False, None, None
 

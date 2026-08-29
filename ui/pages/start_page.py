@@ -6,6 +6,11 @@
   - каждая карточка скрываемая (заголовок-аккордеон с чекбоксом видимости);
   - внутри карточки пункты располагаются в 2 столбика;
   - если содержимое не помещается — появляется слайдер (прокрутка).
+
+Настройки (workers, timeout, max_ping, min_speed, limit и тумблеры)
+сохраняются в data/settings.json и восстанавливаются при следующем
+запуске. Тумблер «С сохранённого кеша» удалён — он дублировал отдельную
+страницу «Перепроверка» в сайдбаре.
 """
 from __future__ import annotations
 
@@ -14,34 +19,65 @@ import customtkinter as ctk
 from .. import theme
 from ..runner import PipelineOptions
 from ..tooltip import CTkToolTip, info_label
+from subgen.settings import get_test_options, save_test_options
 
 HELP = {
-    "workers": "Потоков для параллельного тестирования узлов.",
-    "timeout": "Таймаут на один узел (сек).",
-    "max_ping": "Узлы с пингом выше этого значения отбрасываются (мс).",
-    "min_speed": "Минимальная скорость для признания узла рабочим (КБ/с).",
-    "limit": "Ограничение количества тестируемых узлов (0 = без лимита).",
-    "no_stress": "Отключить нагрузочное (скоростное) тестирование.",
-    "plain": "Тестировать только обычные (не TLS) подключения.",
-    "dpi": "Проверка обхода DPI-блокировок (через Xray).",
-    "siberian": "Проверка на сибирские блокировки.",
-    "cidr": "Проверка узлов по CIDR-спискам запрещённых сетей.",
-    "zapret": "Проверка обхода блокировок по методу zapret.",
-    "telegram": "Проверка Telegram: медиа, MTProto, скорость. Узлы без Telegram отбрасываются.",
-    "dpi_active": "Активная DPI-проверка протокола узла (SNI, ClientHello, ECH, TLS 1.2/1.3).",
-    "use_cache": "Запустить проверку с сохранённого кеша прошлого прогона "
-                 "(data/.runtime_cache): пинг и стресс-тест не повторяются, "
-                 "проверки запускаются с выбранного в «Настройках» этапа. "
-                 "Если сохранённых конфигов нет — тумблер выключен.",
+    "workers": "Потоков для параллельного тестирования узлов. "
+               "Рекомендуется 64 для 32GB RAM, 32 для 16GB RAM. "
+               "Не ставьте больше 128 — будет overhead на переключение контекста.",
+    "timeout": "Таймаут на один узел (сек). 15 сек — норма для мобильного "
+               "интернета. Меньше 8 ставить не рекомендуется — узлы с большим "
+               "RTT будут ложно отбраковываться.",
+    "max_ping": "Узлы с пингом выше этого значения отбрасываются (мс). "
+                "1500 мс — норма для мобильного интернета. "
+                "500 мс — для домашнего. 0 = без ограничения.",
+    "min_speed": "Минимальная скорость для признания узла рабочим (КБ/с). "
+                 "5000 КБ/с = ~5 МБ/с = достаточно для 1080p. "
+                 "3000 КБ/с = минимум для просмотра видео.",
+    "limit": "Ограничение количества тестируемых узлов (0 = без лимита). "
+             "Полезно при первой настройке — поставьте 100, чтобы быстро "
+             "проверить, что всё работает.",
+    "no_stress": "Отключить нагрузочное (скоростное) тестирование. "
+                 "Узлы принимаются только по пингу, без проверки скорости.",
+    "plain": "Тестировать только обычные (не TLS) подключения. "
+             "Узлы с TLS/Reality будут отброшены.",
+    "dpi": "Проверка обхода DPI-блокировок (через Xray). "
+           "Проверяет, может ли узел обходить DPI-цензуру.",
+    "siberian": "Проверка на сибирские блокировки. "
+                "Дополнительная проверка для сибирских мобильных сетей.",
+    "cidr": "Проверка узлов по CIDR-спискам запрещённых сетей. "
+            "Выявляет узлы, которые работают только с белыми IP.",
+    "zapret": "Проверка обхода блокировок по методу zapret. "
+              "DPI suite tcp 16-20 + HTTP test.",
+    "telegram": "Проверка Telegram: медиа, MTProto, скорость. "
+                "Узлы без Telegram отбрасываются. "
+                "ВАЖНО: на мобильном интернете Telegram-проверка обязательна — "
+                "без неё ты получишь узлы, которые не работают с Telegram.",
+    "dpi_active": "Активная DPI-проверка протокола узла (SNI, ClientHello, ECH, TLS 1.2/1.3). "
+                  "Проверяет, может ли узел обходить конкретные DPI-механизмы.",
     "custom_file": "Загрузить конфиги из локального файла (например, сохранённый "
                    "кеш с прошлого прогона). Base64 декодируется, берутся только "
                    "ссылки-конфиги (vless/vmess/trojan/ss/hy2), остальной текст "
                    "игнорируется.",
+    "add_warp": "Добавить WARP-конфиг в конец подписки как fallback. "
+                "После завершения основного тестирования SubGenerator "
+                "запрашивает WARP-конфиг у cyb-portal.com и добавляет "
+                "warp:// URL в subs.txt. WARP не тестируется (Cloudflare "
+                "стабилен) — он работает как резерв, если все vless-узлы упали.",
+    "warp_preset": "Пресет генерации WARP-конфигов. Выбери свой сценарий:\n"
+                   "• Авто — 1 конфиг от cyb-portal (как есть).\n"
+                   "• Мобильный интернет — 3 конфига, разные порты (2408/500/4500). Один пробьётся через DPI.\n"
+                   "• Нейросети ChatGPT — 2 конфига через WARP+ IP. Открывает ChatGPT/Claude/Gemini.\n"
+                   "• Максимальный обход — 6 конфигов, все порты. Один точно пройдёт.",
+    "tun": "Тестировать через TUN (ВКЛЮЧЕНО ПО УМОЛЧАНИЮ, Karing-стиль): "
+           "поднимает ядро с TUN-inbound, весь трафик проверок идёт через "
+           "виртуальный адаптер, чтобы системные настройки DNS/HTTP не влияли "
+           "на результаты. DNS-резолвинг выполняет сам прокси-сервер узла "
+           "(через outbound). Требует прав администратора на Windows и "
+           "wintun.dll для xray-TUN (sing-box с gvisor работает без внешнего "
+           "драйвера). При отсутствии пререквизитов — автоматический fallback "
+           "на SOCKS-only.",
 }
-
-
-
-
 
 
 class StartPage(ctk.CTkFrame):
@@ -103,9 +139,26 @@ class StartPage(ctk.CTkFrame):
             inner_extra.grid_columnconfigure(c, weight=1)
         self.toggle_no_stress = self._make_toggle(inner_extra, 0, 0, "Без нагрузочного теста", HELP["no_stress"], default=False)
         self.toggle_plain = self._make_toggle(inner_extra, 0, 1, "Только обычные подключения", HELP["plain"], default=False)
-        self.toggle_use_cache = self._make_toggle(inner_extra, 1, 0, "С сохранённого кеша", HELP["use_cache"], default=False)
+        # Тумблер «С сохранённого кеша» удалён — он дублировал отдельную
+        # страницу «Перепроверка» в сайдбаре. Перепроверка с этапа теперь
+        # находится там, где ей место — в отдельном разделе.
         self.toggle_custom_file = self._make_toggle(inner_extra, 1, 1, "Свой файл конфигов", HELP["custom_file"], default=False)
-        self.limit = self._make_entry(inner_extra, 2, 0, "Лимит узлов (0 = без лимита)", "0", help=HELP["limit"])
+        self.limit = self._make_entry(inner_extra, 1, 0, "Лимит узлов (0 = без лимита)", "0", help=HELP["limit"])
+        # TUN-проверка — ВКЛЮЧЕНА ПО УМОЛЧАНИЮ. Отдельная строка 3, вся ширина.
+        # Karing-стиль: весь трафик тестов через виртуальный TUN-адаптер,
+        # системные настройки DNS/HTTP не влияют на результаты.
+        self.toggle_tun = self._make_toggle(inner_extra, 3, 0, "Тестировать через TUN (по умолчанию)", HELP["tun"], default=True)
+
+        # Предупреждение о TUN без прав админа (показывается, если процесс
+        # запущен НЕ от администратора, а TUN-тумблер включён).
+        # WARP-настройки перенесены на отдельную страницу «🌀 WARP» в сайдбаре.
+        self.lbl_tun_warn = ctk.CTkLabel(
+            inner_extra, text="",
+            text_color=theme.WARNING,
+            font=ctk.CTkFont(size=11), justify="left", anchor="w",
+            wraplength=420,
+        )
+        self.lbl_tun_warn.grid(row=4, column=0, columnspan=2, padx=6, pady=(2, 0), sticky="ew")
 
         # Строка выбора файла (столбец 2, строка 2): label + entry + «Обзор…» + «✕».
         # Entry доступен только при включённом toggle_custom_file.
@@ -153,6 +206,11 @@ class StartPage(ctk.CTkFrame):
         )
         self.btn_run.grid(row=3, column=0, padx=12, pady=(8, 14), sticky="ew")
         CTkToolTip(self.btn_run, "Запустить сборку и проверку конфигов из всех подписок.")
+
+        # Восстанавливаем сохранённые настройки (workers, timeout, тумблеры).
+        self._restore_settings()
+        # Проверяем права админа и показываем предупреждение, если TUN включён.
+        self._refresh_tun_warning()
 
     # ------------------------------------------------------------ helpers
     def _make_card(self, parent, row, title, *, visible) -> ctk.CTkFrame:
@@ -258,6 +316,9 @@ class StartPage(ctk.CTkFrame):
         entry = ctk.CTkEntry(frame, width=110, justify="right")
         entry.grid(row=0, column=2, padx=(10, 0), sticky="e")
         entry.insert(0, default)
+        # Tooltip на само поле ввода — пользователь видит подсказку при наведении.
+        if help:
+            CTkToolTip(entry, help)
         return entry
 
     # ------------------------------------------------------------ custom file
@@ -292,6 +353,95 @@ class StartPage(ctk.CTkFrame):
         self.custom_file_entry.configure(state=state)
         self.btn_custom_browse.configure(state=state)
         self.btn_custom_clear.configure(state=state)
+
+    # ------------------------------------------------------------ сохранение настроек
+    def _restore_settings(self) -> None:
+        """Восстановить сохранённые настройки тестирования из data/settings.json.
+
+        Применяет workers/timeout/max_ping/min_speed/limit и тумблеры,
+        которые пользователь установил в прошлый раз. Если файла нет —
+        используются дефолты из DEFAULT_TEST_OPTIONS.
+        """
+        opts = get_test_options()
+        # Числовые поля.
+        self.workers.delete(0, "end")
+        self.workers.insert(0, str(opts.get("workers", 32)))
+        self.timeout.delete(0, "end")
+        self.timeout.insert(0, str(opts.get("timeout", 15.0)))
+        self.max_ping.delete(0, "end")
+        self.max_ping.insert(0, str(opts.get("max_ping", 1500)))
+        self.min_speed.delete(0, "end")
+        self.min_speed.insert(0, str(opts.get("min_speed", 3000)))
+        self.limit.delete(0, "end")
+        self.limit.insert(0, str(opts.get("limit", 0)))
+        # Тумблеры.
+        self._set_toggle(self.toggle_no_stress, bool(opts.get("no_stress", False)))
+        self._set_toggle(self.toggle_plain, bool(opts.get("plain", False)))
+        self._set_toggle(self.toggle_telegram, bool(opts.get("telegram_check", True)))
+        self._set_toggle(self.toggle_dpi, bool(opts.get("dpi_check", False)))
+        self._set_toggle(self.toggle_siberian, bool(opts.get("dpi_siberian", False)))
+        self._set_toggle(self.toggle_cidr, bool(opts.get("dpi_cidr", False)))
+        self._set_toggle(self.toggle_dpi_active, bool(opts.get("dpi_active", False)))
+        self._set_toggle(self.toggle_zapret, bool(opts.get("zapret_check", False)))
+        self._set_toggle(self.toggle_tun, bool(opts.get("tun_check", True)))
+
+    @staticmethod
+    def _set_toggle(toggle: ctk.CTkSwitch, value: bool) -> None:
+        if value:
+            toggle.select()
+        else:
+            toggle.deselect()
+
+    def save_current_settings(self) -> None:
+        """Сохранить текущие настройки тестирования в data/settings.json.
+
+        Вызывается перед запуском тестирования (app.on_start_clicked),
+        чтобы при следующем запуске пользователя ждали те же значения.
+        """
+        opts = {
+            "workers": self._int_value(self.workers, 32),
+            "timeout": self._float_value(self.timeout, 15.0),
+            "max_ping": self._int_value(self.max_ping, 1500),
+            "min_speed": self._int_value(self.min_speed, 3000),
+            "limit": self._int_value(self.limit, 0),
+            "no_stress": bool(self.toggle_no_stress.get()),
+            "plain": bool(self.toggle_plain.get()),
+            "telegram_check": bool(self.toggle_telegram.get()),
+            "dpi_check": bool(self.toggle_dpi.get()),
+            "dpi_siberian": bool(self.toggle_siberian.get()),
+            "dpi_cidr": bool(self.toggle_cidr.get()),
+            "dpi_active": bool(self.toggle_dpi_active.get()),
+            "zapret_check": bool(self.toggle_zapret.get()),
+            "tun_check": bool(self.toggle_tun.get()),
+        }
+        try:
+            save_test_options(opts)
+        except Exception:
+            pass  # настройки — не критичны, не роняем запуск из-за ошибки записи
+
+    # ------------------------------------------------------------ TUN warning
+    def _refresh_tun_warning(self) -> None:
+        """Показать предупреждение, если TUN включён, но нет прав админа.
+
+        TUN требует прав администратора для создания виртуального адаптера
+        и модификации системных маршрутов (auto_route). Без прав будет
+        silent fallback на SOCKS-only — пользователь должен это знать.
+        """
+        try:
+            from xray_runtime import _is_elevated
+            is_admin = _is_elevated()
+        except Exception:
+            is_admin = True  # не можем проверить — не пугаем пользователя
+        tun_on = bool(self.toggle_tun.get())
+        if tun_on and not is_admin:
+            self.lbl_tun_warn.configure(
+                text="⚠ TUN включён, но нет прав администрата. "
+                     "Будет fallback на SOCKS-only. "
+                     "Запустите SubGenerator от имени администратора, "
+                     "чтобы TUN-проверка работала полностью."
+            )
+        else:
+            self.lbl_tun_warn.configure(text="")
 
     # ------------------------------------------------------------ options
     @staticmethod
@@ -329,32 +479,11 @@ class StartPage(ctk.CTkFrame):
             dpi_cidr=bool(self.toggle_cidr.get()) if dpi_check else False,
             zapret_check=self.toggle_zapret.get(),
             dpi_active=bool(self.toggle_dpi_active.get()),
-            use_cache=bool(self.toggle_use_cache.get()),
             custom_file=custom_file,
+            tun_check=bool(self.toggle_tun.get()),
         )
 
 
-    def refresh_cache_toggle(self) -> None:
-        """Включить/выключить тумблер запуска с сохранённого кеша.
-
-        Если сохранённых рабочих конфигов (data/.runtime_cache/xray_working.json)
-        нет — тумблер выключается и блокируется. После полного прогона кеш
-        появляется, и тумблер становится доступен.
-        """
-        import json as _json
-
-        available = False
-        path = self.app.data_dir / ".runtime_cache" / "xray_working.json"
-        try:
-            if path.exists():
-                data = _json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    available = any(row.get("fully_checked") for row in data)
-        except Exception:
-            available = False
-        self.toggle_use_cache.configure(state="normal" if available else "disabled")
-        if not available and self.toggle_use_cache.get():
-            self.toggle_use_cache.deselect()
 
     def set_running(self, running: bool) -> None:
         self.btn_run.configure(state="disabled" if running else "normal")

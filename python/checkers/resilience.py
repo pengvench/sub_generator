@@ -37,10 +37,29 @@ from __future__ import annotations
 import contextlib
 import socket
 import ssl
+import struct
 import time
 from typing import Any
 
 from checkers.base import _socks_open_connection, _socks_udp_associate, run_with_node
+
+
+# --- Адаптация под медленный канал (инцидент 2026-09-04, лог4) ---
+# Батарея из 7 подтестов шла последовательно с капами 2-3с на канале с
+# RTT ~2с (initial-check p50 = 2076 мс): каждый SOCKS CONNECT + TLS
+# стоит 2-6с, подтесты гарантированно не успевали. Бюджет узла
+# (timeout*2.5 = 15с при timeout=6с) истекал ДО завершения батареи,
+# run_with_node возвращал None, и живые медленные узлы получали вердикт
+# failed_to_run/completely_dead (в том прогоне так отвалились 13 из 17
+# узлов, прошедших все предыдущие этапы).
+# Теперь: подтаймауты масштабируются по RTT канала (замер первого TCP-теста
+# или подсказка rtt_hint_ms из network profile), батарея ограничена общим
+# дедлайном (не уложившиеся подтесты помечаются "skipped"), а бюджет узла
+# покрывает оценку ВСЕЙ батареи, а не timeout*2.5.
+RTT_SCALE_DIVISOR_MS = 500.0  # RTT канала, выше которого растут таймауты
+RTT_SCALE_MAX = 4.0           # потолок масштабирования подтестов (x4)
+SUB_TIMEOUT_CAP = 12.0        # потолок таймаута одного подтеста
+BATTERY_HARD_CAP = 90.0       # жёсткий потолок бюджета проверки одного узла
 
 
 # Цели для альтернативных проверок (обновлено на основе логов Karing)
@@ -198,6 +217,7 @@ def https_latency_alternative(
     socks_port: int,
     targets: list[tuple[str, int, str]],
     timeout: float = 3.0,
+    deadline: float | None = None,
 ) -> tuple[str | None, float | None, bool]:
     """HTTPS проверка к альтернативным целям.
     
@@ -205,14 +225,91 @@ def https_latency_alternative(
     возвращает первую успешную.
     
     Возвращает (target_host, latency_ms, success).
+    
+    ``deadline`` — монотонная метка времени (``time.monotonic()``), после
+    которой перебор целей прекращается. Нужна, чтобы цикл по 8 целям не
+    растягивал батарею resilience за общий бюджет узла (на мёртвом узле
+    каждая цель сжигает полный подтаймаут).
     """
     for target_host, target_port, server_name in targets:
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem < 0.3:
+                break
+            # Перебор целей не должен выехать за дедлайн: эффективный
+            # таймаут каждой цели ограничен остатком времени.
+            t_eff = min(timeout, max(rem, 0.3))
+        else:
+            t_eff = timeout
         success, latency = _single_https_latency(
-            socks_host, socks_port, target_host, target_port, server_name, timeout
+            socks_host, socks_port, target_host, target_port, server_name, t_eff
         )
         if success:
             return target_host, latency, True
     return None, None, False
+
+
+def multi_target_ping(
+    socks_host: str,
+    socks_port: int,
+    primary_target: tuple[str, int, str],
+    alternative_targets: list[tuple[str, int, str]],
+    timeout: float = 3.0,
+) -> dict[str, Any]:
+    """Многоцелевая проверка пинга.
+    
+    Сначала пробует основную цель, затем альтернативные.
+    Полезно для определения, заблокирована ли конкретная цель
+    (например, telegram.org) или узел действительно мёртв.
+    
+    Возвращает dict с результатами по каждой цели.
+    """
+    results = {}
+    
+    # Основная цель
+    primary_host, primary_port, primary_sni = primary_target
+    success, latency = _single_https_latency(
+        socks_host, socks_port, primary_host, primary_port, primary_sni, timeout
+    )
+    results["primary"] = {
+        "target": primary_host,
+        "success": success,
+        "latency_ms": latency,
+    }
+    
+    # Альтернативные цели
+    alt_success = False
+    best_alt_latency = None
+    best_alt_target = None
+    
+    for alt_host, alt_port, alt_sni in alternative_targets:
+        success, latency = _single_https_latency(
+            socks_host, socks_port, alt_host, alt_port, alt_sni, timeout
+        )
+        results[f"alt_{alt_host}"] = {
+            "target": alt_host,
+            "success": success,
+            "latency_ms": latency,
+        }
+        if success and not alt_success:
+            alt_success = True
+            best_alt_latency = latency
+            best_alt_target = alt_host
+    
+    results["alternative"] = {
+        "success": alt_success,
+        "best_target": best_alt_target,
+        "best_latency_ms": best_alt_latency,
+    }
+    
+    # Итоговый вердикт
+    results["overall"] = {
+        "alive": results["primary"]["success"] or alt_success,
+        "primary_blocked": not results["primary"]["success"] and alt_success,
+        "recommended_target": best_alt_target if not results["primary"]["success"] else primary_host,
+    }
+    
+    return results
 
 
 def dns_over_https_check(
@@ -287,6 +384,7 @@ def udp_dns_check(
     dns_servers: list[tuple[str, int]] | None = None,
     domain: str = "google.com",
     timeout: float = 2.0,
+    deadline: float | None = None,
 ) -> tuple[bool, float | None, str | None]:
     """Проверка DNS через UDP (обход блокировок DoH/DoT).
     
@@ -295,12 +393,22 @@ def udp_dns_check(
     
     Из логов Karing: udp://8.8.8.8 работает за 108-128 мс даже при блокировке DoH.
     
+    ``deadline`` — монотонная метка, после которой перебор DNS-серверов
+    прекращается (ограничение батареи общим бюджетом узла).
+    
     Возвращает (успех, время_мс, использованный сервер).
     """
     if dns_servers is None:
         dns_servers = UDP_DNS_SERVERS
     
     for dns_host, dns_port in dns_servers:
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem < 0.3:
+                break
+            t_eff = min(timeout, max(rem, 0.3))
+        else:
+            t_eff = timeout
         started = time.perf_counter()
         udp_sock = None
         tcp_sock = None
@@ -430,6 +538,8 @@ def resilience_check(
     socks_port: int,
     node_url: str,
     timeout: float = 5.0,
+    rtt_hint_ms: float | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Комплексная проверка живучести узла.
     
@@ -437,6 +547,13 @@ def resilience_check(
     - Работоспособности узла в целом
     - Наличия блокировок конкретных целей
     - Рекомендаций по использованию
+    
+    ``rtt_hint_ms`` — медианный RTT канала из network profile
+    (initial-check p50). ``deadline`` — монотонная метка времени, к которой
+    батарея обязана завершиться: не уложившиеся подтесты помечаются
+    ``"skipped": "deadline"`` и не влияют на вердикт ложным провалом
+    (инцидент 2026-09-04: живые медленные узлы отваливались целиком,
+    потому что бюджет истекал посреди батареи).
     
     Возвращает подробный отчёт с метриками.
     """
@@ -452,71 +569,124 @@ def resilience_check(
         "summary": {},
     }
     
-    # 1. TCP Connect check (базовый) - самый быстрый тест
+    def _cap(base: float) -> float | None:
+        """Эффективный подтаймаут: база × масштаб канала, с потолком и
+        остатком общего дедлайна. None — времени нет, подтест пропускается."""
+        t = min(base * scale, SUB_TIMEOUT_CAP)
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem < 0.3:
+                return None
+            t = min(t, max(rem, 0.3))
+        return t
+    
+    # 1. TCP Connect check (базовый) — на ПОЛНОМ таймауте, а не min(timeout,2):
+    # это одновременно замер RTT канала через узел, по которому масштабируются
+    # остальные подтесты (на мобильном канале RTT ~2с капы 2-3с — гарантированный
+    # провал живых узлов).
     tcp_success, tcp_latency = tcp_connect_check(
-        socks_host, socks_port, "8.8.8.8", 53, min(timeout, 2.0)
+        socks_host, socks_port, "8.8.8.8", 53, timeout
     )
     report["tests"]["tcp_connect"] = {
         "success": tcp_success,
         "latency_ms": tcp_latency,
     }
     
+    # Масштаб подтестов по RTT канала: сначала подсказка конвейера
+    # (network profile), при её отсутствии — замер первого TCP-теста.
+    rtt_ms = rtt_hint_ms if rtt_hint_ms is not None else tcp_latency
+    scale = 1.0
+    if rtt_ms is not None and rtt_ms > RTT_SCALE_DIVISOR_MS:
+        scale = min(RTT_SCALE_MAX, rtt_ms / RTT_SCALE_DIVISOR_MS)
+    report["rtt_ms"] = round(rtt_ms, 1) if rtt_ms is not None else None
+    report["timeout_scale"] = round(scale, 2)
+    
     # 2. DNS-over-HTTPS проверка (обход DNS-блокировок)
-    doh_success, doh_latency = dns_over_https_check(
-        socks_host, socks_port, "google.com", min(timeout, 2.5)
-    )
-    report["tests"]["dns_over_https"] = {
-        "success": doh_success,
-        "latency_ms": doh_latency,
-    }
+    doh_success, doh_latency = False, None
+    doh_t = _cap(2.5)
+    if doh_t is None:
+        report["tests"]["dns_over_https"] = {"success": False, "skipped": "deadline"}
+    else:
+        doh_success, doh_latency = dns_over_https_check(
+            socks_host, socks_port, "google.com", doh_t
+        )
+        report["tests"]["dns_over_https"] = {
+            "success": doh_success,
+            "latency_ms": doh_latency,
+        }
     
     # 3. HTTPS к Telegram (основная цель, часто блокируется)
-    tg_success, tg_latency = _single_https_latency(
-        socks_host, socks_port, "api.telegram.org", 443, "api.telegram.org", timeout
-    )
-    report["tests"]["telegram_https"] = {
-        "success": tg_success,
-        "latency_ms": tg_latency,
-    }
+    tg_success, tg_latency = False, None
+    tg_t = _cap(timeout)
+    if tg_t is None:
+        report["tests"]["telegram_https"] = {"success": False, "skipped": "deadline"}
+    else:
+        tg_success, tg_latency = _single_https_latency(
+            socks_host, socks_port, "api.telegram.org", 443, "api.telegram.org", tg_t
+        )
+        report["tests"]["telegram_https"] = {
+            "success": tg_success,
+            "latency_ms": tg_latency,
+        }
     
     # 4. HTTPS к альтернативным целям (международные CDN) - приоритет DoH
-    alt_result = https_latency_alternative(
-        socks_host, socks_port, ALTERNATIVE_TARGETS[:8], min(timeout, 3.0)
-    )
-    report["tests"]["alternative_https"] = {
-        "success": alt_result[2],
-        "target": alt_result[0],
-        "latency_ms": alt_result[1],
-    }
+    alt_result: tuple[str | None, float | None, bool] = (None, None, False)
+    alt_t = _cap(3.0)
+    if alt_t is None:
+        report["tests"]["alternative_https"] = {"success": False, "skipped": "deadline"}
+    else:
+        alt_result = https_latency_alternative(
+            socks_host, socks_port, ALTERNATIVE_TARGETS[:8], alt_t, deadline=deadline
+        )
+        report["tests"]["alternative_https"] = {
+            "success": alt_result[2],
+            "target": alt_result[0],
+            "latency_ms": alt_result[1],
+        }
     
     # 5. WHITE-SNI проверка (для РФ - расширенный список) - приоритет российским доменам
-    white_sni_result = https_latency_alternative(
-        socks_host, socks_port, WHITE_SNI_TARGETS[:8], min(timeout, 3.0)
-    )
-    report["tests"]["white_sni"] = {
-        "success": white_sni_result[2],
-        "target": white_sni_result[0],
-        "latency_ms": white_sni_result[1],
-    }
+    white_sni_result: tuple[str | None, float | None, bool] = (None, None, False)
+    white_t = _cap(3.0)
+    if white_t is None:
+        report["tests"]["white_sni"] = {"success": False, "skipped": "deadline"}
+    else:
+        white_sni_result = https_latency_alternative(
+            socks_host, socks_port, WHITE_SNI_TARGETS[:8], white_t, deadline=deadline
+        )
+        report["tests"]["white_sni"] = {
+            "success": white_sni_result[2],
+            "target": white_sni_result[0],
+            "latency_ms": white_sni_result[1],
+        }
     
     # 6. UDP DNS проверка (запасной вариант при блокировке DoH/DoT)
-    udp_success, udp_latency, udp_server = udp_dns_check(
-        socks_host, socks_port, domain="google.com", timeout=min(timeout, 2.0)
-    )
-    report["tests"]["udp_dns"] = {
-        "success": udp_success,
-        "server": udp_server,
-        "latency_ms": udp_latency,
-    }
+    udp_success, udp_latency, udp_server = False, None, None
+    udp_t = _cap(2.0)
+    if udp_t is None:
+        report["tests"]["udp_dns"] = {"success": False, "skipped": "deadline"}
+    else:
+        udp_success, udp_latency, udp_server = udp_dns_check(
+            socks_host, socks_port, domain="google.com", timeout=udp_t, deadline=deadline
+        )
+        report["tests"]["udp_dns"] = {
+            "success": udp_success,
+            "server": udp_server,
+            "latency_ms": udp_latency,
+        }
     
     # 7. Fake IP проверка (эмуляция режима работы Karing/Clash/sing-box)
-    fake_ip_success, fake_ip_latency = fake_ip_check(
-        socks_host, socks_port, domain="google.com", timeout=min(timeout, 2.0)
-    )
-    report["tests"]["fake_ip"] = {
-        "success": fake_ip_success,
-        "latency_ms": fake_ip_latency,
-    }
+    fake_ip_success, fake_ip_latency = False, None
+    fake_t = _cap(2.0)
+    if fake_t is None:
+        report["tests"]["fake_ip"] = {"success": False, "skipped": "deadline"}
+    else:
+        fake_ip_success, fake_ip_latency = fake_ip_check(
+            socks_host, socks_port, domain="google.com", timeout=fake_t
+        )
+        report["tests"]["fake_ip"] = {
+            "success": fake_ip_success,
+            "latency_ms": fake_ip_latency,
+        }
     
     # Итоговый вердикт - узел живой если хотя бы один тест прошёл
     any_success = (
@@ -537,6 +707,7 @@ def resilience_check(
         "only_udp_dns_works": udp_success and not tg_success and not doh_success and not alt_result[2] and not white_sni_result[2],
         "fake_ip_works": fake_ip_success,
         "completely_dead": not any_success,
+        "skipped_tests": sum(1 for t in report["tests"].values() if t.get("skipped")),
         "recommended_mode": _get_recommended_mode(report["tests"]),
     }
     
@@ -568,16 +739,48 @@ def _get_recommended_mode(tests: dict[str, Any]) -> str:
 def check_node_resilience_detailed(
     node_url: str,
     timeout: float = 5.0,
+    rtt_hint_ms: float | None = None,
 ) -> "ResilienceCheckResult":
     """Проверка живучести узла через SOCKS-прокси.
     
     Запускает временный Xray-процесс для узла и выполняет серию тестов
     для определения работоспособности в условиях блокировок.
     
+    ``rtt_hint_ms`` — медианный RTT канала из network profile
+    (initial-check p50). На медленных каналах (~2с) подтесты получают
+    увеличенные таймауты, а бюджет узла покрывает ВСЮ батарею.
+    Раньше бюджет был ``timeout * 2.5`` (15с при timeout=6с) — меньше
+    худшего времени батареи (~21с+), поэтому живые медленные узлы
+    получали ``failed_to_run``/``completely_dead`` (инцидент 2026-09-04,
+    лог4: 13 из 17 узлов отвалились на этом этапе).
+    
     Возвращает ResilienceCheckResult с подробными метриками.
     """
+    # Оценка худшего времени батареи с учётом масштабирования по RTT:
+    # tcp идёт на полном таймауте, tg — на масштабированном timeout,
+    # остальные — база × масштаб (каждый с потолком SUB_TIMEOUT_CAP).
+    # Плюс RTT-оверхед на каждый из 7 подтестов: socket-таймауты
+    # per-operation, поэтому реальное время подтеста ≈ RTT + подтаймаут
+    # (SOCKS CONNECT + TLS hang в разных окнах таймаута).
+    _scale = 1.0
+    if rtt_hint_ms is not None and rtt_hint_ms > RTT_SCALE_DIVISOR_MS:
+        _scale = min(RTT_SCALE_MAX, rtt_hint_ms / RTT_SCALE_DIVISOR_MS)
+    _rtt_overhead = min(3.0, max(0.3, (rtt_hint_ms or 500.0) / 1000.0))
+    _est_battery = (
+        timeout
+        + sum(min(base * _scale, SUB_TIMEOUT_CAP) for base in (2.5, timeout, 3.0, 3.0, 2.0, 2.0))
+        + 7.0 * _rtt_overhead
+    )
+    _budget = min(BATTERY_HARD_CAP, 0.8 + _est_battery + 3.0)
+    
     def _check(host: str, port: int) -> ResilienceCheckResult:
-        report = resilience_check(host, port, node_url, timeout)
+        # Дедлайн чуть раньше внешнего бюджета, чтобы батарея успела
+        # вернуть частичный результат, а не убиваться по FutureTimeout.
+        report = resilience_check(
+            host, port, node_url, timeout,
+            rtt_hint_ms=rtt_hint_ms,
+            deadline=time.monotonic() + _budget - 3.0,
+        )
         return ResilienceCheckResult(
             node=node_url,
             alive=report.get("summary", {}).get("alive", False),
@@ -592,7 +795,7 @@ def check_node_resilience_detailed(
             details=report,
         )
     
-    result = run_with_node(node_url, _check, timeout=timeout, budget=timeout * 2.5)
+    result = run_with_node(node_url, _check, timeout=timeout, budget=_budget)
     if result is None:
         return ResilienceCheckResult(
             node=node_url,

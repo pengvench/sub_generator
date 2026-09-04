@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import socket
+import ssl
 import threading
 import time
+import urllib.request
 
 from pathlib import Path
 from typing import Any
@@ -15,8 +19,9 @@ from checkers.base import run_with_node
 from checkers.initial_check import run_initial_check, format_result as format_initial_check_result
 from checkers.dpi_active import DPI_ACTIVE_MIN_SCORE, DpiActiveResult, check_node_dpi_active_detailed
 
-from checkers.telegram_pro import TelegramProResult, check_node_telegram_pro_detailed
+from checkers.telegram_pro import TG_TIMEOUT, TelegramProResult, check_node_telegram_pro_detailed
 from checkers.route import (
+    ROUTE_PROBE_TIMEOUT,
     ROUTE_PROBES,
     RouteCheckResult,
     check_node_route_detailed,
@@ -27,8 +32,7 @@ from checkers.zapret import (
     effective_suite_params,
     load_dpi_suite,
 )
-from xray_runtime import _download_speed_probe, _socks_https_head_status, TG_MEDIA_MIN_KBPS
-from subgen.baseline import measure_baseline, adapt_speed_thresholds, save_baseline_cache
+from xray_runtime import _download_speed_probe, _socks_https_head_status
 
 
 from subgen.config import DEFAULT_SOURCES_FILE, DATA_DIR, GEOIP_FALLBACK_CODE, ROOT
@@ -36,6 +40,7 @@ from subgen.geo import load_geo_cache, serialize_working
 from subgen.logging import log
 from subgen.output import (
     append_text,
+    build_subscription,
     urls_text,
     write_file,
     write_geo_cache,
@@ -63,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--custom-file", default="", help="Локальный файл с конфигами (например, сохранённый кеш с прошлого прогона). Файл читается как есть: base64 декодируется, извлекаются только ссылки-конфиги.")
 
     parser.add_argument("--workers", type=int, default=4, help="Потоков стресс-теста (по умолчанию 4).")
-    parser.add_argument("--timeout", type=float, default=8.0, help="Базовый таймаут проверки, сек (по умолчанию 8). От него ПРОПОРЦИОНАЛЬНО выводятся таймауты всех этапов (initial/dpi/ai/route/resilience), с нижними порогами — чтобы короткий таймаут не ломал живые узлы.")
+    parser.add_argument("--timeout", type=float, default=8.0, help="Таймаут проверки, сек (по умолчанию 8).")
     parser.add_argument("--limit", type=int, default=0, help="Максимум узлов после проверки (0 = без лимита).")
     parser.add_argument("--max-ping", type=int, default=1000, help="Максимальный пинг в мс (0 - без ограничения).")
     parser.add_argument("--no-stress", action="store_true", help="Пропустить стресс-тест (оставить только пропингованных).")
@@ -80,16 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dpi-suite-no-http", action="store_true", help="DPI-suite: не выполнять стандартный HTTP-тест (только suite tcp 16-20).")
     parser.add_argument("--zapret-check", action="store_true", help="УСТАРЕЛО (алиас): включить --dpi-check. Suite выполняется всегда вместе с DPI-проверкой.")
     parser.add_argument("--dpi-active", action="store_true", help="Включить активную DPI-проверку протокола узла (SNI-варианты, фрагментация/большой ClientHello, ECH, TLS 1.2/1.3).")
-    parser.add_argument("--dpi-active-timeout", type=float, default=None, help="Таймаут одного варианта активной DPI-проверки, сек. По умолчанию — 0.5× базового таймаута, не менее 4 сек.")
+    parser.add_argument("--dpi-active-timeout", type=float, default=4.0, help="Таймаут одного варианта активной DPI-проверки, сек (по умолчанию 4).")
     parser.add_argument("--telegram-pro", action="store_true", help="УСТАРЕЛО: продвинутые Telegram-проверки (MTProto connect/auth, upload) и telegram_score теперь выполняются автоматически при включённом Telegram. Флаг оставлен для обратной совместимости (игнорируется, если не задан --no-telegram).")
-    parser.add_argument("--initial-check-timeout", type=float, default=None, help="Таймаут начальной проверки доступности (TCP+HTTP HEAD), сек. По умолчанию — 0.5× базового таймаута, не менее 3 сек.")
+    parser.add_argument("--initial-check-timeout", type=float, default=3.0, help="Таймаут начальной проверки доступности (TCP+HTTP HEAD), сек (по умолчанию 3).")
     # --- ИИ-гео слепок (Gemini/OpenAI): под какой страной exit-IP видят ИИ-сервисы ---
     parser.add_argument("--ai-check", action="store_true", help="УСТАРЕЛО (no-op): ИИ-гео слепок — ОБЯЗАТЕЛЬНЫЙ этап конвейера, выполняется всегда. Определяет страну для флага в подписке (CF trace loc=, как видит OpenAI). Флаг оставлен для совместимости.")
     parser.add_argument("--ai-strict", action="store_true", help="ИИ-гео: отсеивать узлы, чей слепок — РФ (ai_unblocked=False). Слепок недоступен (None) — узел НЕ отсеивается. Единственная опция ИИ-гео: сам слепок обязателен.")
-    parser.add_argument("--ai-timeout", type=float, default=None, help="Таймаут одного ИИ-гео запроса, сек. По умолчанию — 0.4× базового таймаута, не менее 4 сек.")
+    parser.add_argument("--ai-timeout", type=float, default=6.0, help="Таймаут одного ИИ-гео запроса, сек (по умолчанию 6).")
     parser.add_argument("--resilience-check", action="store_true", default=True, help="Включить проверку живучести узлов в условиях блокировок (multi-target ping, WHITE-SNI, альтернативные цели). Включено по умолчанию для работы на заблокированных мобильных сетях.")
     parser.add_argument("--no-resilience-check", action="store_false", dest="resilience_check", help="Отключить проверку живучести (не рекомендуется для мобильных сетей РФ).")
-    parser.add_argument("--resilience-timeout", type=float, default=None, help="Таймаут одного теста resilience-проверки, сек. По умолчанию — 0.4× базового таймаута, не менее 4 сек.")
+    parser.add_argument("--resilience-timeout", type=float, default=4.0, help="Таймаут одного теста resilience-проверки, сек (по умолчанию 4).")
 
     parser.add_argument(
         "--zapret-out",
@@ -101,16 +106,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="working_zapret.txt",
         help="(совместимость) Рабочие конфиги, прошедшие DPI+suite — при включённом --dpi-suite.",
     )
-    # NOTE: устаревшие алиасы --zapret-targets/-timeout/-min-score/-no-http
-    # УДАЛЕНЫ (v1.3): ps1-ранер их не использует, значения дублировали
-    # --dpi-suite-*. Используйте --dpi-suite-*. Файлы zapret-out/-working и
-    # флаг --zapret-check (алиас --dpi-check) сохранены для совместимости.
-    parser.add_argument("--min-speed", type=int, default=5000, help="Минимальная скорость загрузки в КБ/с (запасной порог). Порог един для всех. ПРИ АВТОЗАМЕРЕ СЕТИ (v1.3, полный прогон со стресс-тестом) порог автоматически смягчается под реальную скорость сети (60% от замера по белым сервисам), чтобы мобильные сети не браковали рабочие узлы; это значение используется, если замер не удался.")
-    parser.add_argument(
-        "--autoselect",
-        action="store_true",
-        help="Автовыборка: после проверки собрать ГОТОВЫЙ конфиг-балансер из рабочих узлов (Xray leastLoad / sing-box urltest, функциональная проба t.me). Файлы: data/autoselect_xray.json + data/autoselect_singbox.json.",
-    )
+    parser.add_argument("--zapret-targets", type=int, default=8, help="(устарело, алиас --dpi-suite-targets) Максимум целей DPI suite на узел.")
+    parser.add_argument("--zapret-timeout", type=float, default=5.0, help="(устарело, алиас --dpi-suite-timeout) Таймаут одного suite-теста, сек.")
+    parser.add_argument("--zapret-min-score", type=float, default=0.75, help="(устарело, алиас --dpi-suite-min-score) Мин. доля успешных тестов, 0..1.")
+    parser.add_argument("--zapret-no-http", action="store_true", help="(устарело, алиас --dpi-suite-no-http) Только DPI suite, без HTTP-теста.")
+    parser.add_argument("--min-speed", type=int, default=5000, help="Минимальная скорость загрузки в КБ/с для 1080p (по умолчанию 5000). Порог един для всех: Telegram-медиа фильтр (обязательный, t.me/s/) его НЕ обходит.")
     parser.add_argument(
         "--start-stage",
         choices=["ping", "initial", "telegram_pro", "dpi", "dpi_active", "ai_geo", "route", "resilience", "recheck", "zapret"],
@@ -161,6 +161,12 @@ def _apply_stage_aliases(args: argparse.Namespace) -> argparse.Namespace:
         args.start_stage = "dpi"
     if getattr(args, "zapret_check", False):
         args.dpi_check = True
+        # Старые zapret-* аргументы перекладываем на dpi-suite-* (совместимость
+        # со старыми командными строками/скриптами).
+        args.dpi_suite_targets = args.zapret_targets
+        args.dpi_suite_timeout = args.zapret_timeout
+        args.dpi_suite_min_score = args.zapret_min_score
+        args.dpi_suite_no_http = args.zapret_no_http
     # ИИ-гео слепок обязателен: флаг CLI не нужен, этап выполняется всегда
     # (отключается только перепроверкой с позднего --start-stage).
     args.ai_check = True
@@ -246,6 +252,64 @@ def _load_cached_working() -> list[Any]:
 
 
 
+def _preflight_dns_doh(timeout: float = 5.0) -> dict[str, bool]:
+    """Проверить доступность системного DNS и DoH перед тестированием узлов.
+
+    Модель — Karing: перед проверкой узлов убеждаемся, что локальная сеть
+    вообще может резолвить имена. Это не даёт системным настройкам DNS
+    испортить результаты тестов (например, когда DoH-сервер core резолвится
+    через системный DNS, а тот не работает).
+
+    Возвращает {"system_dns": bool, "doh": bool}.
+    """
+    result = {"system_dns": False, "doh": False}
+
+    # 1) Системный DNS — обычный UDP-запрос A-записи google.com к 8.8.8.8.
+    import contextlib as _cl
+
+    udp_sock: socket.socket | None = None
+    try:
+        transaction_id = b"\xab\xcd"
+        qname = b"\x06google\x03com\x00"
+        query = (
+            transaction_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+            + qname + b"\x00\x01\x00\x01"
+        )
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_sock.settimeout(min(timeout, 3.0))
+        udp_sock.sendto(query, ("8.8.8.8", 53))
+        response, _ = udp_sock.recvfrom(512)
+        if len(response) >= 12 and response[:2] == transaction_id:
+            result["system_dns"] = True
+    except Exception:
+        pass
+    finally:
+        if udp_sock is not None:
+            with _cl.suppress(Exception):
+                udp_sock.close()
+
+    # 2) DoH — HTTPS GET к cloudflare-dns.com/dns-query (JSON API).
+    #    Запрос идёт через checkers.hostres.direct_https_get: домен
+    #    cloudflare-dns.com резолвится по DoH на IP-literal 1.1.1.1,
+    #    соединение открывается на IP с SNI — системный hosts-файл
+    #    НЕ читается (записи-подмены не влияют на preflight).
+    try:
+        from checkers.hostres import direct_https_get
+
+        response = direct_https_get(
+            "https://cloudflare-dns.com/dns-query?name=google.com&type=A",
+            timeout=min(timeout, 5.0),
+            max_bytes=8 * 1024,
+            headers={"Accept": "application/dns-json"},
+        )
+        if response.ok and response.status == 200 and response.body:
+            result["doh"] = True
+    except Exception:
+        pass
+
+    return result
+
+
 def _median_initial_latency(details: dict) -> float:
     """Медиана (p50) латентности initial_check по прошедшим узлам, мс.
 
@@ -303,7 +367,6 @@ def run(
     # (v8: отдельных тумблеров/флагов больше нет). Вес dpi это учитывает.
     run_suite = bool(getattr(args, "dpi_check", False))
     progress = _PowerShellProgress()
-    progress.add_stage("baseline", 0.02, total=1)
     progress.add_stage("load", 0.05, total=len(sources))
     progress.add_stage("ping", 0.25, total=1)
     if not args.no_stress:
@@ -337,50 +400,6 @@ def run(
     resilience_idx = progress.stage_index("resilience") if resilience_enabled else -1
     recheck_idx = progress.stage_index("recheck")
     geo_idx = progress.stage_index("geo")
-    baseline_idx = progress.stage_index("baseline")
-
-    # ---------------------------------------------------------------------
-    # v1.3: таймауты этапов привязаны к базовому --timeout (настройка UI).
-    # Раньше у каждого этапа был свой жёсткий дефолт (initial=3с, dpi=10с,
-    # ai=6с, resilience=4с), никак не связанный с настройкой пользователя:
-    # при таймауте 2-5с в UI «мёртвыми» объявлялись просто медленные узлы.
-    # Теперь каждый этап выводится ПРОПОРЦИОНАЛЬНО базовому таймауту с нижним
-    # порогом; явный CLI-флаг по-прежнему переопределяет.
-    # ---------------------------------------------------------------------
-    base_timeout = max(2.0, float(args.timeout or 8.0))
-    if args.timeout < 6.0:
-        log(
-            f"[sub] WARNING: базовый таймаут {args.timeout:.0f}с мал (рекомендуется >= 8с для мобильных сетей); "
-            "этапы получают нижние пороги, но живые узлы с большим RTT могут браковаться ложно"
-        )
-    if args.initial_check_timeout is None:
-        args.initial_check_timeout = round(max(3.0, base_timeout * 0.5), 1)
-    if args.dpi_active_timeout is None:
-        args.dpi_active_timeout = round(max(4.0, base_timeout * 0.5), 1)
-    if args.ai_timeout is None:
-        args.ai_timeout = round(max(4.0, base_timeout * 0.4), 1)
-    if args.resilience_timeout is None:
-        args.resilience_timeout = round(max(4.0, base_timeout * 0.4), 1)
-    # Route-этап раньше брал константу ROUTE_PROBE_TIMEOUT=4с.
-    route_probe_timeout = round(max(4.0, base_timeout * 0.4), 1)
-    # DPI: производный (0.75×), но не ниже значения из checker_thresholds.json
-    # (кастомный файл может только ПОДНЯТЬ планку относительно базы UI).
-    dpi_stage_timeout = max(
-        float(get_threshold("dpi", "timeout", 10.0)),
-        round(max(6.0, base_timeout * 0.75), 1),
-    )
-    # Telegram-PRO: база 0.6× (RTT-адаптация ниже добавит сверху).
-    tg_base_timeout = round(max(5.0, base_timeout * 0.6), 1)
-    # Финальный recheck: замер скорости большим окном, нижний порог 8с
-    # (раньше было min(8с, timeout) — при timeout=2с замер умирал).
-    recheck_probe_timeout = round(max(8.0, min(base_timeout, 12.0)), 1)
-    log(
-        f"[sub] таймауты этапов (база --timeout={base_timeout:.0f}с): "
-        f"initial={args.initial_check_timeout}с telegram={tg_base_timeout}с(+) "
-        f"dpi={dpi_stage_timeout}с dpi-active={args.dpi_active_timeout}с "
-        f"ai={args.ai_timeout}с route={route_probe_timeout}с "
-        f"resilience={args.resilience_timeout}с recheck={recheck_probe_timeout}с"
-    )
 
 
 
@@ -388,13 +407,6 @@ def run(
     for source in sources:
         log(f"  - {source}")
     log(f"[sub] workers={args.workers} timeout={args.timeout} stress={not args.no_stress} limit={args.limit or '∞'}")
-
-    # Дефолты эффективных порогов (v1.3): при перепроверке с этапа базовый
-    # замер не выполняется — используются значения UI как есть (fallback).
-    baseline_report: dict[str, Any] = {"enabled": False}
-    effective_min_speed = float(args.min_speed)
-    effective_upload_min: float | None = None
-    effective_tg_media_min = float(TG_MEDIA_MIN_KBPS)
 
     # ---------------------------------------------------------------------
     # Начальный этап: либо полный прогон (распинговка + стресс-тест), либо
@@ -422,7 +434,7 @@ def run(
         log(
             f"[sub] preflight network: udp_dns={preflight.udp_dns_ok} "
             f"doh={preflight.doh_ok} http={preflight.http_ok} "
-            f"internet={preflight.internet_ok}"
+            f"tun={preflight.tun_present} internet={preflight.internet_ok}"
         )
         # Критерий остановки: только если НИ DNS, НИ DoH не работают.
         # Если хотя бы UDP DNS отвечает — продолжаем (Karing-стиль).
@@ -446,54 +458,6 @@ def run(
             for err in preflight.errors[:2]:
                 log(f"[sub] preflight warning: {err}")
 
-        # -----------------------------------------------------------------
-        # v1.3: базовый замер скорости сети (спидтест по белым сервисам)
-        # ДО запуска проверок. Мобильные сети асимметричны (инцидент:
-        # download 46 Мбит/с, upload 5.3 Мбит/с) — фиксированный порог
-        # бракует ВСЕ узлы, потому что сеть сама столько не выдаёт.
-        # Пороги адаптируем «чуть ниже среднего от прогона» (60% от
-        # базовой download, 50% от upload). Значение из UI — fallback,
-        # если замер не удался. Замер идёт только при включённом
-        # стресс-тесте (без него скоростных порогов нет).
-        # -----------------------------------------------------------------
-        if not args.no_stress:
-            if baseline_idx >= 0:
-                progress.start_stage(baseline_idx, "замер базовой скорости сети")
-            baseline_result = measure_baseline(timeout=10.0, log_sink=log)
-            if baseline_idx >= 0:
-                progress.finish_stage(
-                    baseline_idx,
-                    f"[baseline] download={baseline_result.download_kbps or 0:.0f} КБ/с "
-                    f"upload={baseline_result.upload_kbps or 0:.0f} КБ/с",
-                )
-            (
-                effective_min_speed,
-                effective_upload_min,
-                effective_tg_media_min,
-                thresholds_info,
-            ) = adapt_speed_thresholds(
-                float(args.min_speed),
-                baseline_result,
-                tg_media_default_kbps=float(TG_MEDIA_MIN_KBPS),
-            )
-            baseline_report = {"enabled": True, **baseline_result.as_dict(), "thresholds": thresholds_info}
-            if thresholds_info["applied"]:
-                log(
-                    f"[sub] пороги адаптированы под замер сети: min_speed {float(args.min_speed):.0f} -> "
-                    f"{effective_min_speed:.0f} КБ/с, min_upload -> {effective_upload_min:.0f} КБ/с, "
-                    f"tg_media -> {effective_tg_media_min:.0f} КБ/с (лимиты ниже среднего от прогона — "
-                    "чтобы сеть не браковала рабочие конфиги)"
-                )
-            elif thresholds_info.get("ignored") == "fast_channel":
-                # КЭП быстрого канала: замер ≥ 100 Мбит/с неинформативен для
-                # VPN-конфигов — порог пользователя не трогаем.
-                log(
-                    f"[sub] базовый замер {float(thresholds_info.get('baseline_mbits') or 0):.0f} Мбит/с "
-                    "≥ 100 Мбит/с — быстрый канал: автопорог НЕ применяется, "
-                    f"порог из UI ({float(args.min_speed):.0f} КБ/с) используется как есть"
-                )
-            save_baseline_cache(baseline_result, thresholds_info)
-
         progress.start_stage(0, f"загрузка {len(sources)} подписок")
 
         working, rejected, discovered = run_refresh(
@@ -504,9 +468,7 @@ def run(
             stress=not args.no_stress,
             log_sink=log,
             progress=progress,
-            min_speed_kbps=effective_min_speed,
-            upload_min_kbps=effective_upload_min,
-            tg_media_min_kbps=effective_tg_media_min,
+            min_speed_kbps=float(args.min_speed),
             telegram_media_check=not args.no_telegram,
             cancel_event=cancel_event,
             pause_event=pause_event,
@@ -531,12 +493,11 @@ def run(
             log("[sub] no ping filter (--max-ping=0)")
 
         # Фильтр по скорости для 1080p (только при стресс-тесте).
-        # Порог — эффективный (адаптированный под базовый замер сети v1.3):
-        # если сеть сама не выдаёт min_speed, фиксированный фильтр браковал
-        # бы все узлы. Telegram-медиа фильтр (обязательный, v7) уже отработал
-        # в стресс-тесте с адаптированным порогом tg_media.
+        # Telegram-медиа фильтр (обязательный, v7) уже отработал в стресс-тесте:
+        # узлы, не качающие видео из t.me/s/, отбракованы там (tg_media_failed).
+        # Исключений больше нет — порог скорости един для всех.
         if not args.no_stress:
-            min_speed = effective_min_speed
+            min_speed = args.min_speed
             orig_count = len(working)
             working = [
                 w
@@ -673,7 +634,7 @@ def run(
         log(
             f"[sub] network profile: initial-check p50 = {network_rtt_ms:.0f} ms"
             + (
-                " (медленный канал: таймауты Telegram/DPI-сьюта адаптированы)"
+                " (медленный канал: таймауты Telegram/DPI-сьюта/Resilience адаптированы)"
                 if network_rtt_ms >= SLOW_NETWORK_RTT_MS
                 else ""
             )
@@ -691,17 +652,15 @@ def run(
         telegram_pro_orig_count = len(working)
         # Адаптивный таймаут: MTProto connect/auth — это 2-3 RTT сквозного
         # пути; при p50 RTT ~2с фиксированные 5с проходят впритык.
-        # v1.3: база — 0.6× базового таймаута UI (не ниже 5с), сверху
-        # RTT-адаптация.
-        tg_timeout = tg_base_timeout
+        tg_timeout = TG_TIMEOUT
         if network_rtt_ms > 0:
-            tg_timeout = round(min(max(tg_base_timeout, network_rtt_ms / 1000.0 * 6.0), 15.0), 1)
+            tg_timeout = round(min(max(TG_TIMEOUT, network_rtt_ms / 1000.0 * 6.0), 15.0), 1)
         log(
             f"[sub] Telegram-PRO check enabled, checking {telegram_pro_orig_count} nodes..."
             + (
                 f" (timeout адаптирован: {tg_timeout}s при p50 RTT {network_rtt_ms:.0f}ms)"
-                if tg_timeout != tg_base_timeout
-                else f" (база 0.6× таймаута UI: {tg_timeout}s)"
+                if tg_timeout != TG_TIMEOUT
+                else ""
             )
         )
         if telegram_pro_idx >= 0:
@@ -766,7 +725,7 @@ def run(
     # дубля tcp 16-20. Отдельный zapret-этап удалён.
     dpi_report: dict[str, Any] = {}
     if args.dpi_check:
-        timeout = dpi_stage_timeout
+        timeout = get_threshold("dpi", "timeout", 10.0)
         require_siberian = args.dpi_siberian or get_threshold("dpi", "require_siberian", False)
         require_cidr = args.dpi_cidr or get_threshold("dpi", "require_cidr", False)
 
@@ -1121,7 +1080,7 @@ def run(
 
             res: RouteCheckResult = check_node_route_detailed(
                 w.node.raw_url,
-                timeout=route_probe_timeout,
+                timeout=ROUTE_PROBE_TIMEOUT,
             )
             route_node_details[w.node.title()] = res.row()
             log(
@@ -1161,10 +1120,26 @@ def run(
 
         resilience_orig_count = len(working)
         resilience_timeout = max(3.0, args.resilience_timeout)
+        # Медленный канал: как Telegram/DPI, адаптируем и resilience
+        # (инцидент 2026-09-04, лог4: p50 RTT 2076 мс, а подтесты батареи
+        # остались с таймаутом 6с — живые узлы, прошедшие DPI, отвалились
+        # на resilience с вердиктом completely_dead).
+        resilience_rtt_hint: float | None = None
+        if network_rtt_ms and network_rtt_ms >= SLOW_NETWORK_RTT_MS:
+            resilience_rtt_hint = network_rtt_ms
+            resilience_timeout = max(
+                resilience_timeout,
+                min(15.0, network_rtt_ms / 1000.0 * 4.0),
+            )
 
         log(
-            f"[sub] Resilience check enabled (default), timeout={resilience_timeout}s, "
-            f"checking {resilience_orig_count} nodes..."
+            f"[sub] Resilience check enabled (default), timeout={resilience_timeout}s"
+            + (
+                f" (адаптирован: p50 RTT {network_rtt_ms:.0f}ms)"
+                if resilience_rtt_hint
+                else ""
+            )
+            + f", checking {resilience_orig_count} nodes..."
         )
         if resilience_idx >= 0:
             progress.start_stage(resilience_idx, f"Resilience-проверка {resilience_orig_count} узлов")
@@ -1183,7 +1158,11 @@ def run(
             if resilience_idx >= 0:
                 progress.update(idx, f"Resilience {w.node.title()}")
 
-            res = check_node_resilience_detailed(w.node.raw_url, timeout=resilience_timeout)
+            res = check_node_resilience_detailed(
+                w.node.raw_url,
+                timeout=resilience_timeout,
+                rtt_hint_ms=resilience_rtt_hint,
+            )
             resilience_node_details[w.node.title()] = res.to_dict()
 
             if res.alive:
@@ -1194,9 +1173,16 @@ def run(
                 )
             else:
                 failed_resilience += 1
+                # Честная причина отвала: ошибка запуска ядра/бюджета — это НЕ
+                # «узел мёртв», раньше оба случая писались как completely_dead.
+                fail_reason = (
+                    "run_failed (ядро узла не поднялось/бюджет)"
+                    if res.recommended_mode == "error"
+                    else "completely_dead"
+                )
                 log(
                     f"[resilience] FAIL {idx}/{resilience_orig_count}: {w.node.title()} "
-                    f"(completely_dead)"
+                    f"({fail_reason})"
                 )
 
             if resilience_idx >= 0:
@@ -1210,6 +1196,7 @@ def run(
             "passed": len(checked_resilience),
             "failed": failed_resilience,
             "timeout_sec": resilience_timeout,
+            "rtt_hint_ms": round(resilience_rtt_hint, 1) if resilience_rtt_hint else None,
             "nodes": resilience_node_details,
         }
     else:
@@ -1225,7 +1212,7 @@ def run(
     recheck_report: dict[str, Any] = {}
     if not args.no_stress:
         recheck_orig_count = len(working)
-        recheck_min_speed = effective_min_speed
+        recheck_min_speed = args.min_speed
         log(
             f"[sub] Final speed re-check after all checks, min={recheck_min_speed} Kbps, "
             f"checking {recheck_orig_count} nodes..."
@@ -1241,9 +1228,7 @@ def run(
         # Источники замера скорости загрузки (пробуем по порядку, первый
         # успешный результат берём). speed.cloudflare.com не работает через
         # Cloudflare Worker-прокси (даёт None/0), поэтому нужны fallback-хосты.
-        # v1.3: проба скорости идёт большим окном (нижний порог 8с даже при
-        # коротком таймауте UI): замер на 2-3с — это ramp-up, а не скорость.
-        _SPEED_TIMEOUT = recheck_probe_timeout
+        _SPEED_TIMEOUT = min(8.0, args.timeout)
 
         # У Cloudflare Worker-узлов есть ramp-up: короткий замер (512KB/2.5s)
         # замеряет начальный медленный участок и сильно занижает скорость
@@ -1280,7 +1265,7 @@ def run(
             # замер скорости даёт None, и HEAD тоже не отвечает.
             for host in ("api.telegram.org", "example.com", "www.google.com"):
                 try:
-                    res = _socks_https_head_status(socks_host, socks_port, host, 443, host, recheck_probe_timeout, "/")
+                    res = _socks_https_head_status(socks_host, socks_port, host, 443, host, min(8.0, args.timeout), "/")
                 except Exception:  # noqa: BLE001
                     res = None
                 if res is not None and res[0] < 500:
@@ -1289,7 +1274,7 @@ def run(
 
         # Большой замер (16MB/8s на каждый источник, до 2 попыток) может занять
         # дольше дефолтного budget (24с) — даём явный запас.
-        _RECHECK_BUDGET = max(120.0, recheck_probe_timeout * 6.0)
+        _RECHECK_BUDGET = max(120.0, min(8.0, args.timeout) * 6.0)
 
         for idx, w in enumerate(working, 1):
             if cancel_event and cancel_event.is_set():
@@ -1304,7 +1289,7 @@ def run(
 
                 w.node.raw_url,
                 _speed_probe,
-                timeout=recheck_probe_timeout,
+                timeout=min(8.0, args.timeout),
                 budget=_RECHECK_BUDGET,
             )
 
@@ -1320,8 +1305,8 @@ def run(
                 alive = run_with_node(
                     w.node.raw_url,
                     _alive_probe,
-                    timeout=recheck_probe_timeout,
-                    budget=max(60.0, recheck_probe_timeout * 4.0),
+                    timeout=min(8.0, args.timeout),
+                    budget=max(60.0, min(8.0, args.timeout) * 4.0),
                 )
                 alive = bool(alive)
 
@@ -1391,7 +1376,7 @@ def run(
             working,
             geo_cache,
             last_call,
-            timeout=recheck_probe_timeout,
+            timeout=min(8.0, args.timeout),
             progress=progress_geo,
         )
     else:
@@ -1400,7 +1385,7 @@ def run(
             candidates,
             geo_cache,
             last_call,
-            timeout=recheck_probe_timeout,
+            timeout=min(8.0, args.timeout),
             progress=progress_geo,
         )
     if geo_idx >= 0:
@@ -1413,20 +1398,6 @@ def run(
         out_path=out_path,
         plain=False,
     )
-
-    # ---------------------------------------------------------------------
-    # v1.3: Автовыборка — готовый конфиг-балансер из проверенных узлов.
-    # Xray: burstObservatory (функциональная проба t.me) + leastLoad-балансер;
-    # sing-box: urltest-группа для hy2/hysteria. Импортируется в клиент
-    # ЦЕЛИКОМ (готовый конфиг), SOCKS/ mixed-прокси поднимается локально.
-    # ---------------------------------------------------------------------
-    autoselect_report: dict[str, Any] = {"enabled": False}
-    if getattr(args, "autoselect", False) and rows:
-        from subgen.autoselect import write_autoselect_files
-
-        autoselect_report = write_autoselect_files(rows, log_sink=log)
-    elif getattr(args, "autoselect", False):
-        log("[autoselect] WARNING: нет проверенных узлов — конфиг автовыборки не собран")
 
     # WARP генерация удалена — обычные warp:// URL блокируются на
     # мобильных сетях РФ и бесполезны.
@@ -1443,10 +1414,6 @@ def run(
         # Сетевой профиль прогона (v8.2): p50 initial_check, slow_mode —
         # видно, какой сетью шёл прогон и почему таймауты адаптированы.
         "network": network_report,
-        # v1.3: базовый замер сети + адаптированные пороги отбраковки.
-        "baseline": baseline_report,
-        # v1.3: автовыборка (конфиг-балансер из рабочих узлов).
-        "autoselect": autoselect_report,
         "initial_check": initial_check_report,
         "telegram_pro": telegram_pro_report,
         "dpi": dpi_report,

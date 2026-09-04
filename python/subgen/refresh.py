@@ -12,7 +12,13 @@ import threading
 from collections.abc import Callable
 
 from subgen.config import DATA_DIR, ROOT
-from xray_runtime import TG_MEDIA_MIN_KBPS, XrayCoreRuntime, XrayNode, XrayProbeResult, XrayRuntimeConfig, collect_subscription_nodes
+from xray_runtime import (
+    XrayCoreRuntime,
+    XrayNode,
+    XrayProbeResult,
+    XrayRuntimeConfig,
+    collect_subscription_nodes,
+)
 
 
 def run_refresh(
@@ -25,8 +31,6 @@ def run_refresh(
     log_sink: Callable[[str], None],
     progress=None,
     min_speed_kbps: float = 2048.0,
-    upload_min_kbps: float | None = None,
-    tg_media_min_kbps: float | None = None,
     telegram_media_check: bool = True,
     cancel_event: threading.Event | None = None,
     pause_event: threading.Event | None = None,
@@ -39,11 +43,6 @@ def run_refresh(
     min_speed_kbps — единый порог скорости (КБ/с), который применяется и в
     стресс-тесте (Фаза 2), и в финальном recheck. Передаётся в XrayRuntimeConfig,
     чтобы оба замера использовали один и тот же порог.
-
-    upload_min_kbps / tg_media_min_kbps (v1.3) — адаптивные пороги от
-    базового замера сети (subgen.baseline): на асимметричных мобильных
-    сетях (46/5 Мбит) фиксированные доли бракуют все узлы. None —
-    стандартное поведение (upload = 10% от min_speed, tg = TG_MEDIA_MIN_KBPS).
     """
     config = XrayRuntimeConfig(
         subscription_urls=list(sources),
@@ -51,8 +50,6 @@ def run_refresh(
         probe_timeout_sec=max(2.0, timeout),
         max_servers=max_servers,
         min_speed_kbps=min_speed_kbps,
-        upload_min_kbps=upload_min_kbps,
-        tg_media_min_kbps=float(tg_media_min_kbps) if tg_media_min_kbps else float(TG_MEDIA_MIN_KBPS),
         telegram_media_check=telegram_media_check,
     )
     temp_out = DATA_DIR / ".runtime_cache"

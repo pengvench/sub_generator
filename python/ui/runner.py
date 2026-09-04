@@ -24,9 +24,6 @@ class PipelineOptions:
     max_ping: int = 1500
     min_speed: int = 3000
     no_stress: bool = False
-    # v1.3: автовыборка — собрать готовый конфиг-балансер из рабочих узлов
-    # (Xray leastLoad + sing-box urltest, функциональная проба t.me).
-    autoselect: bool = False
     telegram_check: bool = True
     dpi_check: bool = False
 
@@ -120,8 +117,6 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
 
     if options.no_stress:
         args.append("--no-stress")
-    if options.autoselect:
-        args.append("--autoselect")
     if not options.telegram_check:
         args.append("--no-telegram")
     if options.dpi_check:

@@ -1,11 +1,10 @@
 """Константы и базовые настройки проекта sub_generator (ПК-версия).
 
-sources.txt — в КОРНЕ репозитория (рядом с exe в собранной версии) и
-хранится в git. data/ — только рантайм-артефакты (логи, кеш, отчёты,
-settings.json), создаётся автоматически и в архив репозитория не входит.
+Все пути к данным — в data/, которая создаётся автоматически.
 """
 from __future__ import annotations
 
+import base64
 import sys
 from pathlib import Path
 
@@ -28,15 +27,13 @@ def _app_root() -> Path:
 # Корень проекта/приложения (каталог, где лежат python/, bin/, generate.py).
 ROOT = _app_root()
 
-# Runtime-папка для результатов (кеш, репорты, подписки-результаты, логи) —
-# создаётся автоматически, в git/архив не входит. Пользовательские данные
-# (sources.txt) в ней НЕ хранятся — они в корне.
+# Единая папка для всех результатов (кеш, репорты, подписки, логи),
+# чтобы не мусорить в корне проекта.
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Единый файл списка подписок (по строке на URL) — в корне репозитория,
-# рядом с generate.py; в собранной версии — рядом с exe.
-DEFAULT_SOURCES_FILE = ROOT / "sources.txt"
+# Файл списка подписок по умолчанию (по строке на URL).
+DEFAULT_SOURCES_FILE = DATA_DIR / "sources.txt"
 
 
 
@@ -47,6 +44,28 @@ SUBSCRIPTION_DESCRIPTION = (
     "# ТГ канал автора: https://t.me/peppe_poppo\n"
     "# Сайт проекта: https://tetta-prod.ru\n"
 )
+
+
+# --------------------------------------------------------------------------
+# Crypt encoding (простая XOR-обфускация)
+# --------------------------------------------------------------------------
+_CRYPT_KEY = b"mtproxy_autoswitch_key_2024"
+
+
+def crypt_encode(data: str, key: bytes = _CRYPT_KEY) -> str:
+    """Зашифровать данные с помощью XOR и вернуть base64-строку."""
+    data_bytes = data.encode("utf-8")
+    key_len = len(key)
+    encrypted = bytes(data_bytes[i] ^ key[i % key_len] for i in range(len(data_bytes)))
+    return base64.b64encode(encrypted).decode("ascii")
+
+
+def crypt_decode(encoded: str, key: bytes = _CRYPT_KEY) -> str:
+    """Расшифровать данные из base64 с помощью XOR."""
+    encrypted = base64.b64decode(encoded.encode("ascii"))
+    key_len = len(key)
+    decrypted = bytes(encrypted[i] ^ key[i % key_len] for i in range(len(encrypted)))
+    return decrypted.decode("utf-8", errors="replace")
 
 
 # --------------------------------------------------------------------------

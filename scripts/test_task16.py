@@ -172,19 +172,13 @@ def test_aliases():
     args = _apply_stage_aliases(parser.parse_args(["--zapret-check"]))
     assert args.dpi_check, "--zapret-check должен включать dpi_check (suite всегда часть DPI)"
 
-    # v1.3: устаревшие алиасы --zapret-targets/-timeout/-min-score/-no-http
-    # УДАЛЕНЫ (значения дублировали --dpi-suite-*, ps1-ранер их не использует).
-    option_strings = {opt for action in parser._actions for opt in action.option_strings}
-    for removed_alias in ("--zapret-targets", "--zapret-timeout", "--zapret-min-score", "--zapret-no-http"):
-        assert removed_alias not in option_strings, f"{removed_alias} должен быть удалён (v1.3)"
-    # Прямые --dpi-suite-* флаги продолжают работать.
     args = _apply_stage_aliases(
         parser.parse_args([
-            "--dpi-check",
-            "--dpi-suite-targets", "5",
-            "--dpi-suite-timeout", "7",
-            "--dpi-suite-min-score", "0.5",
-            "--dpi-suite-no-http",
+            "--zapret-check",
+            "--zapret-targets", "5",
+            "--zapret-timeout", "7",
+            "--zapret-min-score", "0.5",
+            "--zapret-no-http",
         ])
     )
     assert args.dpi_check
@@ -411,12 +405,7 @@ def test_geo_tg_media_suffix():
     assert "📼" not in geo_src, "иконка 📼 не должна остаться в geo.py"
     assert "tg_media_kbps" in geo_src, "geo должен сохранять tg_media_kbps как данные"
 
-    # После разбиения xray_runtime.py на пакет runtime/ релевантный код живёт
-    # в runtime/core.py (вердикты стресс-теста) и runtime/probes_telegram.py
-    # (медиа-проба). Фасад xray_runtime.py исходников больше не содержит.
-    xr_src = open(os.path.join(ROOT, "runtime", "core.py"), encoding="utf-8").read() + open(
-        os.path.join(ROOT, "runtime", "probes_telegram.py"), encoding="utf-8"
-    ).read()
+    xr_src = open(os.path.join(ROOT, "xray_runtime.py"), encoding="utf-8").read()
     assert "tg_media_failed" in xr_src, "медиа-фильтр должен отбраковывать (reason=tg_media_failed)"
     assert "TG_MEDIA_RESCUE_REASON_PREFIXES" not in xr_src, "rescue-механика удалена"
     assert "tg_media_ok" not in xr_src, "reason=tg_media_ok больше не выставляется"

@@ -1,8 +1,7 @@
 """Определение путей приложения (работает и из исходников, и из PyInstaller).
 
 Единый соурс: python/ui/paths.py. Корень репозитория — на два уровня выше
-(ui -> python -> корень), где лежат generate.py, sources.txt, bin/, scripts/.
-data/ — только рантайм-артефакты (логи, кеш, отчёты), создаётся автоматически.
+(ui -> python -> корень), где лежат generate.py, bin/, data/, scripts/.
 """
 from __future__ import annotations
 
@@ -26,20 +25,20 @@ def data_dir() -> Path:
 
 
 def sources_file() -> Path:
-    """sources.txt — в корне (рядом с exe/в репозитории), НЕ в data/.
-
-    В data/ живут только рантайм-артефакты (логи, кеш, отчёты),
-    чтобы пользовательский список подписок не смешивался с мусором.
-    """
-    return app_root() / "sources.txt"
+    return data_dir() / "sources.txt"
 
 
 def ensure_sources_file() -> Path:
     """Вернуть путь к sources.txt, создав пустой файл, если его нет."""
     path = sources_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text("", encoding="utf-8")
     return path
+
+
+def bin_dir() -> Path:
+    return app_root() / "bin"
 
 
 def scripts_dir() -> Path:
@@ -50,3 +49,10 @@ def scripts_dir() -> Path:
 def assets_dir() -> Path:
     """Каталог ресурсов (иконки и т.п.)."""
     return app_root() / "assets"
+
+
+def ui_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        # Рядом с exe могут лежать страницы — но они вшиты. Возвращаем корень.
+        return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parent

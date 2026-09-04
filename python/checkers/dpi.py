@@ -25,6 +25,9 @@ from . import base
 from .base import (
     TCP1620_DETECTED,
     TCP1620_NOT_DETECTED,
+    TCP1620_POSSIBLE,
+    TCP1620_PROBABLY,
+    TCP1620_UNLIKELY,
 )
 
 logger = logging.getLogger(__name__)
@@ -338,6 +341,36 @@ def _run_checks(
             logger.warning("DPI suite failed on node: %s", exc)
 
     return result
+
+
+
+
+def check_node_dpi(
+    node_url: str,
+    target_host: str = DPI_DEFAULT_TARGET,
+    timeout: float = DPI_TIMEOUT,
+    root_dir: Optional[Path] = None,
+    require_siberian: bool = False,
+    require_cidr: bool = False,
+    target_hosts: tuple[str, ...] | None = None,
+) -> bool:
+    """Проверить, способен ли узел работать при DPI-блокировках.
+
+    Поднимает временный core-процесс узла и выполняет реальные проверки
+    (alive + tcp 16-20 + siberian) через локальный SOCKS5-прокси.
+
+    Возвращает True, если узел реально передаёт данные к целевому хосту.
+    """
+    result = check_node_dpi_detailed(
+        node_url,
+        target_host=target_host,
+        timeout=timeout,
+        root_dir=root_dir,
+        require_siberian=require_siberian,
+        require_cidr=require_cidr,
+        target_hosts=target_hosts,
+    )
+    return result.accepted
 
 
 def check_node_dpi_detailed(

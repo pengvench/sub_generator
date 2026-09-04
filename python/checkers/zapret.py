@@ -1026,3 +1026,53 @@ def check_node_zapret_detailed(
     return result
 
 
+def check_node_zapret(
+    node_url: str,
+    targets: Optional[list[ZapretTarget]] = None,
+    timeout: float = ZAPRET_TIMEOUT,
+    max_targets: int = ZAPRET_MAX_TARGETS,
+    root_dir: Optional[Path] = None,
+    run_http_test: bool = True,
+    min_score: float = ZAPRET_MIN_SCORE,
+    rtt_hint_ms: float = 0.0,
+) -> bool:
+    """Проверить узел Zapret-методом (возвращает bool)."""
+    result = check_node_zapret_detailed(
+        node_url,
+        targets=targets,
+        timeout=timeout,
+        max_targets=max_targets,
+        root_dir=root_dir,
+        run_http_test=run_http_test,
+        min_score=min_score,
+        rtt_hint_ms=rtt_hint_ms,
+    )
+    return result.accepted
+
+
+if __name__ == "__main__":
+    import sys
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if len(sys.argv) < 2:
+        print("Usage: python -m checkers.zapret <node_url> [max_targets]")
+        sys.exit(1)
+    url = sys.argv[1]
+    max_t = int(sys.argv[2]) if len(sys.argv) > 2 else ZAPRET_MAX_TARGETS
+    res = check_node_zapret_detailed(url, max_targets=max_t)
+    print(f"Zapret check for {url}: {'PASS' if res.accepted else 'FAIL'}")
+    print(
+        f"  score={res.score_text} ({res.score:.1%} >= {res.min_score:.1%}) "
+        f"targets={res.total_targets} ok={res.ok_targets} "
+        f"blocked={res.blocked_targets} reason={res.reason}"
+    )
+    for t in res.targets:
+        statuses = ", ".join(
+            f"{p['protocol']}={p['status']}({p['http_code']})" for p in t["probes"]
+        )
+        print(f"  dpi {t['host']}: {statuses}")
+    for ht in res.http_tests:
+        statuses = ", ".join(
+            f"{p['protocol']}={p['status']}({p['http_code']})" for p in ht.probes
+        )
+        print(f"  http {ht.host}: {statuses}")

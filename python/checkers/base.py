@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-from xray_runtime import XrayCoreRuntime, parse_node_link
+from xray_runtime import XrayCoreRuntime, XrayNode, parse_node_link
 
 # Размер случайного payload для проверки tcp 16-20 / l4-25 (как в dpich).
 TCP1620_PAYLOAD_BYTES = 64 * 1024
@@ -381,6 +381,82 @@ def siberian_check_ok(
     return True
 
 
+def download_bytes(
+    socks_host: str,
+    socks_port: int,
+    target_host: str,
+    target_port: int,
+    server_name: str,
+    path: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_bytes: int = 256 * 1024,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[bool, int, float]:
+    """Реально скачать данные через прокси.
+
+    Возвращает (успех, получено_байт, скорость_кб_с). Используется для
+    проверки реальной загрузки (например, контента YouTube).
+
+    ``extra_headers`` — дополнительные HTTP-заголовки (например, Cookie для
+    обхода consent-страницы Google).
+    """
+    raw_sock: socket.socket | None = None
+    try:
+        raw_sock = _socks_open_connection(socks_host, socks_port, target_host, target_port, timeout)
+        if raw_sock is None:
+            return False, 0, 0.0
+        with _wrap_tls(raw_sock, server_name, timeout) as tls_sock:
+            raw_sock = None
+            header_lines = [
+                f"GET {path} HTTP/1.1\r\n",
+                f"Host: {server_name}\r\n",
+                f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36\r\n",
+                f"Connection: close\r\n",
+            ]
+            for key, value in (extra_headers or {}).items():
+                header_lines.append(f"{key}: {value}\r\n")
+            header_lines.append("\r\n")
+            request = "".join(header_lines).encode("ascii")
+            tls_sock.sendall(request)
+
+            buffer = b""
+            body_bytes = 0
+            started: float | None = None
+            deadline = time.perf_counter() + timeout
+            while body_bytes < max_bytes and time.perf_counter() < deadline:
+                chunk = tls_sock.recv(min(65536, max_bytes - body_bytes + 4096))
+                if not chunk:
+                    break
+                if started is None:
+                    buffer += chunk
+                    header_end = buffer.find(b"\r\n\r\n")
+                    if header_end < 0:
+                        continue
+                    headers = buffer[:header_end]
+                    if not headers.startswith(b"HTTP/"):
+                        return False, 0, 0.0
+                    status = headers.split(b" ", 2)[1:2]
+                    if not status or not status[0].startswith(b"2"):
+                        return False, 0, 0.0
+                    body = buffer[header_end + 4 :]
+                    body_bytes += len(body)
+                    started = time.perf_counter()
+                    buffer = b""
+                else:
+                    body_bytes += len(chunk)
+            if started is None or body_bytes <= 0:
+                return False, 0, 0.0
+            elapsed = max(0.001, time.perf_counter() - started)
+            return True, body_bytes, (body_bytes / 1024.0) / elapsed
+    except Exception:
+        return False, 0, 0.0
+    finally:
+        if raw_sock is not None:
+            with contextlib.suppress(Exception):
+                raw_sock.close()
+
+
 def _http_read_headers(
     sock: socket.socket,
     timeout: float,
@@ -608,16 +684,24 @@ def run_with_node(
     # Защищает от зависаний, если узел поднялся, но сетевые операции не
     # завершаются в рамках отдельных таймаутов.
     budget = budget or max(5.0, timeout * 3.0)
+    pool = ThreadPoolExecutor(max_workers=1)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(runtime.with_node_process, node, fn, fp=fp)
-            try:
-                return future.result(timeout=budget)
-            except FutureTimeout:
-                return None
+        future = pool.submit(runtime.with_node_process, node, fn, fp=fp)
+        try:
+            return future.result(timeout=budget)
+        except FutureTimeout:
+            # Бюджет истёк: НЕ ждём зависшую задачу при выходе (раньше выход
+            # из with-блока блокировался до конца батареи тестов, растягивая
+            # «отвал» одного узла на десятки секунд — инцидент 2026-09-04,
+            # лог4). Ядро узла убивается Job Object'ом в runtime.stop()
+            # ниже, socket-операции брошенной задачи падают быстро и поток
+            # завершается сам.
+            return None
     except Exception:
         return None
     finally:
+        with contextlib.suppress(Exception):
+            pool.shutdown(wait=False, cancel_futures=True)
         with contextlib.suppress(Exception):
             runtime.stop()
 

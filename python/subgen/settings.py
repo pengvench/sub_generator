@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import threading
 
+from pathlib import Path
+
 from subgen.config import DATA_DIR, SUBSCRIPTION_DESCRIPTION
 
 _SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -30,9 +32,6 @@ DEFAULT_TEST_OPTIONS: dict[str, object] = {
     "min_speed": 3000,
     "limit": 0,
     "no_stress": False,
-    # v1.3: автовыборка — готовый конфиг-балансер из рабочих узлов
-    # (Xray leastLoad / sing-box urltest, проба t.me).
-    "autoselect": False,
     "telegram_check": True,
     "dpi_check": False,
     "dpi_siberian": False,

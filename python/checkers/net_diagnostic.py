@@ -1,10 +1,5 @@
 """Предварительная локальная диагностика сети перед запуском проверок узлов.
 
-ЕДИНСТВЕННАЯ реализация локальной диагностики: используется и конвейером
-(subgen/pipeline.py — preflight перед тестированием узлов), и GUI-страницей
-«Диагностика» (ui/pages/diag_page.py). Раньше GUI держал собственные inline-
-проверки (дубль кода) — теперь обе точки сходятся на run_network_diagnostic().
-
 Мотивация (из Karing NetCheckScreen): если локальный DNS заблокирован, до узла
 или хоста невозможно подключиться в принципе. Поэтому перед тем как гонять
 конфиги xray/sing-box, проверяем базовую сеть САМОСТОЯТЕЛЬНО, без участия
@@ -18,22 +13,31 @@
 2. DNS-over-HTTPS — HTTPS-запрос к cloudflare-dns.com/dns-query.
    Fallback: dns.google, dns.adguard-dns.com, doh.opendns.com.
 3. Базовая HTTP/HTTPS-доступность — лёгкий GET generate_204.
-4. Доступность заблокированных в РФ целей: chatgpt.com, instagram.com,
-   api.telegram.org — факультативно (include_blocked_media=True). Это не
-   влияет на internet_ok, но позволяет зафиксировать, что режет провайдер.
-
-TUN-проверки УДАЛЕНЫ (v1.3): TUN-функциональность не используется в
-ПК-версии, информация о TUN-адаптерах была бессмысленной.
+4. Наличие/возможность TUN-адаптера — Windows netsh/ipconfig.
+5. Доступность заблокированных в РФ медиа-целей: chatgpt.com,
+   chat.openai.com, instagram.com — факультативно (include_blocked_media=True).
+   Это не влияет на internet_ok, но позволяет зафиксировать, проходит ли
+   TUN-маршрут к блокированным ресурсам.
 
 Функции из checkers.resilience (udp_dns_check, dns_over_https_check) здесь
 НЕ используются: они проверяют DNS ЧЕРЕЗ SOCKS-прокси поднятого узла, а нам
 нужно проверить саму локальную сеть до запуска узлов.
+
+Параметризация TUN:
+    run_network_diagnostic(tun_iface="sgtun0") — если указано имя активного
+    TUN-интерфейса, проверки выполняются с привязкой к этому интерфейсу
+    (на Windows привязка по интерфейсу не поддерживается напрямую, поэтому
+    мы полагаемся на auto_route ядра: системный трафик автоматически уходит
+    в TUN). Это переиспользует NetworkDiagnosticResult, добавляя только
+    контекст «через какой интерфейс шёл трафик».
 """
 from __future__ import annotations
 
 import contextlib
 import socket
+import subprocess
 import time
+import urllib.request
 from dataclasses import dataclass, field
 
 
@@ -56,7 +60,7 @@ DOH_ENDPOINTS = [
     "https://cloudflare-dns.com/dns-query",
     "https://dns.google/dns-query",
     # DoH-fallback: если Cloudflare/Google DoH блокированы на сети,
-    # пробуем альтернативные провайдеров.
+    # пробуем альтернативные провайдеры.
     "https://dns.adguard-dns.com/dns-query",
     "https://doh.opendns.com/dns-query",
 ]
@@ -72,10 +76,9 @@ HTTP_PROBE_URLS = [
 
 DNS_PROBE_DOMAIN = "google.com"
 
-# Заблокированные в РФ цели. Проверка факультативна — она не влияет на
-# internet_ok, но позволяет отличить «сеть пропускает блокировки» от
-# «провайдер режет SNI». api.telegram.org добавлен для страницы
-# «Диагностика» в GUI (Telegram — главный критерий пользователя).
+# Заблокированные в РФ медиа-цели. Проверка факультативна — она не влияет
+# на internet_ok, но позволяет отличить «узел/TUN пропускает блокировки»
+# от «узел работает, но блокировки на стороне провайдера».
 BLOCKED_MEDIA_HTTP_PROBES = [
     # chatgpt.com — главное зеркало ChatGPT, часто блокируется по SNI/IP.
     ("chatgpt.com", "https://chatgpt.com/"),
@@ -83,8 +86,6 @@ BLOCKED_MEDIA_HTTP_PROBES = [
     ("chat.openai.com", "https://chat.openai.com/"),
     # instagram.com — главный домен Instagram.
     ("instagram.com", "https://www.instagram.com/"),
-    # api.telegram.org — Bot API Telegram (заблокирован на части сетей РФ).
-    ("api.telegram.org", "https://api.telegram.org/"),
 ]
 
 
@@ -99,38 +100,24 @@ class NetworkDiagnosticResult:
     http_ok: bool = False
     http_latency_ms: float | None = None
     http_url: str | None = None
+    tun_present: bool = False
+    tun_ready: bool = False
+    tun_detail: str = ""
     # DNS-fallback: True, если первый сервер (1.1.1.1) НЕ ответил, но
     # один из резервных (9.9.9.9/AdGuard/OpenDNS) — ответил. Полезный
     # сигнал для диагностики: «основной DNS режется, но запасной работает».
     dns_fallback_used: bool = False
     dns_fallback_server: str | None = None
-    # Детальные результаты по блокированным целям (include_blocked_media):
-    # host -> {"ok": bool, "latency_ms": float | None, "status": int}.
-    blocked_targets: dict[str, dict[str, object]] = field(default_factory=dict)
+    # chatgpt/instagram — факультативные проверки (include_blocked_media).
+    chatgpt_ok: bool = False
+    chatgpt_latency_ms: float | None = None
+    instagram_ok: bool = False
+    instagram_latency_ms: float | None = None
+    # Имя активного TUN-интерфейса, через который шли проверки (если
+    # параметризовано). На Windows это информационное поле: реальную
+    # маршрутизацию делает ядро (auto_route=True).
+    tun_iface: str = ""
     errors: list[str] = field(default_factory=list)
-
-    # ------------------------------------------------------------- derived
-    @property
-    def chatgpt_ok(self) -> bool:
-        """True, если доступен любой chatgpt/openai-домен."""
-        return any(
-            ("chatgpt" in host or "openai" in host) and bool(v.get("ok"))
-            for host, v in self.blocked_targets.items()
-        )
-
-    @property
-    def instagram_ok(self) -> bool:
-        return any(
-            "instagram" in host and bool(v.get("ok"))
-            for host, v in self.blocked_targets.items()
-        )
-
-    @property
-    def telegram_api_ok(self) -> bool:
-        return any(
-            host == "api.telegram.org" and bool(v.get("ok"))
-            for host, v in self.blocked_targets.items()
-        )
 
     @property
     def dns_ok(self) -> bool:
@@ -153,14 +140,16 @@ class NetworkDiagnosticResult:
             "http_ok": self.http_ok,
             "http_latency_ms": self.http_latency_ms,
             "http_url": self.http_url,
+            "tun_present": self.tun_present,
+            "tun_ready": self.tun_ready,
+            "tun_detail": self.tun_detail,
             "dns_fallback_used": self.dns_fallback_used,
             "dns_fallback_server": self.dns_fallback_server,
             "chatgpt_ok": self.chatgpt_ok,
+            "chatgpt_latency_ms": self.chatgpt_latency_ms,
             "instagram_ok": self.instagram_ok,
-            "telegram_api_ok": self.telegram_api_ok,
-            "blocked_targets": {
-                host: dict(v) for host, v in self.blocked_targets.items()
-            },
+            "instagram_latency_ms": self.instagram_latency_ms,
+            "tun_iface": self.tun_iface,
             "errors": list(self.errors),
         }
 
@@ -258,7 +247,8 @@ def local_doh_check(
     IP-literal-серверы (1.1.1.1/8.8.8.8), соединение открывается на IP с
     SNI — записи hosts (в т.ч. подмены «разблокирующих» утилит) не влияют
     на диагностику. Перебирает DOH_ENDPOINTS по порядку: сначала
-    Cloudflare/Google, затем AdGuard/OpenDNS как fallback.
+    Cloudflare/Google, затем AdGuard/OpenDNS как fallback. Fallback на
+    urlopen (hosts-зависимый) — только если hostres недоступен.
     """
     last_error = ""
     for endpoint in DOH_ENDPOINTS:
@@ -316,20 +306,23 @@ def local_http_check(
 
 def local_blocked_media_check(
     timeout: float = 4.0,
-) -> tuple[dict[str, dict[str, object]], str]:
-    """Проверка доступности заблокированных целей (chatgpt/instagram/tg).
+) -> tuple[bool, float | None, bool, float | None, str]:
+    """Проверка доступности chatgpt.com и instagram.com.
 
     Методология Karing: HTTPS GET к блокированным в РФ целям — если запрос
-    проходит, сеть корректно маршрутизирует к блокированным ресурсам.
+    проходит, узел/TUN корректно маршрутизирует к блокированным ресурсам.
     Используется только как информационный сигнал, не влияет на internet_ok.
 
     Используем GET вместо HEAD: chatgpt.com возвращает 403 на HEAD без
     Accept-Language/Cookie, но GET с User-Agent браузера работает.
 
-    Возвращает (targets, last_error), где targets — host -> {
-    "ok": bool, "latency_ms": float | None, "status": int}.
+    Возвращает (chatgpt_ok, chatgpt_latency_ms, instagram_ok,
+    instagram_latency_ms, last_error).
     """
-    targets: dict[str, dict[str, object]] = {}
+    chatgpt_ok = False
+    chatgpt_latency: float | None = None
+    instagram_ok = False
+    instagram_latency: float | None = None
     last_error = ""
 
     for host, url in BLOCKED_MEDIA_HTTP_PROBES:
@@ -349,23 +342,75 @@ def local_blocked_media_check(
                 },
             )
             status = response.status if response.ok else 0
-            # Считаем успехом любой ответ < 500. 403 от chatgpt без
+            # Считаем успехом любой 2xx/3xx ответ. 403 от chatgpt без
             # cookies — это «сервер доступен, но требует авторизацию»,
             # что всё равно означает: соединение установлено.
-            ok = 200 <= status < 500
-            latency_ms = (time.perf_counter() - started) * 1000.0
-            targets[host] = {
-                "ok": ok,
-                "latency_ms": round(latency_ms, 1) if ok else None,
-                "status": int(status),
-            }
-            if not ok:
+            if 200 <= status < 500:
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                if "chatgpt" in host or "openai" in host:
+                    if not chatgpt_ok or (chatgpt_latency is not None and latency_ms < chatgpt_latency):
+                        chatgpt_ok = True
+                        chatgpt_latency = latency_ms
+                elif "instagram" in host:
+                    if not instagram_ok or (instagram_latency is not None and latency_ms < instagram_latency):
+                        instagram_ok = True
+                        instagram_latency = latency_ms
+            else:
                 last_error = f"{url}: status {status}"
         except Exception as exc:
-            targets[host] = {"ok": False, "latency_ms": None, "status": 0}
             last_error = f"{url}: {type(exc).__name__}: {exc}"
 
-    return targets, last_error
+    return chatgpt_ok, chatgpt_latency, instagram_ok, instagram_latency, last_error
+
+
+def _windows_tun_detail(iface: str = "") -> tuple[bool, str]:
+    """Проверка TUN-адаптера на Windows через netsh/ipconfig.
+
+    Если указан iface (имя конкретного TUN-интерфейса), проверяем наличие
+    именно этого адаптера. Иначе — ищем любой TUN/TAP/WireGuard-адаптер.
+    """
+    detail_parts: list[str] = []
+    tun_present = False
+    for cmd in (
+        ["netsh", "interface", "show", "interface"],
+        ["ipconfig", "/all"],
+    ):
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            low = output.lower()
+            if iface and iface.lower() in low:
+                tun_present = True
+                detail_parts.append(f"iface:{iface}")
+                break
+            for marker in ("tun", "tap", "wireguard", "wg", "wintun", "utun"):
+                if marker in low:
+                    tun_present = True
+                    detail_parts.append(marker)
+                    break
+        except Exception as exc:
+            detail_parts.append(f"{cmd[0]}: {type(exc).__name__}: {exc}")
+    return tun_present, "; ".join(detail_parts) or "no tun adapter found"
+
+
+def local_tun_check(iface: str = "") -> tuple[bool, bool, str]:
+    """Проверка TUN-адаптера. Возвращает (present, ready, detail).
+
+    Если iface задан, проверяется именно этот интерфейс (используется
+    при TUN-проверке узла: после поднятия ядра мы убеждаемся, что
+    конкретный sgtun0 действительно появился в системе).
+    """
+    present, detail = _windows_tun_detail(iface)
+    ready = present
+    return present, ready, detail
 
 
 def run_network_diagnostic(
@@ -374,20 +419,24 @@ def run_network_diagnostic(
     doh_timeout: float = 4.0,
     http_timeout: float = 4.0,
     include_blocked_media: bool = False,
+    tun_iface: str = "",
 ) -> NetworkDiagnosticResult:
     """Выполняет все локальные проверки и агрегирует результат.
 
     Параметры:
         dns_timeout — таймаут UDP DNS-запроса к одному серверу, сек.
         doh_timeout — таймаут DoH-запроса, сек.
-        http_timeout — таймаут HTTPS-проверки generate_204 и блокированных
-            целей, сек.
-        include_blocked_media — дополнительно проверить chatgpt.com,
-            instagram.com и api.telegram.org. По умолчанию False: эти
-            проверки полезны в основном на странице «Диагностика» в GUI;
-            в preflight конвейера они не нужны (засоряют лог).
+        http_timeout — таймаут HTTPS-проверки generate_204, сек.
+        include_blocked_media — дополнительно проверить chatgpt.com и
+            instagram.com. По умолчанию False: эти проверки полезны только
+            когда трафик уже завёрнут в TUN/прокси (иначе они всегда
+            упадут на заблокированной сети, засоряя лог).
+        tun_iface — имя активного TUN-интерфейса. Используется для
+            параметризации: если указано, проверяем именно этот интерфейс
+            в local_tun_check (вместо поиска любого TUN).
     """
     result = NetworkDiagnosticResult()
+    result.tun_iface = tun_iface
 
     # 1) UDP DNS с явным отслеживанием fallback. UDP приоритетен: на
     # заблокированных сетях DoH/DoT режутся, а UDP DNS на 53-м порту
@@ -417,11 +466,18 @@ def run_network_diagnostic(
     if err:
         result.errors.append(f"http: {err}")
 
-    # 4) Заблокированные цели — факультативно (GUI-диагностика).
+    # 4) TUN-адаптер (конкретный интерфейс или любой).
+    result.tun_present, result.tun_ready, result.tun_detail = local_tun_check(iface=tun_iface)
+
+    # 5) Заблокированные медиа — факультативно.
     if include_blocked_media:
-        result.blocked_targets, err = local_blocked_media_check(
-            timeout=http_timeout
-        )
+        (
+            result.chatgpt_ok,
+            result.chatgpt_latency_ms,
+            result.instagram_ok,
+            result.instagram_latency_ms,
+            err,
+        ) = local_blocked_media_check(timeout=http_timeout)
         if err:
             result.errors.append(f"blocked_media: {err}")
 

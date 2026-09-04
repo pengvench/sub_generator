@@ -108,6 +108,28 @@ def _run_checks(
     )
 
 
+def check_node_cidr(
+    node_url: str,
+    timeout: float = CIDR_TIMEOUT,
+    root_dir: Optional[Path] = None,
+    regular_hosts: tuple[str, ...] = CIDR_REGULAR_HOSTS,
+    whitelisted_hosts: tuple[str, ...] = CIDR_WHITELISTED_HOSTS,
+) -> bool:
+    """Проверить, не ограничен ли узел CIDR-whitelist цензурой.
+
+    Возвращает True, если узел может достучаться до обычных (не whitelisted)
+    ресурсов, т.е. CIDR-ограничений нет.
+    """
+    result = check_node_cidr_detailed(
+        node_url,
+        timeout=timeout,
+        root_dir=root_dir,
+        regular_hosts=regular_hosts,
+        whitelisted_hosts=whitelisted_hosts,
+    )
+    return result.accepted
+
+
 def check_node_cidr_detailed(
     node_url: str,
     timeout: float = CIDR_TIMEOUT,

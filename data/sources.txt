@@ -19,9 +19,6 @@ https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/
 https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/2.txt
 https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/3.txt
 https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/4.txt
-https://raw.githack.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt
-https://raw.githack.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt
-https://raw.githack.com/igareck/vpn-configs-for-russia/main/WHITE-SNI-RU-all.txt
 https://flat-hill-2415.fatago78.workers.dev
 https://sub.vlessfo.ru/vlessforu/working_configs.txt
 https://p.kfwl.lol/https://freevpnhappcluchi.duckdns.org/sub/lew1ik2xiuohs9v3

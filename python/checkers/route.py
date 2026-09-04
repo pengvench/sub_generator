@@ -24,6 +24,7 @@ import contextlib
 import logging
 import socket
 import ssl
+import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -208,3 +209,24 @@ def check_node_route_detailed(
     return result
 
 
+def check_node_route(
+    node_url: str,
+    timeout: float = ROUTE_PROBE_TIMEOUT,
+    root_dir: Optional[Path] = None,
+) -> bool:
+    """Упрощённая проверка стабильности маршрута (bool)."""
+    return check_node_route_detailed(node_url, timeout=timeout, root_dir=root_dir).accepted
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python -m checkers.route <node_url>")
+        sys.exit(1)
+    r = check_node_route_detailed(sys.argv[1])
+    print(
+        f"ROUTE for {sys.argv[1]}: {'PASS' if r.accepted else 'FAIL'} "
+        f"avg={r.ping_avg}ms p95={r.ping_p95}ms jitter={r.jitter}ms loss={r.loss} "
+        f"({r.probes_ok}/{r.probes_total}) reason={r.reason}"
+    )

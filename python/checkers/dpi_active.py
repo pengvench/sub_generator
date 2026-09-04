@@ -667,3 +667,27 @@ def check_node_dpi_active_detailed(
     )
 
 
+def check_node_dpi_active(
+    node_url: str,
+    timeout: float = DPI_ACTIVE_TIMEOUT,
+    root_dir: Optional[Path] = None,
+) -> bool:
+    """Упрощённая активная DPI-проверка (bool)."""
+    return check_node_dpi_active_detailed(node_url, timeout=timeout, root_dir=root_dir).accepted
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python -m checkers.dpi_active <node_url>")
+        sys.exit(1)
+    r = check_node_dpi_active_detailed(sys.argv[1])
+    print(
+        f"DPI-ACTIVE for {sys.argv[1]}: {'PASS' if r.accepted else 'FAIL'} "
+        f"score={r.score} robustness={r.robustness_score}/{r.robustness_total} "
+        f"ech={r.ech_supported} reason={r.reason}"
+    )
+    print(f"  fingerprints: {r.fingerprints}")
+    print(f"  tunnel: {r.details.get('tunnel_counts')}")
+    print(f"  direct: {r.details.get('direct_meta')}")

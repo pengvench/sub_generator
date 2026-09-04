@@ -25,15 +25,15 @@ HELP = {
     "workers": "Потоков для параллельного тестирования узлов. "
                "Рекомендуется 64 для 32GB RAM, 32 для 16GB RAM. "
                "Не ставьте больше 128 — будет overhead на переключение контекста.",
-    "timeout": "Базовый таймаут на один узел (сек). 15 сек — норма для мобильного "
+    "timeout": "Таймаут на один узел (сек). 15 сек — норма для мобильного "
                "интернета. Меньше 8 ставить не рекомендуется — узлы с большим "
-               "RTT будут ложно отбраковываться. От этого значения ПРОПОРЦИОНАЛЬНО "
-               "выводятся таймауты всех этапов (initial, DPI, ИИ-гео, route, "
-               "resilience) с нижними порогами — короткий таймаут больше не "
-               "убивает живые медленные узлы.",
+               "RTT будут ложно отбраковываться.",
     "max_ping": "Узлы с пингом выше этого значения отбрасываются (мс). "
                 "1500 мс — норма для мобильного интернета. "
                 "500 мс — для домашнего. 0 = без ограничения.",
+    "min_speed": "Минимальная скорость для признания узла рабочим (КБ/с). "
+                 "5000 КБ/с = ~5 МБ/с = достаточно для 1080p. "
+                 "3000 КБ/с = минимум для просмотра видео.",
     "limit": "Ограничение количества тестируемых узлов (0 = без лимита). "
              "Полезно при первой настройке — поставьте 100, чтобы быстро "
              "проверить, что всё работает.",
@@ -63,21 +63,6 @@ HELP = {
                    "кеш с прошлого прогона). Base64 декодируется, берутся только "
                    "ссылки-конфиги (vless/vmess/trojan/ss/hy2), остальной текст "
                    "игнорируется.",
-    "autoselect": "Автовыборка: после проверки собрать ГОТОВЫЙ конфиг-"
-                 "балансер из рабочих узлов. Xray: leastLoad-балансер с "
-                 "функциональной пробой t.me (не просто пинг); sing-box: "
-                 "urltest для hy2. Файлы: data/autoselect_xray.json (+ "
-                 "data/autoselect_singbox.json). Импортируй конфиг в клиент "
-                 "целиком — ядро само будет выбирать лучший узел.",
-    "min_speed": "Запасной мин. порог скорости (КБ/с). При полном прогоне "
-                 "сначала делается автозамер сети по белым сервисам "
-                 "(Яндекс.Интернетометр / tele2 / движок Билайна speedtest.ru), "
-                 "и порог автоматически смягчается "
-                 "под реальную скорость (60% от замера, чуть ниже среднего) — "
-                 "чтобы мобильная сеть не браковала рабочие конфиги. Это "
-                 "значение используется, только если замер не удался ИЛИ замер "
-                 "≥ 100 Мбит/с (быстрый проводной канал — автопорог такой "
-                 "замер не слушает, обычные VPN-конфиги столько не дают).",
     "ai_strict": "ИИ-гео: исключить РФ-слепок — узлы, чей ИИ-гео слепок "
                  "оказался Россией (ai_unblocked=False), отбрасываются. "
                  "Слепок недоступен (None) — узел НЕ отсеивается. "
@@ -145,16 +130,14 @@ class StartPage(ctk.CTkFrame):
         inner_extra = self.card_extra.inner
         for c in range(2):
             inner_extra.grid_columnconfigure(c, weight=1)
-        # Row 0: Без стресс-теста | Лимит узлов
+        # Row 0: Без стресс-теста | Свой файл конфигов
         self.toggle_no_stress = self._make_toggle(inner_extra, 0, 0, "Без нагрузочного теста", HELP["no_stress"], default=False)
-        self.limit = self._make_entry(inner_extra, 0, 1, "Лимит узлов (0 = без лимита)", "0", help=HELP["limit"])
-        # Row 1: Автовыборка | Свой файл конфигов
-        self.toggle_autoselect = self._make_toggle(inner_extra, 1, 0, "Автовыборка (конфиг-балансер)", HELP["autoselect"], default=False)
-        self.toggle_custom_file = self._make_toggle(inner_extra, 1, 1, "Свой файл конфигов", HELP["custom_file"], default=False)
-        # Row 2: Выбор файла — поле пути ПРЯМО ПОД тумблером «Свой файл
-        # конфигов» (та же правая колонка), а не где-то сбоку.
+        self.toggle_custom_file = self._make_toggle(inner_extra, 0, 1, "Свой файл конфигов", HELP["custom_file"], default=False)
+        # Row 1: Лимит узлов | Выбор файла (поле пути — под тумблером
+        # «Свой файл конфигов», в правой колонке: пустых ячеек нет)
+        self.limit = self._make_entry(inner_extra, 1, 0, "Лимит узлов (0 = без лимита)", "0", help=HELP["limit"])
         frame_custom = ctk.CTkFrame(inner_extra, fg_color="transparent")
-        frame_custom.grid(row=2, column=1, padx=6, pady=(0, 4), sticky="ew")
+        frame_custom.grid(row=1, column=1, padx=6, pady=4, sticky="ew")
         frame_custom.grid_columnconfigure(0, weight=1)
         self.custom_file_entry = ctk.CTkEntry(frame_custom, width=110, justify="left", placeholder_text="путь к файлу")
         self.custom_file_entry.grid(row=0, column=0, padx=(0, 4), sticky="ew")
@@ -362,7 +345,6 @@ class StartPage(ctk.CTkFrame):
         self.limit.insert(0, str(opts.get("limit", 0)))
         # Тумблеры.
         self._set_toggle(self.toggle_no_stress, bool(opts.get("no_stress", False)))
-        self._set_toggle(self.toggle_autoselect, bool(opts.get("autoselect", False)))
 
         self._set_toggle(self.toggle_telegram, bool(opts.get("telegram_check", True)))
         self._set_toggle(self.toggle_dpi, bool(opts.get("dpi_check", False)))
@@ -400,7 +382,7 @@ class StartPage(ctk.CTkFrame):
             "min_speed": self._int_value(self.min_speed, 3000),
             "limit": self._int_value(self.limit, 0),
             "no_stress": bool(self.toggle_no_stress.get()),
-            "autoselect": bool(self.toggle_autoselect.get()),
+
             "telegram_check": bool(self.toggle_telegram.get()),
             "dpi_check": bool(self.toggle_dpi.get()),
             "dpi_siberian": bool(self.toggle_siberian.get()),
@@ -444,7 +426,6 @@ class StartPage(ctk.CTkFrame):
             max_ping=self._int_value(self.max_ping, 1500),
             min_speed=self._int_value(self.min_speed, 3000),
             no_stress=self.toggle_no_stress.get(),
-            autoselect=bool(self.toggle_autoselect.get()),
 
             telegram_check=self.toggle_telegram.get(),
             dpi_check=dpi_check,

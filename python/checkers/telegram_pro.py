@@ -39,6 +39,8 @@ from typing import Optional
 
 from . import base
 from xray_runtime import (
+    TELEGRAM_API_HEAD_TARGET,
+    TELEGRAM_MEDIA_DC,
     _encode_abridged_packet,
     _read_abridged_packet,
     _socks_mtproto_latency,
@@ -316,3 +318,25 @@ def check_node_telegram_pro_detailed(
     return result
 
 
+def check_node_telegram_pro(
+    node_url: str,
+    timeout: float = TG_TIMEOUT,
+    root_dir: Optional[Path] = None,
+) -> bool:
+    """Упрощённая продвинутая Telegram-проверка (bool)."""
+    return check_node_telegram_pro_detailed(node_url, timeout=timeout, root_dir=root_dir).accepted
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python -m checkers.telegram_pro <node_url>")
+        sys.exit(1)
+    r = check_node_telegram_pro_detailed(sys.argv[1])
+    print(
+        f"TELEGRAM-PRO for {sys.argv[1]}: {'PASS' if r.accepted else 'FAIL'} "
+        f"score={r.telegram_score} reason={r.reason}"
+    )
+    print(f"  connect={r.connect}({r.connect_ms}ms) auth={r.auth} "
+          f"upload={r.upload_kbps}KB/s download={r.download_kbps}KB/s")

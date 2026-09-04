@@ -242,7 +242,7 @@ class SubGenApp(ctk.CTk):
         # Низ сайдбара: версия/источник
         foot = ctk.CTkLabel(
             self.sidebar,
-            text=f"sources.txt — рядом с exe\nлоги/кеш — в data/",
+            text=f"sources.txt · data/\nsubs.txt — рядом с exe",
             text_color=theme.MUTED,
             font=ctk.CTkFont(size=10),
             justify="left",

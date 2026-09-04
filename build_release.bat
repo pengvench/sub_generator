@@ -26,7 +26,9 @@ echo [3/3] Assembling build\ ...
 mkdir build\
 copy /Y build\dist\SubGenerator.exe build\SubGenerator.exe >nul
 copy /Y build\dist\SubGenerator-CLI.exe build\SubGenerator-CLI.exe >nul
-copy /Y sources.txt build\sources.txt >nul
+copy /Y data\sources.txt build\sources.txt >nul
+mkdir build\data >nul 2>nul
+copy /Y data\sources.txt build\data\sources.txt >nul
 copy /Y "%~dp0scripts\run_sub_generator.ps1" build\run_sub_generator.ps1 >nul
 copy /Y "%~dp0scripts\run_sub_generator.bat" build\run_sub_generator.bat >nul
 copy /Y "%~dp0assets\icon.ico" build\icon.ico >nul
@@ -48,7 +50,8 @@ echo.
 echo Build complete:
 echo   build\SubGenerator.exe      (GUI)
 echo   build\SubGenerator-CLI.exe  (console)
-echo   build\sources.txt           (subscriptions, editable, рядом с exe)
+echo   build\sources.txt           (subscriptions, editable)
+echo   build\data\sources.txt      (то же, в data/ — куда смотрит приложение)
 echo   build\run_sub_generator.ps1 (PowerShell progress wrapper)
 echo   build\run_sub_generator.bat (one-click PowerShell run)
 echo   build\icon.ico              (app icon)

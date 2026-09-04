@@ -127,7 +127,28 @@ def load_thresholds() -> dict[str, Any]:
     return thresholds
 
 
+def save_thresholds(thresholds: dict[str, Any]) -> None:
+    """Сохранить пороги в checker_thresholds.json."""
+    _CHECKER_THRESHOLDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _CHECKER_THRESHOLDS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(thresholds, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(_CHECKER_THRESHOLDS_PATH)
+
+
 def get_threshold(category: str, key: str, default: Any = None) -> Any:
     """Получить конкретный порог по категории и ключу."""
     thresholds = load_thresholds()
     return thresholds.get(category, {}).get(key, default)
+
+
+def create_default_config() -> None:
+    """Создать файл конфигурации с дефолтными значениями."""
+    save_thresholds(DEFAULT_THRESHOLDS)
+    print(f"Created default config at {_CHECKER_THRESHOLDS_PATH}")
+
+
+if __name__ == "__main__":
+    create_default_config()

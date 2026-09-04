@@ -114,8 +114,8 @@ def main() -> int:
                 assert "inet_aton" in src, "нет ATYP=1 ветки для IP в _socks_target_address"
         assert found, "_socks_target_address не найден"
 
-        xr_src = open(os.path.join(ROOT, "runtime", "netsocks.py"), encoding="utf-8").read()
-        assert "socket.inet_aton(target_host)" in xr_src, "нет ATYP=1 ветки в runtime.netsocks._socks_open_connection"
+        xr_src = open(os.path.join(ROOT, "xray_runtime.py"), encoding="utf-8").read()
+        assert "socket.inet_aton(target_host)" in xr_src, "нет ATYP=1 ветки в xray_runtime._socks_open_connection"
 
     check("SOCKS: ATYP=1/4 для IP, ATYP=3 для домена", _idna)
 

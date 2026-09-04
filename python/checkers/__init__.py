@@ -24,11 +24,13 @@ from .dpi import (
     DPI_DEFAULT_TARGET,
     DPI_DEFAULT_TARGETS,
     DpiCheckResult,
+    check_node_dpi,
     check_node_dpi_detailed,
 )
 
 from .cidr import (
     CidrCheckResult,
+    check_node_cidr,
     check_node_cidr_detailed,
 )
 from .zapret import (
@@ -38,19 +40,23 @@ from .zapret import (
     ZapretHttpResult,
     ZapretProbeResult,
     ZapretTarget,
+    check_node_zapret,
     check_node_zapret_detailed,
     load_dpi_suite,
 )
 from .dpi_active import (
     DpiActiveResult,
+    check_node_dpi_active,
     check_node_dpi_active_detailed,
 )
 from .telegram_pro import (
     TelegramProResult,
+    check_node_telegram_pro,
     check_node_telegram_pro_detailed,
 )
 from .route import (
     RouteCheckResult,
+    check_node_route,
     check_node_route_detailed,
 )
 
@@ -59,8 +65,10 @@ __all__ = [
     "DPI_DEFAULT_TARGET",
     "DPI_DEFAULT_TARGETS",
     "DpiCheckResult",
+    "check_node_dpi",
     "check_node_dpi_detailed",
     "CidrCheckResult",
+    "check_node_cidr",
     "check_node_cidr_detailed",
     "DPI_SUITE_URL",
     "STATUS_BLOCKED",
@@ -68,12 +76,16 @@ __all__ = [
     "ZapretHttpResult",
     "ZapretProbeResult",
     "ZapretTarget",
+    "check_node_zapret",
     "check_node_zapret_detailed",
     "load_dpi_suite",
     "DpiActiveResult",
+    "check_node_dpi_active",
     "check_node_dpi_active_detailed",
     "TelegramProResult",
+    "check_node_telegram_pro",
     "check_node_telegram_pro_detailed",
     "RouteCheckResult",
+    "check_node_route",
     "check_node_route_detailed",
 ]

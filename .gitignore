@@ -1,8 +1,6 @@
 # ============================================================
 # SubGenerator — репозиторий ПК-версии (Windows)
-# В корне: generate.py, sources.txt (список подписок, в git),
-# батники сборки. data/ — только рантайм-мусор (логи, кеш,
-# отчёты), создаётся при запуске и в git не входит.
+# В корне только соурс (generate.py) и батники на сборку.
 # ============================================================
 
 # Python cache
@@ -31,11 +29,14 @@ pip-selfcheck.json
 .vscode/
 .idea/
 
-# Runtime data: data/ ЦЕЛИКОМ (кеш, отчёты, settings, baseline_last,
-# autoselect-конфиги, run.log) — всё это результаты прогона, не соурс
-data/
-
-# Результаты конвейера, пишутся в корень рядом с exe
+# Runtime data (создаётся при запуске; sources.txt — исключение, хранится)
+data/report.json
+data/run.log
+data/settings.json
+data/geo_cache.json
+data/working*.txt
+data/subs*.txt
+data/.runtime_cache/
 subs.txt
 working*.txt
 subs_*.txt

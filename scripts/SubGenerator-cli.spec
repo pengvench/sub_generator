@@ -10,18 +10,12 @@ PYTHON = os.path.join(ROOT, 'python')
 
 datas = [
     (os.path.join(ROOT, 'bin'), 'bin'),
-    (os.path.join(ROOT, 'sources.txt'), '.'),
+    (os.path.join(ROOT, 'data', 'sources.txt'), 'data'),
 ]
 
 binaries = []
 hiddenimports = [
-    'xray_runtime',  # фасад над пакетом runtime/
-    # runtime/ — пакет движка (бывший xray_runtime.py, разбит на модули).
-    'runtime', 'runtime.types', 'runtime.uritools', 'runtime.parse',
-    'runtime.fetch', 'runtime.netsocks', 'runtime.probes_ping',
-    'runtime.probes_telegram', 'runtime.probes_speed', 'runtime.configs',
-    'runtime.procs', 'runtime.core',
-    'subgen.pipeline', 'subgen.refresh', 'subgen.geo',
+    'xray_runtime', 'subgen.pipeline', 'subgen.refresh', 'subgen.geo',
     'subgen.output', 'subgen.logging', 'subgen.progress', 'subgen.config',
     'subgen.checker_thresholds', 'subgen.checker_cache',
     'subgen.settings',

@@ -29,7 +29,7 @@ copy /Y build\dist\SubGenerator-CLI.exe build\SubGenerator-CLI.exe >nul
 copy /Y sources.txt build\sources.txt >nul
 copy /Y "%~dp0scripts\run_sub_generator.ps1" build\run_sub_generator.ps1 >nul
 copy /Y "%~dp0scripts\run_sub_generator.bat" build\run_sub_generator.bat >nul
-copy /Y icon.ico build\icon.ico >nul
+copy /Y "%~dp0assets\icon.ico" build\icon.ico >nul
 
 rem Собранная сборка должна быть полностью независима от Python:
 rem при запуске run_sub_generator.ps1 рядом с exe используется
@@ -39,23 +39,22 @@ if not exist build\SubGenerator-CLI.exe (
     exit /b 1
 )
 
-
-
 if exist build\_work rmdir /s /q build\_work
 if exist build\dist rmdir /s /q build\dist
 if exist __pycache__ rmdir /s /q __pycache__
+if exist python\__pycache__ rmdir /s /q python\__pycache__
 
 echo.
 echo Build complete:
 echo   build\SubGenerator.exe      (GUI)
 echo   build\SubGenerator-CLI.exe  (console)
-echo   build\sources.txt           (subscriptions, editable)
+echo   build\sources.txt           (subscriptions, editable, рядом с exe)
 echo   build\run_sub_generator.ps1 (PowerShell progress wrapper)
 echo   build\run_sub_generator.bat (one-click PowerShell run)
 echo   build\icon.ico              (app icon)
 
 echo.
 echo On first run next to exe will appear:
-echo   data\  (logs, cache, working.txt, report.json)
+echo   data\  (logs, cache, working.txt, report.json, settings.json)
 echo   subs.txt  (resulting subscription, next to exe)
 endlocal

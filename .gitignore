@@ -1,9 +1,17 @@
-```gitignore
+# ============================================================
+# SubGenerator — репозиторий ПК-версии (Windows)
+# В корне: generate.py, sources.txt (список подписок, в git),
+# батники сборки. data/ — только рантайм-мусор (логи, кеш,
+# отчёты), создаётся при запуске и в git не входит.
+# ============================================================
+
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
 
 # Dependencies
 .venv/
@@ -23,16 +31,21 @@ pip-selfcheck.json
 .vscode/
 .idea/
 
-# Build artifacts
+# Runtime data: data/ ЦЕЛИКОМ (кеш, отчёты, settings, baseline_last,
+# autoselect-конфиги, run.log) — всё это результаты прогона, не соурс
+data/
+
+# Результаты конвейера, пишутся в корень рядом с exe
+subs.txt
+working*.txt
+subs_*.txt
+
+# Build artifacts (ПК)
 build/
 dist/
 target/
 *.egg-info/
 
-# Testing and coverage
-.coverage
-coverage/
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-```
+# Binaries: ядра ПК скачиваются/обновляются отдельно (см. bin/CORE_VERSIONS.txt)
+# bin/ в репозитории хранится (готовые ядра), раскомментируйте чтобы исключить:
+# bin/*.exe

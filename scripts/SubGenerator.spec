@@ -1,34 +1,46 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Спецификация PyInstaller: GUI-версия SubGenerator.
+# Пути относительные (от scripts/), сборка запускается build_release.bat
+# из корня репозитория — работает на любой машине.
 from PyInstaller.utils.hooks import collect_all
+import os
 
-ROOT = 'c:\\Users\\peppo\\Desktop\\sub_generator'
+ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
+PYTHON = os.path.join(ROOT, 'python')
 
-datas = [(ROOT + '\\bin', 'bin'), (ROOT + '\\sources.txt', '.'), (ROOT + '\\icon.ico', '.')]
+datas = [
+    (os.path.join(ROOT, 'bin'), 'bin'),
+    (os.path.join(ROOT, 'sources.txt'), '.'),
+    (os.path.join(ROOT, 'assets', 'icon.ico'), '.'),
+]
 
 binaries = []
 hiddenimports = [
-    'xray_runtime', 'subgen.pipeline', 'subgen.refresh', 'subgen.geo',
+    'xray_runtime',  # фасад над пакетом runtime/
+    # runtime/ — пакет движка (бывший xray_runtime.py, разбит на модули).
+    'runtime', 'runtime.types', 'runtime.uritools', 'runtime.parse',
+    'runtime.fetch', 'runtime.netsocks', 'runtime.probes_ping',
+    'runtime.probes_telegram', 'runtime.probes_speed', 'runtime.configs',
+    'runtime.procs', 'runtime.core',
+    'subgen.pipeline', 'subgen.refresh', 'subgen.geo',
     'subgen.output', 'subgen.logging', 'subgen.progress', 'subgen.config',
-    'subgen.checker_thresholds', 'subgen.checker_cache', 'subgen.warp',
+    'subgen.checker_thresholds', 'subgen.checker_cache',
     'subgen.settings',
     'checkers.dpi', 'checkers.cidr', 'checkers.zapret', 'checkers.base',
     'checkers.initial_check', 'checkers.telegram_pro', 'checkers.route',
     'ui.app', 'ui.runner', 'ui.paths', 'ui.tooltip', 'ui.theme', 'ui.main',
     'ui.pages.start_page', 'ui.pages.sources_page', 'ui.pages.log_page',
-    'ui.pages.settings_page', 'ui.pages.recheck_page', 'ui.pages.warp_page',
-
+    'ui.pages.settings_page', 'ui.pages.recheck_page',
+    'ui.pages.diag_page',
 ]
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('darkdetect')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-# cryptography — для генерации X25519 ключей WARP (прямой Cloudflare API).
-tmp_ret = collect_all('cryptography')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 a = Analysis(
-    [ROOT + '\\ui\\main.py'],
-    pathex=[ROOT],
+    [os.path.join(PYTHON, 'ui', 'main.py')],
+    pathex=[ROOT, PYTHON],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -48,7 +60,7 @@ exe = EXE(
     a.datas,
     [],
     name='SubGenerator',
-    icon=ROOT + '\\icon.ico',
+    icon=os.path.join(ROOT, 'assets', 'icon.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -62,8 +74,9 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     # UAC-манифест: при запуске exe Windows автоматически показывает
-    # диалог «Запустить от имени администратора?». TUN-проверка требует
-    # прав админа для создания виртуального адаптера и модификации
-    # маршрутов (auto_route=True у sing-box, strictRoute=True у xray).
+    # диалог «Запустить от имени администратора?». Нужны права админа
+    # для управления процессами xray.exe/sing-box.exe (terminate tree
+    # через WinAPI, kill-on-close job objects) и корректной очистки
+    # временных файлов в data/.runtime_cache.
     uac_admin=True,
 )

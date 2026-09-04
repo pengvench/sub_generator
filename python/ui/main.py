@@ -1,0 +1,73 @@
+"""Точка входа SubGenerator (GUI).
+
+Без аргументов — запускает графический интерфейс (customtkinter, Material-тема).
+С флагом --cli / -c — консольный режим (полный конвейер), как из батника.
+
+Файл лежит в python/ui/main.py; для запуска напрямую
+(`python python/ui/main.py`) bootstrap ниже добавляет python/ в sys.path.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Bootstrap: каталог python/ (родитель каталога ui/) — в sys.path.
+_PYTHON_DIR = Path(__file__).resolve().parent.parent
+if str(_PYTHON_DIR) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_DIR))
+
+from ui.paths import ensure_sources_file
+
+
+def _run_cli(argv):
+    from subgen.encoding import setup_console_encoding
+    from subgen.pipeline import run
+
+    setup_console_encoding()
+    os.environ["SUB_GEN_PS_WRAPPER"] = "1"
+    return run(argv)
+
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ensure_sources_file()
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-c", "--cli", action="store_true", help="Консольный режим (без GUI): полный конвейер.")
+    parser.add_argument("-h", "--help", action="store_true", help="Показать справку.")
+    try:
+        ns, rest = parser.parse_known_args(argv)
+    except SystemExit:
+        return 2
+
+    if ns.help and not ns.cli:
+        parser.print_help()
+        print("Без аргументов запускается графический интерфейс (customtkinter).")
+        print("С флагом --cli запускается консольный режим (полный конвейер).")
+        print("Пример: SubGenerator --cli --workers 32 --dpi-check --dpi-siberian")
+        return 0
+
+    if ns.cli:
+        if ns.help:
+            rest = rest + ["--help"]
+        return _run_cli(rest)
+
+    try:
+        import customtkinter as ctk  # noqa: F401
+    except Exception as exc:
+        print(f"[gui] customtkinter недоступен: {exc}")
+        print("[gui] Запустите в консольном режиме: SubGenerator --cli")
+        return 1
+
+    from ui.app import SubGenApp
+
+    app = SubGenApp()
+    app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

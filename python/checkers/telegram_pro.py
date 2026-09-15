@@ -13,6 +13,12 @@ Telegram важен для пользователя не только скоро
    транспортный слой MTProto жив и принимает клиентские пакеты.
 3. **Upload (загрузка файла)** — реальная передача данных от клиента к
    инфраструктуре Telegram (POST api.telegram.org с измерением скорости).
+4. **TG-медиа** — загрузка видео из веб-версии канала t.me/s/<канал> через
+   ТОТ ЖЕ прокси (модуль tg_media). Раньше медиа-фильтр жил в стресс-фазе
+   (xray_runtime._stress_probe_node), теперь перенесён сюда: Telegram-этап
+   = единственное место, где узел обязан реально качать медиа из Telegram
+   (>= 512 КБ/с), иначе — отбраковка (tg_media_failed). Стресс-тест
+   (финальный спидтест) измеряет ТОЛЬКО скорость.
 
 ``telegram_score`` (0..100) — взвешенная сумма компонентов. Узел с высокой
 скоростью, но обрывающимся MTProto, получает низкий балл.
@@ -38,6 +44,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import base
+from .tg_media import TG_MEDIA_MIN_KBPS, run_tg_media_check
 from xray_runtime import (
     TELEGRAM_API_HEAD_TARGET,
     TELEGRAM_MEDIA_DC,
@@ -62,10 +69,14 @@ TELEGRAM_UPLOAD_HOST = "api.telegram.org"
 TELEGRAM_UPLOAD_PATH = "/file/bot0/sendDocument"
 
 # Вес компонентов в telegram_score (сумма = 1.0).
+# tg_media — равный вес с остальными: медиа-загрузка перенесена из
+# стресс-фазы в этот этап (архитектура: главный критерий — загрузка
+# заблокированных сервисов, скорость — отдельно и в конце).
 TG_WEIGHTS = {
-    "connect": 0.30,  # MTProto connect (установка соединения)
-    "auth": 0.30,  # MTProto auth (транспортный обмен)
-    "upload": 0.40,  # загрузка файла
+    "connect": 0.25,  # MTProto connect (установка соединения)
+    "auth": 0.25,  # MTProto auth (транспортный обмен)
+    "upload": 0.25,  # загрузка файла
+    "tg_media": 0.25,  # видео из t.me/s/ (медиа-загрузка)
 }
 
 # Таймауты.
@@ -93,6 +104,9 @@ class TelegramProResult:
     auth: bool = False
     upload: bool = False
     upload_kbps: float | None = None
+    tg_media: bool = False
+    tg_media_kbps: float | None = None
+    tg_media_reason: str = ""
     download: bool = False
     download_kbps: float | None = None
     details: dict = field(default_factory=dict)
@@ -107,6 +121,9 @@ class TelegramProResult:
             "auth": self.auth,
             "upload": self.upload,
             "upload_kbps": round(self.upload_kbps, 1) if self.upload_kbps else None,
+            "tg_media": self.tg_media,
+            "tg_media_kbps": round(self.tg_media_kbps, 1) if self.tg_media_kbps else None,
+            "tg_media_reason": self.tg_media_reason,
             "download": self.download,
             "download_kbps": round(self.download_kbps, 1) if self.download_kbps else None,
             "details": self.details,
@@ -236,6 +253,8 @@ def _run_telegram_pro(
     socks_host: str,
     socks_port: int,
     timeout: float,
+    *,
+    media_check: bool = True,
 ) -> TelegramProResult:
     """Выполнить Telegram-проверки через поднятый SOCKS-прокси узла."""
     connect_ms: float | None = None
@@ -268,15 +287,39 @@ def _run_telegram_pro(
     )
     upload_ok = upload_kbps is not None and upload_kbps >= TG_GOOD_KBPS * 0.25
 
+    # --- TG-медиа (перенесено из стресс-фазы): видео из t.me/s/<канал> ---
+    # Жёсткий гейт: узел, не качающий медиа из Telegram, НЕ проходит
+    # Telegram-этап независимо от остальных компонентов (reason=tg_media_failed).
+    tg_media_ok = False
+    tg_media_kbps: float | None = None
+    tg_media_reason = ""
+    if media_check:
+        media = run_tg_media_check(socks_host, socks_port)
+        tg_media_ok = bool(media.accepted)
+        tg_media_kbps = media.kbps
+        tg_media_reason = str(media.reason or "")
+    else:
+        tg_media_ok = True  # проверка отключена — не гейтим
+
     # telegram_score = взвешенная сумма компонентов (0..100).
     score = 0.0
     score += TG_WEIGHTS["connect"] * 100.0 if connect_ok else 0.0
     score += TG_WEIGHTS["auth"] * 100.0 if auth_ok else 0.0
     score += TG_WEIGHTS["upload"] * 100.0 if upload_ok else 0.0
+    score += TG_WEIGHTS["tg_media"] * 100.0 if tg_media_ok else 0.0
 
-    # Порог: connect+auth обязательны, score >= 60.
-    accepted = connect_ok and auth_ok and score >= 60.0
-    reason = "ready" if accepted else "telegram_unstable"
+    # Порог: connect+auth обязательны, tg_media — обязательный гейт,
+    # score >= 60.
+    if not connect_ok or not auth_ok:
+        accepted = False
+        reason = "telegram_unstable"
+    elif media_check and not tg_media_ok:
+        accepted = False
+        detail = tg_media_reason or "media not downloaded"
+        reason = f"tg_media_failed ({detail})"
+    else:
+        accepted = score >= 60.0
+        reason = "ready" if accepted else "telegram_unstable"
 
     return TelegramProResult(
         accepted=accepted,
@@ -287,6 +330,9 @@ def _run_telegram_pro(
         auth=auth_ok,
         upload=upload_ok,
         upload_kbps=round(upload_kbps, 1) if upload_kbps is not None else None,
+        tg_media=tg_media_ok,
+        tg_media_kbps=round(tg_media_kbps, 1) if tg_media_kbps is not None else None,
+        tg_media_reason=tg_media_reason,
         download=False,
         download_kbps=None,
         details={
@@ -294,6 +340,8 @@ def _run_telegram_pro(
             "upload_bytes": TG_UPLOAD_BYTES,
             "weights": TG_WEIGHTS,
             "good_kbps": TG_GOOD_KBPS,
+            "tg_media_min_kbps": TG_MEDIA_MIN_KBPS,
+            "media_check": media_check,
         },
     )
 
@@ -310,12 +358,41 @@ def check_node_telegram_pro_detailed(
     def _run(host: str, port: int) -> TelegramProResult:
         return _run_telegram_pro(host, port, timeout)
 
-    # connect(до 5 DC) + auth(до 5 DC) + upload.
-    budget = max(20.0, timeout * 16.0)
+    # connect(до 5 DC) + auth(до 5 DC) + upload + tg_media(страница+видео,
+    # до ~40с на медленном канале). Бюджет с запасом на медиа-фазу.
+    budget = max(60.0, timeout * 25.0)
     result = base.run_with_node(node_url, _run, timeout=timeout, root_dir=root_dir, budget=budget)
     if result is None:
         return TelegramProResult(accepted=False, reason="node_start_failed")
     return result
+
+
+def check_node_telegram_pro_via_socks(
+    socks_host: str,
+    socks_port: int,
+    timeout: float = TG_TIMEOUT,
+    *,
+    media_check: bool = True,
+) -> TelegramProResult:
+    """Telegram-проверка через УЖЕ поднятый SOCKS endpoint (от sing-box pool).
+
+    В отличие от ``check_node_telegram_pro_detailed``, эта функция НЕ поднимает
+    свой xray.exe/sing-box.exe — она использует SOCKS5 endpoint, который уже
+    настроен на нужный outbound через Clash API (см. SingBoxBatchPool.select).
+
+    Это убирает 0.4с sleep + старт ядра на каждый узел = ~70с экономии на 174
+    узлах telegram_pro, и главное — убирает ``node_start_failed`` (59% отвала
+    в инциденте run2.log: 102/174 упали именно потому, что 32 параллельных
+    xray.exe падали при старте).
+
+    Параметры те же, что у ``_run_telegram_pro``.
+    """
+    return _run_telegram_pro(
+        socks_host,
+        socks_port,
+        timeout,
+        media_check=media_check,
+    )
 
 
 def check_node_telegram_pro(
@@ -339,4 +416,4 @@ if __name__ == "__main__":
         f"score={r.telegram_score} reason={r.reason}"
     )
     print(f"  connect={r.connect}({r.connect_ms}ms) auth={r.auth} "
-          f"upload={r.upload_kbps}KB/s download={r.download_kbps}KB/s")
+          f"upload={r.upload_kbps}KB/s tg_media={r.tg_media}({r.tg_media_kbps}KB/s)")

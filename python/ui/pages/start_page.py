@@ -22,52 +22,25 @@ from ..tooltip import CTkToolTip, info_label
 from subgen.settings import get_test_options, save_test_options
 
 HELP = {
-    "workers": "Потоков для параллельного тестирования узлов. "
-               "Рекомендуется 64 для 32GB RAM, 32 для 16GB RAM. "
-               "Не ставьте больше 128 — будет overhead на переключение контекста.",
-    "timeout": "Таймаут на один узел (сек). 15 сек — норма для мобильного "
-               "интернета. Меньше 8 ставить не рекомендуется — узлы с большим "
-               "RTT будут ложно отбраковываться.",
-    "max_ping": "Узлы с пингом выше этого значения отбрасываются (мс). "
-                "1500 мс — норма для мобильного интернета. "
-                "500 мс — для домашнего. 0 = без ограничения.",
-    "min_speed": "Минимальная скорость для признания узла рабочим (КБ/с). "
-                 "5000 КБ/с = ~5 МБ/с = достаточно для 1080p. "
-                 "3000 КБ/с = минимум для просмотра видео.",
-    "limit": "Ограничение количества тестируемых узлов (0 = без лимита). "
-             "Полезно при первой настройке — поставьте 100, чтобы быстро "
-             "проверить, что всё работает.",
-    "no_stress": "Отключить нагрузочное (скоростное) тестирование. "
-                 "Узлы принимаются только по пингу, без проверки скорости.",
-
-    "dpi": "Проверка обхода DPI-блокировок (через Xray) — ЦЕЛИКОМ, одним "
-           "этапом: alive + tcp 16-20 на заблокированные цели + siberian/"
-           "CIDR (опции ниже) + Zapret-suite (POST 64KB по HTTP/1.1, "
-           "TLS1.2/1.3, score >= 75%) НА ТОМ ЖЕ core-процессе узла. "
-           "Отдельного тумблера suite нет: узел принимается только если "
-           "прошли ОБЕ части.",
-    "siberian": "Проверка на сибирские блокировки. "
-                "Дополнительная проверка для сибирских мобильных сетей.",
-    "cidr": "Проверка узлов по CIDR-спискам запрещённых сетей. "
-            "Выявляет узлы, которые работают только с белыми IP.",
-    "telegram": "Проверка Telegram: медиа, MTProto, скорость. "
-                "Узлы без Telegram отбрасываются. "
-                "ВАЖНО: на мобильном интернете Telegram-проверка обязательна — "
-                "без неё ты получишь узлы, которые не работают с Telegram. "
-                "Медиа-фильтр (t.me/s/): каждый узел ОБЯЗАН реально качать "
-                "видео из веб-версии канала (>= 512 КБ/с). Не качает — "
-                "отбраковка (tg_media_failed), даже если спид-тест пройден.",
-    "dpi_active": "Активная DPI-проверка протокола узла (SNI, ClientHello, ECH, TLS 1.2/1.3). "
-                  "Проверяет, может ли узел обходить конкретные DPI-механизмы.",
-    "custom_file": "Загрузить конфиги из локального файла (например, сохранённый "
-                   "кеш с прошлого прогона). Base64 декодируется, берутся только "
-                   "ссылки-конфиги (vless/vmess/trojan/ss/hy2), остальной текст "
-                   "игнорируется.",
-    "ai_strict": "ИИ-гео: исключить РФ-слепок — узлы, чей ИИ-гео слепок "
-                 "оказался Россией (ai_unblocked=False), отбрасываются. "
-                 "Слепок недоступен (None) — узел НЕ отсеивается. "
-                 "Сам ИИ-гео слепок (Gemini/OpenAI, CF trace loc=) выполняется "
-                 "ВСЕГДА как обязательный этап и задаёт флаг страны узла.",
+    "workers": "Параллельных потоков. 32 — норма.",
+    "timeout": "Таймаут на узел, сек.",
+    "max_ping": "Отбраковка по пингу, мс. 0 = без лимита.",
+    "min_speed": "Мин. скорость, КБ/с. Адаптируется под канал.",
+    "limit": "Лимит узлов. 0 = без лимита.",
+    "no_stress": "Пропустить финальный спидтест.",
+    "sing_box_only": "Все узлы через sing-box (вместо xray).",
+    "dpi": "Проверка обхода DPI-блокировок.",
+    "siberian": "Доп. проверка для сибирских сетей.",
+    "cidr": "Проверка по CIDR-спискам запрещённых сетей.",
+    "services": "Доступ к инсте/ютубу/дискорду.",
+    "telegram": "MTProto + медиа. Узлы без ТГ отбраковываются.",
+    "dpi_active": "SNI/ECH/TLS-фаззинг протокола узла.",
+    "custom_file": "Загрузить конфиги из локального файла.",
+    "ai_strict": "Отбраковать узлы с выходом в РФ.",
+    "dedup_mode": "normal — игнорирует uTLS-фингерпринты. aggressive — только host+port+sni.",
+    "use_singbox_pool": "Один sing-box на батч вместо старт-стопа ядра.",
+    "singbox_pool_batch": "Узлов на один sing-box процесс.",
+    "resilience_check": "Живучесть в блокировках (TCP/DoH/UDP DNS).",
 }
 
 
@@ -107,14 +80,14 @@ class StartPage(ctk.CTkFrame):
         inner_what = self.card_what.inner
         for c in range(2):
             inner_what.grid_columnconfigure(c, weight=1)
-        self.toggle_dpi = self._make_toggle(inner_what, 0, 0, "DPI-проверка (обход + Zapret-suite)", HELP["dpi"], default=False)
-        self.toggle_siberian = self._make_toggle(inner_what, 0, 1, "Siberian (сибирские блокировки)", HELP["siberian"], default=True, enabled_when=self.toggle_dpi)
-        self.toggle_cidr = self._make_toggle(inner_what, 1, 0, "CIDR (запрещённые сети)", HELP["cidr"], default=False, enabled_when=self.toggle_dpi)
-        self.toggle_dpi_active = self._make_toggle(inner_what, 1, 1, "DPI-актив (SNI/ECH/TLS)", HELP["dpi_active"], default=False)
-        self.toggle_telegram = self._make_toggle(inner_what, 2, 0, "Telegram (загрузка/выгрузка)", HELP["telegram"], default=True)
-        # v8: ИИ-гео слепок — обязательный этап (тумблера НЕТ): задаёт флаг
-        # страны узла по CF-слепку OpenAI. Единственная опция — strict.
-        self.toggle_ai_strict = self._make_toggle(inner_what, 2, 1, "ИИ-гео: исключить РФ-слепок", HELP["ai_strict"], default=False)
+        self.toggle_dpi = self._make_toggle(inner_what, 0, 0, "DPI-проверка", HELP["dpi"], default=False)
+        self.toggle_siberian = self._make_toggle(inner_what, 0, 1, "Siberian", HELP["siberian"], default=True, enabled_when=self.toggle_dpi)
+        self.toggle_cidr = self._make_toggle(inner_what, 1, 0, "CIDR", HELP["cidr"], default=False, enabled_when=self.toggle_dpi)
+        self.toggle_dpi_active = self._make_toggle(inner_what, 1, 1, "DPI-актив", HELP["dpi_active"], default=False)
+        self.toggle_telegram = self._make_toggle(inner_what, 2, 0, "Telegram", HELP["telegram"], default=True)
+        self.toggle_services = self._make_toggle(inner_what, 3, 0, "Заблокированные сервисы", HELP["services"], default=True)
+        self.toggle_services2 = None
+        self.toggle_ai_strict = self._make_toggle(inner_what, 2, 1, "Исключить РФ-слепок", HELP["ai_strict"], default=False)
 
 
         # --- содержимое: «Скорость тестирования» (2 столбика) ---
@@ -160,6 +133,48 @@ class StartPage(ctk.CTkFrame):
         # из-за этого поля файла навсегда оставались заблокированными).
         self.toggle_custom_file.configure(command=lambda _=None: self._sync_custom_file_controls())
         self._sync_custom_file_controls()
+        self.toggle_sing_box_only = self._make_toggle(inner_extra, 2, 0, "Только sing-box", HELP["sing_box_only"], default=False)
+        # v11: sing-box pool, дедупликация, resilience.
+        self.toggle_use_singbox_pool = self._make_toggle(
+            inner_extra, 3, 0,
+            "Sing-box pool",
+            HELP["use_singbox_pool"], default=True,
+        )
+        self.singbox_pool_batch = self._make_entry(
+            inner_extra, 3, 1,
+            "Батч pool",
+            "200", help=HELP["singbox_pool_batch"],
+        )
+        # Дедупликация (dropdown) | Resilience (тумблер)
+        import customtkinter as _ctk
+        dedup_frame = _ctk.CTkFrame(inner_extra, fg_color="transparent")
+        dedup_frame.grid(row=4, column=0, padx=6, pady=4, sticky="ew")
+        dedup_frame.grid_columnconfigure(1, weight=1)
+        dedup_label = _ctk.CTkLabel(
+            dedup_frame, text="Дедупликация:",
+            font=_ctk.CTkFont(size=12), text_color=theme.MUTED,
+            anchor="w",
+        )
+        dedup_label.grid(row=0, column=0, padx=(0, 6), sticky="w")
+        self.dedup_mode_var = _ctk.StringVar(value="normal")
+        self.dedup_mode_menu = _ctk.CTkOptionMenu(
+            dedup_frame,
+            values=["strict", "normal", "aggressive"],
+            variable=self.dedup_mode_var,
+            width=120, height=26,
+            fg_color=theme.CARD, button_color=theme.ACCENT,
+            button_hover_color=theme.ACCENT_HOVER,
+            text_color=theme.TEXT,
+            font=_ctk.CTkFont(size=11),
+        )
+        self.dedup_mode_menu.grid(row=0, column=1, sticky="ew")
+        CTkToolTip(self.dedup_mode_menu, HELP["dedup_mode"])
+
+        self.toggle_resilience_check = self._make_toggle(
+            inner_extra, 4, 1,
+            "Resilience",
+            HELP["resilience_check"], default=True,
+        )
 
 
 
@@ -176,7 +191,7 @@ class StartPage(ctk.CTkFrame):
             command=self.app.on_start_clicked,
         )
         self.btn_run.grid(row=3, column=0, padx=12, pady=(8, 14), sticky="ew")
-        CTkToolTip(self.btn_run, "Запустить сборку и проверку конфигов из всех подписок.")
+        CTkToolTip(self.btn_run, "Запуск тестирования.")
 
         # Восстанавливаем сохранённые настройки (workers, timeout, тумблеры).
         self._restore_settings()
@@ -207,7 +222,7 @@ class StartPage(ctk.CTkFrame):
             text_color=theme.MUTED, font=ctk.CTkFont(size=11),
         )
         chk.grid(row=0, column=1, sticky="e")
-        CTkToolTip(chk, "Показывать или скрывать блок. Скрытые блоки экономят место.")
+        CTkToolTip(chk, "Скрыть/показать блок.")
 
         # Контейнер содержимого (2 столбика)
         inner = ctk.CTkFrame(card, fg_color="transparent")
@@ -345,8 +360,10 @@ class StartPage(ctk.CTkFrame):
         self.limit.insert(0, str(opts.get("limit", 0)))
         # Тумблеры.
         self._set_toggle(self.toggle_no_stress, bool(opts.get("no_stress", False)))
+        self._set_toggle(self.toggle_sing_box_only, bool(opts.get("sing_box_only", False)))
 
         self._set_toggle(self.toggle_telegram, bool(opts.get("telegram_check", True)))
+        self._set_toggle(self.toggle_services, bool(opts.get("services_check", True)))
         self._set_toggle(self.toggle_dpi, bool(opts.get("dpi_check", False)))
         self._set_toggle(self.toggle_siberian, bool(opts.get("dpi_siberian", False)))
         self._set_toggle(self.toggle_cidr, bool(opts.get("dpi_cidr", False)))
@@ -358,6 +375,15 @@ class StartPage(ctk.CTkFrame):
         if bool(opts.get("zapret_check", False)):
             self._set_toggle(self.toggle_dpi, True)
         self._set_toggle(self.toggle_ai_strict, bool(opts.get("ai_strict", False)))
+        # v11: новые опции.
+        self._set_toggle(self.toggle_use_singbox_pool, bool(opts.get("use_singbox_pool", True)))
+        self._set_toggle(self.toggle_resilience_check, bool(opts.get("resilience_check", True)))
+        dedup_mode = str(opts.get("dedup_mode", "normal"))
+        if dedup_mode not in ("strict", "normal", "aggressive"):
+            dedup_mode = "normal"
+        self.dedup_mode_var.set(dedup_mode)
+        self.singbox_pool_batch.delete(0, "end")
+        self.singbox_pool_batch.insert(0, str(opts.get("singbox_pool_batch", 200)))
         # Синхронизация зависимых тумблеров с восстановленными состояниями.
         self._sync_toggle_dependents(self.toggle_dpi)
         self._sync_toggle_dependents(self.toggle_telegram)
@@ -382,8 +408,10 @@ class StartPage(ctk.CTkFrame):
             "min_speed": self._int_value(self.min_speed, 3000),
             "limit": self._int_value(self.limit, 0),
             "no_stress": bool(self.toggle_no_stress.get()),
+            "sing_box_only": bool(self.toggle_sing_box_only.get()),
 
             "telegram_check": bool(self.toggle_telegram.get()),
+            "services_check": bool(self.toggle_services.get()),
             "dpi_check": bool(self.toggle_dpi.get()),
             "dpi_siberian": bool(self.toggle_siberian.get()),
             "dpi_cidr": bool(self.toggle_cidr.get()),
@@ -391,6 +419,11 @@ class StartPage(ctk.CTkFrame):
             # v8: ai-слепок обязателен — ключа ai_check больше нет;
             # zapret_check не сохраняем (suite — часть DPI-проверки).
             "ai_strict": bool(self.toggle_ai_strict.get()),
+            # v11: новые опции.
+            "dedup_mode": str(self.dedup_mode_var.get() or "normal"),
+            "use_singbox_pool": bool(self.toggle_use_singbox_pool.get()),
+            "singbox_pool_batch": self._int_value(self.singbox_pool_batch, 200),
+            "resilience_check": bool(self.toggle_resilience_check.get()),
         }
         try:
             save_test_options(opts)
@@ -426,14 +459,21 @@ class StartPage(ctk.CTkFrame):
             max_ping=self._int_value(self.max_ping, 1500),
             min_speed=self._int_value(self.min_speed, 3000),
             no_stress=self.toggle_no_stress.get(),
+            sing_box_only=self.toggle_sing_box_only.get(),
 
             telegram_check=self.toggle_telegram.get(),
+            services_check=self.toggle_services.get(),
             dpi_check=dpi_check,
             dpi_siberian=bool(self.toggle_siberian.get()) if dpi_check else False,
             dpi_cidr=bool(self.toggle_cidr.get()) if dpi_check else False,
             dpi_active=bool(self.toggle_dpi_active.get()),
             ai_strict=bool(self.toggle_ai_strict.get()),
             custom_file=custom_file,
+            # v11: новые опции.
+            dedup_mode=str(self.dedup_mode_var.get() or "normal"),
+            use_singbox_pool=bool(self.toggle_use_singbox_pool.get()),
+            singbox_pool_batch=self._int_value(self.singbox_pool_batch, 200),
+            resilience_check=bool(self.toggle_resilience_check.get()),
         )
 
 

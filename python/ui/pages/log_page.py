@@ -39,7 +39,7 @@ class LogPage(ctk.CTkFrame):
             font=ctk.CTkFont(size=14, weight="bold"), anchor="w", text_color=theme.TEXT,
         )
         stats_header.grid(row=0, column=0, sticky="w")
-        CTkToolTip(stats_header, "Статистика из последнего прогона: сколько узлов найдено, прошло пинг и признано рабочими.")
+        CTkToolTip(stats_header, "Статистика последнего прогона.")
 
         self.stats_box = ctk.CTkTextbox(
             self.stats_card, font=ctk.CTkFont(family=theme.FONT_MONO, size=12),
@@ -76,7 +76,7 @@ class LogPage(ctk.CTkFrame):
             command=self.clear_log,
         )
         self.btn_clear.grid(row=0, column=1)
-        CTkToolTip(self.btn_clear, "Очистить журнал выполнения (статистика останется).")
+        CTkToolTip(self.btn_clear, "Очистить журнал.")
 
         self.log_box = ctk.CTkTextbox(
             self.log_card, font=ctk.CTkFont(family=theme.FONT_MONO, size=12),

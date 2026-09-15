@@ -75,15 +75,19 @@ try {
         $runnerArgs = @()
     }
 
-    # Дублируем весь вывод в data\run.log, чтобы ошибки можно было посмотреть
-    # даже после закрытия окна.
+    # v11: лог-файл data/run.log пишется САМ Python-кодом (subgen/logging.py).
+    # Раньше PS1 дублировал вывод в run.log через Add-Content — это приводило
+    # к ДВОЙНОМУ логу (Python пишет + PS1 пишет ту же строку). Add-Content на
+    # каждую строку был медленным (открытие/закрытие файла × 23000 строк).
+    # Теперь PS1 только выводит в консоль (Write-Host), а в файл пишет Python.
     $logDir = Join-Path $rootDir 'data'
     if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
     $logPath = Join-Path $logDir 'run.log'
+    # Маркер начала прогона (одна строка — без дублирования).
     Add-Content -Path $logPath -Value ("===== {0} =====" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    Add-Content -Path $logPath -Value "Runner: $runner $($runnerArgs -join ' ')"
 
     Write-Host "Runner: $runner $($runnerArgs -join ' ')" -ForegroundColor DarkGray
-    Add-Content -Path $logPath -Value "Runner: $runner $($runnerArgs -join ' ')"
 
     # Run the generator and process its output line by line.
     & $runner @runnerArgs @PyArgs 2>&1 | ForEach-Object {
@@ -92,10 +96,8 @@ try {
             $line = $line.ToString()
         }
         $text = [string]$line
-        # Дублируем строку в лог-файл (маркеры прогресса не пишем).
-        if (-not $text.StartsWith($Marker)) {
-            Add-Content -Path $logPath -Value $text
-        }
+        # v11: в лог-файл больше НЕ пишем — Python (subgen/logging.py) уже
+        # пишет туда. Раньше тут был Add-Content на каждую строку = дубль.
 
         if ($text.StartsWith($Marker)) {
 

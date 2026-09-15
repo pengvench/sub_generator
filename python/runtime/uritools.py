@@ -64,6 +64,51 @@ _BASE64_QUERY_PARAMS = frozenset({
     "spxfingerprint", "spx",
 })
 
+# Режимы дедупликации. См. _node_dedup_text(mode=...).
+DEDUP_MODE_STRICT = "strict"        # текущее поведение: весь canonical URL
+DEDUP_MODE_NORMAL = "normal"        # игнор: fp/fingerprint/spx (uTLS-фингерпринты)
+DEDUP_MODE_AGGRESSIVE = "aggressive"  # игнор: всё, кроме protocol+host+port+sni+credential
+DEDUP_MODES = (DEDUP_MODE_STRICT, DEDUP_MODE_NORMAL, DEDUP_MODE_AGGRESSIVE)
+
+# Параметры uTLS-фингерпринтов — не влияют на сам узел, только на DPI-маскировку
+# клиента. Два конфига, отличающихся ТОЛЬКО fp/fingerprint/spx, — это ОДИН И ТОТ
+# ЖЕ бэкенд. В normal/aggressive режимах они удаляются из dedup-ключа.
+_FP_QUERY_PARAMS = frozenset({"fp", "fingerprint", "spx"})
+
+# В aggressive-режиме оставляем только эти параметры (всё остальное отбрасывается).
+# SNI/host — куда подключаемся, type — транспорт (ws/grpc/tcp), security — tls/reality,
+# pbk/sid — Reality-ключи (без них разные узлы на одном IP:port). Остальное
+# (alpn, allowInsecure, flow, fp, path-нюансы) — не критично для идентичности.
+_AGGRESSIVE_KEEP_PARAMS = frozenset({
+    "host", "sni", "type", "security",
+    "pbk", "sid", "publickey", "public-key",
+    "serviceName",
+})
+
+
+# Глобальный режим дедупликации (аналог set_forced_runtime).
+# Устанавливается один раз на старте конвейера через set_dedup_mode().
+# По умолчанию — DEDUP_MODE_STRICT (обратная совместимость со старым поведением).
+_DEDUP_MODE: str = DEDUP_MODE_STRICT
+
+
+def set_dedup_mode(mode: str | None) -> None:
+    """Установить глобальный режим дедупликации.
+
+    Вызывается из pipeline.py при разборе аргументов (--dedup-mode).
+    Влияет на все последующие вызовы ``_node_dedup_text`` и ``XrayNode.key``.
+    """
+    global _DEDUP_MODE
+    value = str(mode or "").strip().lower()
+    if value not in DEDUP_MODES:
+        value = DEDUP_MODE_STRICT
+    _DEDUP_MODE = value
+
+
+def get_dedup_mode() -> str:
+    """Текущий глобальный режим дедупликации."""
+    return _DEDUP_MODE
+
 
 def _normalize_ss_userinfo(userinfo: str) -> str:
     """Нормализовать userinfo из ss:// URL.
@@ -94,7 +139,28 @@ def _normalize_ss_userinfo(userinfo: str) -> str:
     return userinfo
 
 
-def _node_dedup_text(raw_uri: str) -> str:
+def _node_dedup_text(raw_uri: str, *, mode: str | None = None) -> str:
+    """Канонизированный текст узла для дедупликации (хешируется в XrayNode.key).
+
+    ``mode`` управляет агрессивностью дедупликации:
+      - ``strict`` (по умолчанию, обратная совместимость): весь canonical URL,
+        включая fp/fingerprint/spx/alpn/path-нюансы. Два конфига с разным
+        uTLS-фингерпринтом считаются РАЗНЫМИ узлами.
+      - ``normal``: игнорирует только ``fp``/``fingerprint``/``spx`` (uTLS-маскировка
+        клиента не меняет бэкенд). Убирает 5-15% мусорных дубликатов от подписок,
+        которые раздают один бэкенд с разными фингерпринтами для DPI-обхода.
+      - ``aggressive``: оставляет только ``protocol + host + port + credential +
+        sni/host + type + security + pbk/sid``. Убирает 30-50% дубликатов, но
+        рискованно: разные ``flow`` (xtls-rprx-vision vs none) или разные ``path``
+        у WS-транспорта считаются одним узлом. Имеет смысл для очень больших
+        подписок (10k+), где цель — найти РАЗНЫЕ бэкенды, а не разные маскировки.
+
+    Если ``mode`` не указан — используется глобальный режим (см. set_dedup_mode).
+
+    vmess-узлы во ВСЕХ режимах канонизируются по JSON-телу (без ``ps``).
+    """
+    if mode is None:
+        mode = _DEDUP_MODE
     value = _sanitize_node_uri(raw_uri)
     if not value:
         return ""
@@ -108,6 +174,14 @@ def _node_dedup_text(raw_uri: str) -> str:
             # одним конфигом при дедупликации.
             if isinstance(payload, dict):
                 payload.pop("ps", None)
+                # В normal/aggressive режимах удаляем маскировочные поля vmess.
+                if mode in (DEDUP_MODE_NORMAL, DEDUP_MODE_AGGRESSIVE):
+                    for fp_key in ("fp", "fingerprint", "spx"):
+                        payload.pop(fp_key, None)
+                if mode == DEDUP_MODE_AGGRESSIVE:
+                    # Оставляем только ключевые поля идентичности.
+                    keep = {"add", "port", "id", "aid", "scy", "net", "host", "sni", "security"}
+                    payload = {k: v for k, v in payload.items() if k in keep}
             return "vmess://" + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return value
     if "#" in value:
@@ -120,6 +194,12 @@ def _node_dedup_text(raw_uri: str) -> str:
         items = parse_qs(parsed.query, keep_blank_values=True)
         parts: list[str] = []
         for key in sorted(items):
+            # normal: выкидываем fp/fingerprint/spx.
+            if mode == DEDUP_MODE_NORMAL and key.lower() in _FP_QUERY_PARAMS:
+                continue
+            # aggressive: выкидываем всё, кроме белого списка.
+            if mode == DEDUP_MODE_AGGRESSIVE and key.lower() not in _AGGRESSIVE_KEEP_PARAMS:
+                continue
             for item in sorted(items[key]):
                 # Нормализация base64-параметров (pbk, sid, publicKey и т.д.):
                 # добавляем padding, чтобы abc123 и abc123= считались одним ключом.
@@ -155,6 +235,10 @@ def _node_dedup_text(raw_uri: str) -> str:
         userinfo = quote(userinfo_str, safe=":")
         netloc = f"{userinfo}@{netloc}"
     path = parsed.path.rstrip("/")
+    # aggressive: убираем path (ws-маршруты у одного бэкенда могут отличаться,
+    # но это всё ещё тот же сервер). Нормальный режим оставляет path.
+    if mode == DEDUP_MODE_AGGRESSIVE:
+        path = ""
     return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
 
 

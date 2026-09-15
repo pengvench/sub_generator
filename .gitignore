@@ -30,6 +30,8 @@ pip-selfcheck.json
 .idea/
 
 # Runtime data (создаётся при запуске; sources.txt — исключение, хранится)
+data/sources.txt
+data/*
 data/report.json
 data/run.log
 data/settings.json

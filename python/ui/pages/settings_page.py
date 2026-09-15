@@ -78,7 +78,7 @@ class SettingsPage(ctk.CTkFrame):
             command=self._save,
         )
         self.btn_save.grid(row=2, column=0, padx=12, pady=(8, 14), sticky="ew")
-        CTkToolTip(self.btn_save, "Сохранить описание и префикс подписки.")
+        CTkToolTip(self.btn_save, "Сохранить.")
 
         self.lbl_saved = ctk.CTkLabel(
             self.scroll, text="", text_color=theme.SUCCESS,

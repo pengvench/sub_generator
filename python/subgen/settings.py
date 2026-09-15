@@ -32,7 +32,14 @@ DEFAULT_TEST_OPTIONS: dict[str, object] = {
     "min_speed": 3000,
     "limit": 0,
     "no_stress": False,
+    # Режим «только sing-box»: тумблер «Тестировать все узлы через sing-box»
+    # (страница «Тестирование»). Автовыбор ядра удалён: по умолчанию xray,
+    # hysteria/hy2 — всегда sing-box, этот флаг форсит sing-box для всех.
+    "sing_box_only": False,
     "telegram_check": True,
+    # Заблокированные сервисы (инста/ютуб/дискорд) — главный критерий:
+    # этап включён по умолчанию (тумблер «Заблокированные сервисы»).
+    "services_check": True,
     "dpi_check": False,
     "dpi_siberian": False,
     "dpi_cidr": False,
@@ -42,6 +49,11 @@ DEFAULT_TEST_OPTIONS: dict[str, object] = {
     # ИИ-гео слепок обязателен; единственная опция — ai_strict.
     "ai_strict": False,
     "ai_timeout": 6.0,
+    # v11: новые опции конвейера.
+    "dedup_mode": "normal",        # strict/normal/aggressive
+    "use_singbox_pool": True,      # один sing-box + Clash API для initial_check
+    "singbox_pool_batch": 200,     # размер батча
+    "resilience_check": True,      # живучесть в блокировках
 }
 
 

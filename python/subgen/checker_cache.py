@@ -80,50 +80,50 @@ class CheckerCache:
                     }
         except Exception:
             self._entries = {}
-    
+
     def _save(self) -> None:
-        """Сохранить кэш в файл."""
-        with _lock:
-            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._cache_path.with_suffix(".json.tmp")
-            data = {k: v.to_dict() for k, v in self._entries.items()}
-            tmp.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(self._cache_path)
-    
+        """Сохранить кэш в файл (вызывать под _lock)."""
+        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._cache_path.with_suffix(".json.tmp")
+        data = {k: v.to_dict() for k, v in self._entries.items()}
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(self._cache_path)
+
     def get(
         self,
         url: str,
         checker_type: str,
     ) -> Optional[CacheEntry]:
-        """Получить запись кэша для узла и типа проверки."""
-        key = f"{checker_type}:{self._hash_url(url)}"
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        
-        # TTL зависит от типа проверки и вердикта: проходы DPI живут дольше
-        # (12ч — ночные результаты не истекают к дневному перезапуску), фейлы —
-        # короче (30мин; провал мог быть из-за медленной сети, быстро
-        # перепроверяем). Фикс «dpi уронил всё на мобильной сети» 2026-09-02.
-        cache_cfg = load_thresholds().get("cache", {})
-        ttl = cache_cfg.get("ttl_seconds", 3600)
-        if checker_type == "dpi":
-            ttl = (
-                cache_cfg.get("ttl_dpi_pass_seconds", 43200)
-                if entry.passed
-                else cache_cfg.get("ttl_dpi_fail_seconds", 1800)
-            )
-        
-        if not entry.is_valid(ttl):
-            # Истёк срок действия — удаляем запись
-            del self._entries[key]
-            return None
-        
-        return entry
-    
+        """Получить запись кэша для узла и типа проверки (потокобезопасно)."""
+        with _lock:
+            key = f"{checker_type}:{self._hash_url(url)}"
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+
+            # TTL зависит от типа проверки и вердикта: проходы DPI живут дольше
+            # (12ч — ночные результаты не истекают к дневному перезапуску), фейлы —
+            # короче (30мин; провал мог быть из-за медленной сети, быстро
+            # перепроверяем). Фикс «dpi уронил всё на мобильной сети» 2026-09-02.
+            cache_cfg = load_thresholds().get("cache", {})
+            ttl = cache_cfg.get("ttl_seconds", 3600)
+            if checker_type == "dpi":
+                ttl = (
+                    cache_cfg.get("ttl_dpi_pass_seconds", 43200)
+                    if entry.passed
+                    else cache_cfg.get("ttl_dpi_fail_seconds", 1800)
+                )
+
+            if not entry.is_valid(ttl):
+                # Истёк срок действия — удаляем запись
+                self._entries.pop(key, None)
+                return None
+
+            return entry
+
     def set(
         self,
         url: str,
@@ -131,30 +131,31 @@ class CheckerCache:
         passed: bool,
         details: Optional[dict] = None,
     ) -> None:
-        """Добавить/обновить запись кэша."""
-        key = f"{checker_type}:{self._hash_url(url)}"
-        entry = CacheEntry(
-            url_hash=self._hash_url(url),
-            timestamp=time.time(),
-            passed=passed,
-            checker_type=checker_type,
-            details=details or {},
-        )
-        self._entries[key] = entry
-        
-        # Ограничиваем размер кэша
-        thresholds = load_thresholds()
-        max_entries = thresholds.get("cache", {}).get("max_entries", 1000)
-        if len(self._entries) > max_entries:
-            # Удаляем самые старые записи
-            sorted_entries = sorted(
-                self._entries.items(),
-                key=lambda x: x[1].timestamp,
+        """Добавить/обновить запись кэша (потокобезопасно)."""
+        with _lock:
+            key = f"{checker_type}:{self._hash_url(url)}"
+            entry = CacheEntry(
+                url_hash=self._hash_url(url),
+                timestamp=time.time(),
+                passed=passed,
+                checker_type=checker_type,
+                details=details or {},
             )
-            for i in range(len(self._entries) - max_entries):
-                del self._entries[sorted_entries[i][0]]
-        
-        self._save()
+            self._entries[key] = entry
+
+            # Ограничиваем размер кэша
+            thresholds = load_thresholds()
+            max_entries = thresholds.get("cache", {}).get("max_entries", 1000)
+            if len(self._entries) > max_entries:
+                # Удаляем самые старые записи
+                sorted_entries = sorted(
+                    self._entries.items(),
+                    key=lambda x: x[1].timestamp,
+                )
+                for i in range(len(self._entries) - max_entries):
+                    del self._entries[sorted_entries[i][0]]
+
+            self._save()
     
     def clear(self) -> None:
         """Очистить весь кэш."""

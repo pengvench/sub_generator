@@ -24,7 +24,9 @@ class PipelineOptions:
     max_ping: int = 1500
     min_speed: int = 3000
     no_stress: bool = False
+    sing_box_only: bool = False
     telegram_check: bool = True
+    services_check: bool = True
     dpi_check: bool = False
 
     dpi_siberian: bool = False
@@ -37,6 +39,17 @@ class PipelineOptions:
     # поля ai_check нет; единственная опция — ai_strict (исключить слепок-РФ).
     ai_strict: bool = False
     ai_timeout: float = 6.0
+
+    # v11: новые опции.
+    # dedup_mode — режим дедупликации узлов (strict/normal/aggressive).
+    # use_singbox_pool — один sing-box процесс с N outbounds + Clash API
+    # для массовых этапов (initial_check). По умолчанию включён.
+    # singbox_pool_batch — размер батча (200 узлов на один процесс).
+    # resilience_check — проверка живучести в блокировках (включена по умолчанию).
+    dedup_mode: str = "normal"
+    use_singbox_pool: bool = True
+    singbox_pool_batch: int = 200
+    resilience_check: bool = True
 
     start_stage: str = "ping"
     custom_file: str = ""
@@ -117,8 +130,15 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
 
     if options.no_stress:
         args.append("--no-stress")
+    # Режим «только sing-box»: все узлы тестируются через sing-box.
+    if options.sing_box_only:
+        args.append("--sing-box-only")
     if not options.telegram_check:
         args.append("--no-telegram")
+    # Заблокированные сервисы (инста/ютуб/дискорд) — главный отсеивающий этап
+    # (включён по умолчанию; выключаем только явным тумблером UI).
+    if not options.services_check:
+        args.append("--no-services")
     if options.dpi_check:
         args.append("--dpi-check")
         if options.dpi_siberian:
@@ -136,6 +156,15 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
         args.append("--ai-strict")
     if options.ai_timeout != 6.0:
         args += ["--ai-timeout", str(options.ai_timeout)]
+    # v11: новые опции — передаём всегда, т.к. дефолты конвейера и UI
+    # совпадают, но при изменении в UI аргумент должен попасть в CLI.
+    args += ["--dedup-mode", str(options.dedup_mode)]
+    if not options.use_singbox_pool:
+        args.append("--no-singbox-pool")
+    if options.singbox_pool_batch != 200:
+        args += ["--singbox-pool-batch", str(options.singbox_pool_batch)]
+    if not options.resilience_check:
+        args.append("--no-resilience-check")
     if options.start_stage != "ping":
         args += ["--start-stage", options.start_stage]
     if options.custom_file:

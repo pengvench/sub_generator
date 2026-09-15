@@ -1,8 +1,15 @@
+# SubGenerator sources - cleaned (rule-providers removed)
+# 133 subscription URLs (rule-providers like discord.yaml/mrs removed)
+# Generated: 2026-09-14
+
+https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/APTEKAxWHITExLIST
+https://gist.githubusercontent.com/Diman331/8c868070c0b5a5ec0c7d94507717b67b/raw/subscription.txt
+https://gitverse.ru/api/repos/gidro/white/raw/branch/master/subscription.txt
+https://gidroksi.fun/black-list
 https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 https://raw.githubusercontent.com/flaafix/AetrisVPN/refs/heads/main/AetrisVPN.txt
-https://mifa.world/aeon
 https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt
 https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt
 https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt
@@ -19,24 +26,18 @@ https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/
 https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/2.txt
 https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/3.txt
 https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/4.txt
-https://flat-hill-2415.fatago78.workers.dev
 https://sub.vlessfo.ru/vlessforu/working_configs.txt
 https://p.kfwl.lol/https://freevpnhappcluchi.duckdns.org/sub/lew1ik2xiuohs9v3
 https://p.kfwl.lol/https://freevpnhappcluchi.duckdns.org/sub/o20pq89rdo9e7afo
 https://raw.githubusercontent.com/bobrinaw/vlessforu/refs/heads/main/working_configs.txt
 https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all
-https://sub.orpheous.ru/sub/Zadyeut4EJZQCBg5
 https://gitverse.ru/api/repos/bikinitw22/apelsintel/raw/branch/main/alive_bs.txt
-https://raw.githubusercontent.com/Diversan313/apex-parser/main/alive_bl.txt
 https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/sub.txt
 https://vpnsvpns.github.io/Prihs/mifa.json
 https://vpnsvpns.github.io/Prihs/ros.json
 https://vpnsvpns.github.io/Prihs/white.json
-https://raw.githubusercontent.com/iampedii/whitedns-sub/refs/heads/main/all.yaml
 https://hub.mos.ru/zieng2/wl/raw/main/list_universal.txt
 https://panel.elix.lol/api/sub/MvrYyN9U5XS8AuAp
-https://charity.invisibleshrimp.su/DGC4_hKXVZ0phvvw
-https://s3.toostep.top/s/exitfy
 https://cyb-portal.com/CP-001
 https://cyb-portal.com/CP-002
 https://cyb-portal.com/CP-003
@@ -59,7 +60,6 @@ https://cyb-portal.com/CP-020
 https://cyb-portal.com/CP-021
 https://cyb-portal.com/CP-022
 https://cyb-portal.com/CP-023
-https://cyb-portal.com/CP-024
 https://cyb-portal.com/CP-025
 https://cyb-portal.com/CP-026
 https://cyb-portal.com/CP-027
@@ -84,4 +84,48 @@ https://p.kfwl.lol/https://freevpnhappcluchi.duckdns.org/sub/c32dw5mfut31f3ri
 https://p.kfwl.lol/https://freevpnhappcluchi.duckdns.org/sub/9kaf6wcp2eok5fbe
 https://gitverse.ru/api/repos/FUKIFA/FUFIKA/raw/branch/master/FUKIFABLL
 https://tunpass.online/sub/2d90a93c2019cb97
-https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/APTEKAxWHITExLIST
+https://hub.mos.ru/nfajih/wildvf/-/raw/main/WVFBLACK
+https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/APTEKAxBLACKxLIST
+https://gist.githubusercontent.com/SlavaKat/2d75a18830db8315ee79d58f5ee62e30/raw/
+https://raw.githubusercontent.com/Diversan313/apex-parser/main/subs/main/alive_bs.txt
+https://etoneya.su/whitelist
+https://whitelist.etoneya.baby
+https://etoneya.su/other
+https://etoneya.su/gemini
+https://etoneya.su/youtube
+https://etoneya.su/ytm
+https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/main/kizyakbeta7.txt
+https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/main/kizyakbeta6.txt
+https://gist.githubusercontent.com/SlavaKat/a82a9698ff9f2f6dc4798a13e8b69a10/raw/
+https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/main/kizyakbeta6BL.txt
+https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/whitelist.txt
+https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/blacklist.txt
+https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/1.txt
+https://raw.githubusercontent.com/hiztin/VLESS-PO-GRIBI/main/deploy/subscriptions/25.txt
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt
+https://0dceb06f.withblancvpn.online/s/a91b6cba9cec463cb20cbb8d17e71b35#BlancVPN
+https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/%D0%91%D0%B5%D0%BB%D1%8B%D0%B5_%D1%81%D0%BF%D0%B8%D1%81%D0%BA%D0%B8229.txt
+https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/whitelist.txt
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.grey-lance.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=promokod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Германия 🇩🇪
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.vast-mesa.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=lovikod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Швеция 🇸🇪
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.wide-frost.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=zolla.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Финляндия 🇫🇮
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.fox-tower.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=gloria-jeans.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇪🇪 Эстония
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.red-river.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇵🇱 Польша
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.neat-cove.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Россия 🇷🇺
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.dawn-marsh.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=reksoft.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Литва 🇱🇹
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.warm-robin.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=aeroflot.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Латвия 🇱🇻
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@play.wide-frost.test-cdn-kkk.com:8443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=zolla.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 🎮 Игровой 1
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@play.fox-tower.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=gloria-jeans.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇪🇪 🎮 Игровой 2
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@play.vast-mesa.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=lovikod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇸🇪 🎮 Игровой 3
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.grey-lance.test-cdn-kkk.com:9443?encryption=none&type=xhttp&mode=auto&security=reality&sni=promokod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇩🇪 Обход Резерв (только Wi-Fi)
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.red-blaze.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Нидерланды 🇳🇱
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.free-marsh.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=tr.eu-ffast.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Турция 🇹🇷
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.mint-lance.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=kari.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#США 🇺🇸
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.gold-pond.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Франция 🇫🇷
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.firm-tower.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Великобритания 🇬🇧
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.soft-blade.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=tradingview.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Казахстан 🇰🇿
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.rare-glen.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=ads.x5.ru&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE #1
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.iron-mine.test-cdn-kkk.com:443?encryption=none&type=grpc&serviceName=ads.x5.ru&mode=gun&security=reality&sni=gazeta-business.ru&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE #2
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.bay-glep.test-cdn-kkk.com:443?encryption=none&type=grpc&serviceName=ads.x5.ru&mode=gun&security=reality&sni=gazeta-business.ru&fp=firefox&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE #3
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test10.firm-dune.test-cdn-kkk.com:10443?encryption=none&type=grpc&serviceName=ads.x5.ru&mode=gun&security=reality&sni=www.google.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE Reserve
+vless://dd76e0a5-9079-423d-afc2-d372f8106160@telegram.private-networks-zk.com:443?flow=xtls-rprx-vision&type=tcp&headerType=none&security=reality&fp=chrome&sni=ads.x5.ru&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#[FREE] ТОЛЬКО TG БОТ + САЙТ

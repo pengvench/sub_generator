@@ -27,18 +27,19 @@ from ..tooltip import CTkToolTip, info_label
 # label — что видит пользователь.
 # NOTE: отдельного zapret-этапа больше нет — функционал тестирования Zapret
 # (DPI suite tcp 16-20 + HTTP) объединён с этапом 'dpi'. Новые узлы: ai_geo.
-# v8.2: telegram_pro идёт ДО dpi (Telegram — главный критерий, он не должен
-# обрезаться DPI-гейтом, откалиброванным под широкополосный доступ).
+# v11: убраны route (бессмысленный) и zapret-suite. Порядок этапов
+# синхронизирован с pipeline.STAGE_ORDER: ping → initial → telegram_pro →
+# services → dpi → resilience → dpi_active → ai_geo → recheck.
 STAGES: list[tuple[str, str]] = [
-    ("ping", "Сначала (полный прогон: пинг + стресс-тест)"),
+    ("ping", "Сначала (полный прогон: пинг + все проверки)"),
     ("initial", "Initial check (TCP+HTTP HEAD)"),
-    ("telegram_pro", "Telegram-PRO (MTProto connect/auth)"),
-    ("dpi", "DPI (+ Zapret-suite, если включён)"),
-    ("dpi_active", "DPI-актив (SNI/ECH/TLS 1.2/1.3)"),
-    ("ai_geo", "ИИ-гео (Gemini/OpenAI слепок)"),
-    ("route", "Route (трассировка маршрута)"),
+    ("telegram_pro", "Telegram-PRO (MTProto + медиа)"),
+    ("services", "Заблокированные сервисы (инста/ютуб/дискорд)"),
+    ("dpi", "DPI-проверка (обход блокировок)"),
     ("resilience", "Resilience (живучесть в блокировках)"),
-    ("recheck", "Финальный спидтест"),
+    ("dpi_active", "DPI-актив (SNI/ECH/TLS 1.2/1.3)"),
+    ("ai_geo", "ИИ-гео (консенсус CF+ipinfo+ip-api, флаг страны)"),
+    ("recheck", "Финальный отсеивающий спидтест"),
 ]
 
 
@@ -124,7 +125,7 @@ class RecheckPage(ctk.CTkFrame):
             command=self._open_cache_dir,
         )
         self.btn_open_cache.grid(row=1, column=0, padx=6, pady=(0, 6), sticky="w")
-        CTkToolTip(self.btn_open_cache, "Открыть data/.runtime_cache в проводнике.")
+        CTkToolTip(self.btn_open_cache, "Открыть кеш.")
 
         # ---------------- Кнопка запуска ----------------
         self.btn_run = ctk.CTkButton(
@@ -139,9 +140,7 @@ class RecheckPage(ctk.CTkFrame):
             command=self.app.on_start_clicked,
         )
         self.btn_run.grid(row=2, column=0, padx=12, pady=(8, 14), sticky="ew")
-        CTkToolTip(self.btn_run, "Запустить проверку с выбранным режимом. "
-                                  "При перепроверке с этапа пинг и стресс-тест "
-                                  "не повторяются — используются сохранённые конфиги.")
+        CTkToolTip(self.btn_run, "Запустить проверку.")
 
         self.refresh_availability()
 

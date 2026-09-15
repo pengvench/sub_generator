@@ -35,6 +35,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # Файл списка подписок по умолчанию (по строке на URL).
 DEFAULT_SOURCES_FILE = DATA_DIR / "sources.txt"
 
+# Папка сохранённых подписок из вкладки "Импорт" (data/saved_subs/*.txt).
+# Pipeline автоматически загружает все .txt/.json из этой папки как источники.
+SAVED_SUBS_DIR = DATA_DIR / "saved_subs"
+SAVED_SUBS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 
 # --------------------------------------------------------------------------

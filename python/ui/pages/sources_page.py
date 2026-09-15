@@ -14,10 +14,11 @@ class SourcesPage(ctk.CTkFrame):
         super().__init__(master, **kwargs)
         self.app = app
         self._sources: list[str] = []
+        self._use_saved_subs = True  # toggle: auto-merge saved_subs into sources
         self.configure(fg_color=theme.BG)
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(3, weight=1)  # textbox (list) is expandable
 
         header = ctk.CTkLabel(
             self, text="Подписки",
@@ -47,7 +48,7 @@ class SourcesPage(ctk.CTkFrame):
         # (widget-level binding срабатывает раньше стандартных обработчиков).
         self.entry_url._entry.bind("<Control-KeyPress>", self._on_entry_ctrl_key)
 
-        CTkToolTip(self.entry_url, "Вставьте ссылку на подписку и нажмите «+ Добавить» (Enter).")
+        CTkToolTip(self.entry_url, "Ссылка на подписку. Enter — добавить.")
 
 
 
@@ -60,7 +61,7 @@ class SourcesPage(ctk.CTkFrame):
             text_color="#0C1014", command=self._add_urls,
         )
         self.btn_add.grid(row=0, column=1, padx=(0, 8), pady=12)
-        CTkToolTip(self.btn_add, "Добавить ссылку из поля в список.")
+        CTkToolTip(self.btn_add, "Добавить.")
 
         self.btn_remove = ctk.CTkButton(
             add_frame, text="− Удалить", width=110,
@@ -68,7 +69,7 @@ class SourcesPage(ctk.CTkFrame):
             command=self._remove_selected,
         )
         self.btn_remove.grid(row=0, column=2, padx=(0, 14), pady=12)
-        CTkToolTip(self.btn_remove, "Удалить выделенные подписки из списка (зажав Ctrl).")
+        CTkToolTip(self.btn_remove, "Удалить выделенные.")
 
         # ---------------- Список ----------------
         self.list_frame = ctk.CTkFrame(self, fg_color=theme.CARD, corner_radius=10,
@@ -101,24 +102,49 @@ class SourcesPage(ctk.CTkFrame):
 
 
 
+        # ---------------- Тумблер: импортированные подписки ----------------
+        toggle_frame = ctk.CTkFrame(self, fg_color=theme.CARD, corner_radius=10,
+                                    border_width=1, border_color=theme.BORDER)
+        toggle_frame.grid(row=4, column=0, padx=24, pady=(0, 12), sticky="ew")
+        toggle_frame.grid_columnconfigure(1, weight=1)
+
+        self.chk_saved_subs = ctk.CTkSwitch(
+            toggle_frame,
+            text="Использовать импортированные подписки (data/saved_subs/)",
+            command=self._on_saved_subs_toggle,
+        )
+        self.chk_saved_subs.grid(row=0, column=0, padx=14, pady=10, sticky="w")
+        self.chk_saved_subs.select()  # ON by default
+        CTkToolTip(self.chk_saved_subs,
+                   "Включить/выключить авто-загрузку файлов из data/saved_subs/ "
+                   "(вкладка «Импорт»). При включении — они добавляются к sources.txt "
+                   "и тестируются вместе с основными подписками.")
+
+        self.lbl_saved_count = ctk.CTkLabel(
+            toggle_frame, text="Найдено: 0",
+            text_color=theme.MUTED, font=ctk.CTkFont(size=11),
+        )
+        self.lbl_saved_count.grid(row=0, column=1, padx=14, pady=10, sticky="e")
+        self._update_saved_count()
+
         # ---------------- Действия ----------------
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
-        actions.grid(row=4, column=0, padx=24, pady=(0, 20), sticky="ew")
+        actions.grid(row=5, column=0, padx=24, pady=(0, 20), sticky="ew")
 
         self.btn_save = ctk.CTkButton(
             actions, text=" Сохранить", width=140,
             command=self._save_all,
         )
         self.btn_save.grid(row=0, column=0, padx=(0, 8))
-        CTkToolTip(self.btn_save, "Записать текущий список в sources.txt.")
+        CTkToolTip(self.btn_save, "Сохранить в sources.txt.")
 
         self.btn_reload = ctk.CTkButton(
             actions, text="↻ Перечитать", width=140,
             command=self.reload,
         )
         self.btn_reload.grid(row=0, column=1, padx=(0, 8))
-        CTkToolTip(self.btn_reload, "Перечитать sources.txt с диска (отменить несохранённые изменения).")
+        CTkToolTip(self.btn_reload, "Перечитать sources.txt.")
 
         self.btn_combined = ctk.CTkButton(
             actions, text=" Проверить и отсеять", width=220,
@@ -126,7 +152,7 @@ class SourcesPage(ctk.CTkFrame):
             command=self.app.on_combined_clicked,
         )
         self.btn_combined.grid(row=0, column=2, padx=(0, 8))
-        CTkToolTip(self.btn_combined, "Сначала отсеять мусорные подписки, затем проверить живучесть оставшихся.")
+        CTkToolTip(self.btn_combined, "Отсеять мусорные + проверить живучесть.")
 
         self.btn_export = ctk.CTkButton(
             actions, text=" Экспорт", width=140,
@@ -134,7 +160,7 @@ class SourcesPage(ctk.CTkFrame):
             command=self.app.on_export_clicked,
         )
         self.btn_export.grid(row=0, column=3, padx=(0, 0))
-        CTkToolTip(self.btn_export, "Скачать все подписки, собрать все конфиги и сохранить в preload.txt с дедупликацией.")
+        CTkToolTip(self.btn_export, "Собрать конфиги в preload.txt.")
 
         self.reload()
 
@@ -144,7 +170,17 @@ class SourcesPage(ctk.CTkFrame):
             lines = self.app.sources_file.read_text(encoding="utf-8")
         except OSError:
             lines = ""
-        self._sources = [ln.strip() for ln in lines.splitlines() if ln.strip()]
+        # Filter out comment lines (#) and empty lines.
+        # Also filter out direct configs (vless://, vmess://, etc) - they are
+        # handled by _load_sources via direct_configs.txt, not as HTTP sources.
+        _DIRECT_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "hysteria://")
+        self._sources = [
+            ln.strip()
+            for ln in lines.splitlines()
+            if ln.strip()
+            and not ln.lstrip().startswith("#")
+            and not ln.lower().lstrip().startswith(_DIRECT_SCHEMES)
+        ]
         self._refresh_list()
 
     def _refresh_list(self) -> None:
@@ -269,7 +305,48 @@ class SourcesPage(ctk.CTkFrame):
 
     # ------------------------------------------------------------ api
     def get_sources(self) -> list[str]:
-        return list(self._sources)
+        """Return sources list + saved_subs files (from "Импорт" tab) if toggle is ON.
+
+        saved_subs/*.txt are added to the sources list so pipeline tests them
+        TOGETHER with the main sources.txt subscriptions.
+        """
+        sources = list(self._sources)
+        if not self._use_saved_subs:
+            return sources
+        try:
+            from ..paths import data_dir
+            saved_dir = data_dir() / "saved_subs"
+            if saved_dir.exists():
+                for f in sorted(saved_dir.glob("*.txt")) + sorted(saved_dir.glob("*.json")):
+                    if f.name == "README.txt":
+                        continue
+                    fp = str(f.resolve())
+                    if fp not in sources:
+                        sources.append(fp)
+        except Exception:
+            pass
+        return sources
+
+    def _on_saved_subs_toggle(self) -> None:
+        self._use_saved_subs = bool(self.chk_saved_subs.get())
+        self._update_saved_count()
+        if self._use_saved_subs:
+            self.app.show_status("Импортированные подписки ВКЛЮЧЕНЫ (добавлены к sources.txt)")
+        else:
+            self.app.show_status("Импортированные подписки ВЫКЛЮЧЕНЫ")
+
+    def _update_saved_count(self) -> None:
+        try:
+            from ..paths import data_dir
+            saved_dir = data_dir() / "saved_subs"
+            if saved_dir.exists():
+                files = [f for f in (list(saved_dir.glob("*.txt")) + list(saved_dir.glob("*.json")))
+                         if f.name != "README.txt"]
+                self.lbl_saved_count.configure(text=f"Найдено: {len(files)}")
+            else:
+                self.lbl_saved_count.configure(text="Найдено: 0")
+        except Exception:
+            self.lbl_saved_count.configure(text="Найдено: ?")
 
     def set_sources(self, urls: list[str]) -> None:
         self._sources = list(urls)

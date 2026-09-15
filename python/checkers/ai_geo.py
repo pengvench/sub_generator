@@ -102,6 +102,13 @@ class AiGeoResult:
     cf_source: str = ""  # какой из эндпоинтов ответил (chatgpt.com / claude.ai)
     google_country: str = ""  # страна из футера Google (пусто = не спарсился)
     gemini_reachable: bool = False
+    # v11: Дополнительные источники гео для консенсуса.
+    # Проблема старой логики: CF trace показывает гео CF-кеша, не exit-IP.
+    # Если узел — CF Worker, loc всегда страна CF-ноды (часто US), а реальный
+    # exit может быть в UK. ipinfo/ip-api запрашивают exit-IP напрямую.
+    ipinfo_country: str = ""  # ISO-код от ipinfo.io/json
+    ipapi_country: str = ""   # ISO-код от ip-api.com/json
+    consensus_country: str = ""  # финальный вердикт (консенсус 2-of-3)
     # Вердикты.
     openai_ok: bool = False  # CF слепок != RU
     gemini_ok: bool = False  # Google footer != Россия
@@ -117,6 +124,9 @@ class AiGeoResult:
             "cf_source": self.cf_source,
             "google_country": self.google_country,
             "gemini_reachable": self.gemini_reachable,
+            "ipinfo_country": self.ipinfo_country,
+            "ipapi_country": self.ipapi_country,
+            "consensus_country": self.consensus_country,
             "openai_ok": self.openai_ok,
             "gemini_ok": self.gemini_ok,
             "ai_unblocked": self.ai_unblocked,
@@ -264,6 +274,111 @@ def _probe_gemini(
     return bool(ok and status in (200, 302))
 
 
+# v11: прямые гео-пробы exit-IP.
+# ipinfo.io/json — бесплатный лимит 50k/мес с любого IP, отдаёт {"country":"XX"}.
+# ip-api.com/json — бесплатный лимит 45/мин с любого IP, отдаёт {"countryCode":"XX"}.
+# Оба запрашивают ГЕО ВЫХОДНОГО IP прокси-узла, а не гео кеша (как CF trace).
+# Это критично: CF Worker-узлы показывают CF-гео (часто US), а реальный exit
+# может быть в UK/EU — пользователь видит "ПХ: вы из Америки" при подключении
+# к британскому прокси. ipinfo/ip-api дают реальный exit-гео.
+_IPINFO_RE = re.compile(rb'"country"\s*:\s*"([A-Za-z]{2})"')
+_IPAPI_RE = re.compile(rb'"countryCode"\s*:\s*"([A-Za-z]{2})"')
+
+
+def _probe_ipinfo(
+    socks_host: str,
+    socks_port: int,
+    timeout: float,
+) -> str:
+    """Запрос ipinfo.io/json через прокси. Возвращает ISO-код страны или ''."""
+    ok, body, status = base.http_get_body(
+        socks_host,
+        socks_port,
+        "ipinfo.io",
+        443,
+        "ipinfo.io",
+        "/json",
+        timeout=timeout,
+        max_bytes=8 * 1024,
+    )
+    if not ok or status != 200 or not body:
+        return ""
+    match = _IPINFO_RE.search(body)
+    if match is None:
+        return ""
+    return match.group(1).decode("ascii", errors="replace").upper()
+
+
+def _probe_ipapi(
+    socks_host: str,
+    socks_port: int,
+    timeout: float,
+) -> str:
+    """Запрос ip-api.com/json через прокси. Возвращает ISO-код страны или ''.
+
+    ip-api.com работает по HTTP (без TLS) на 80 порту — это даже надёжнее
+    через прокси (нет TLS-handshake DPI-риска). Но мы используем HTTPS на 443
+    для единообразия — ip-api.com поддерживает и то, и другое.
+    """
+    ok, body, status = base.http_get_body(
+        socks_host,
+        socks_port,
+        "ip-api.com",
+        443,
+        "ip-api.com",
+        "/json",
+        timeout=timeout,
+        max_bytes=8 * 1024,
+    )
+    if not ok or status != 200 or not body:
+        return ""
+    match = _IPAPI_RE.search(body)
+    if match is None:
+        return ""
+    return match.group(1).decode("ascii", errors="replace").upper()
+
+
+def _consensus_country(
+    cf_loc: str,
+    ipinfo_country: str,
+    ipapi_country: str,
+) -> str:
+    """Консенсус гео из 3 источников. Возвращает ISO-код страны или ''.
+
+    Логика (v11):
+    - Если 2+ источника согласны — берём их значение.
+    - Если все три разные — приоритет ipinfo (самый точный для non-CF exit).
+    - Если доступен только один — берём его.
+    - Если ни одного — ''.
+
+    CF trace понижен: на CF-Worker узлах он показывает гео CF-кеша (US/EU),
+    а не реальный exit. ipinfo/ip-api запрашивают exit-IP напрямую.
+    """
+    votes: list[str] = []
+    if cf_loc:
+        votes.append(cf_loc)
+    if ipinfo_country:
+        votes.append(ipinfo_country)
+    if ipapi_country:
+        votes.append(ipapi_country)
+    if not votes:
+        return ""
+    # Подсчёт голосов.
+    counts: dict[str, int] = {}
+    for v in votes:
+        counts[v] = counts.get(v, 0) + 1
+    # 2+ согласны — берём.
+    for code, count in counts.items():
+        if count >= 2:
+            return code
+    # Все разные — приоритет ipinfo, потом ip-api, потом CF.
+    if ipinfo_country:
+        return ipinfo_country
+    if ipapi_country:
+        return ipapi_country
+    return cf_loc
+
+
 def _run_ai_geo_checks(host: str, port: int, timeout: float) -> AiGeoResult:
     """Выполнить ИИ-гео слепок через локальный SOCKS5-прокси узла."""
     result = AiGeoResult(checked=True)
@@ -271,15 +386,36 @@ def _run_ai_geo_checks(host: str, port: int, timeout: float) -> AiGeoResult:
     result.cf_loc, result.cf_source = _probe_cf_trace(host, port, timeout)
     result.google_country = _probe_google_country(host, port, timeout)
     result.gemini_reachable = _probe_gemini(host, port, timeout)
+    # v11: прямые пробы exit-IP — критичны для CF Worker-узлов, где CF trace
+    # показывает гео CF-кеша, а не реальный exit.
+    result.ipinfo_country = _probe_ipinfo(host, port, timeout)
+    result.ipapi_country = _probe_ipapi(host, port, timeout)
+    result.consensus_country = _consensus_country(
+        result.cf_loc, result.ipinfo_country, result.ipapi_country
+    )
 
+    # v11: вердикт ai_unblocked теперь строится по consensus_country
+    # (а не только по CF), что исправляет ложный «РФ» для CF Worker-узлов.
+    # Старая логика (compute_verdict) оставлена для обратной совместимости.
     result.openai_ok, result.gemini_ok, result.ai_unblocked, result.reason = compute_verdict(
         result.cf_loc, result.google_country
     )
+    # v11: если consensus_country есть — пересобираем вердикт по нему.
+    if result.consensus_country:
+        result.ai_unblocked = not is_russia_iso(result.consensus_country)
+        result.reason = (
+            f"consensus={result.consensus_country} "
+            f"(cf={result.cf_loc or '-'}, ipinfo={result.ipinfo_country or '-'}, "
+            f"ipapi={result.ipapi_country or '-'})"
+        )
     result.details = {
         "cf_loc": result.cf_loc,
         "cf_source": result.cf_source,
         "google_country": result.google_country,
         "gemini_reachable": result.gemini_reachable,
+        "ipinfo_country": result.ipinfo_country,
+        "ipapi_country": result.ipapi_country,
+        "consensus_country": result.consensus_country,
     }
     return result
 

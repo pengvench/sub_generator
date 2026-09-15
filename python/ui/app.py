@@ -19,6 +19,7 @@ from .pages.settings_page import SettingsPage
 from .pages.sources_page import SourcesPage
 from .pages.start_page import StartPage
 from .pages.diag_page import DiagPage
+from .pages.import_page import ImportPage
 
 from .runner import PipelineRunner, build_pipeline_args, filter_sources_by_history
 from .tooltip import CTkToolTip
@@ -224,14 +225,16 @@ class SubGenApp(ctk.CTk):
 
         self.btn_start = self._nav_button(3, "▶ Тестирование", "start")
         self.btn_sources = self._nav_button(4, "📚 Подписки", "sources")
-        self.btn_recheck = self._nav_button(5, "🔁 Перепроверка", "recheck")
-        self.btn_diag = self._nav_button(6, "🔬 Диагностика", "diag")
-        self.btn_log = self._nav_button(7, "📊 Лог", "log")
-        self.btn_settings = self._nav_button(8, "⚙ Настройки", "settings")
+        self.btn_import = self._nav_button(5, "📥 Импорт", "import")
+        self.btn_recheck = self._nav_button(6, "🔁 Перепроверка", "recheck")
+        self.btn_diag = self._nav_button(7, "🔬 Диагностика", "diag")
+        self.btn_log = self._nav_button(8, "📊 Лог", "log")
+        self.btn_settings = self._nav_button(9, "⚙ Настройки", "settings")
 
         self._nav_buttons = {
             "start": self.btn_start,
             "sources": self.btn_sources,
+            "import": self.btn_import,
             "recheck": self.btn_recheck,
             "diag": self.btn_diag,
             "log": self.btn_log,
@@ -274,6 +277,7 @@ class SubGenApp(ctk.CTk):
 
         self.page_start = StartPage(self.pages_frame, self)
         self.page_sources = SourcesPage(self.pages_frame, self)
+        self.page_import = ImportPage(self.pages_frame, self)
         self.page_recheck = RecheckPage(self.pages_frame, self)
         self.page_diag = DiagPage(self.pages_frame, self)
         self.page_log = LogPage(self.pages_frame, self)
@@ -282,6 +286,7 @@ class SubGenApp(ctk.CTk):
         self.pages = {
             "start": self.page_start,
             "sources": self.page_sources,
+            "import": self.page_import,
             "recheck": self.page_recheck,
             "diag": self.page_diag,
             "log": self.page_log,

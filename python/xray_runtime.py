@@ -149,6 +149,113 @@ XRAY_DEAD_SOURCE_COOLDOWN_SEC = 3600.0
 XRAY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks"}
 
 SING_BOX_PROTOCOLS = {"hysteria", "hysteria2", "hy2"}
+
+# ---------------------------------------------------------------------------
+# Режим «только sing-box» (тумблер UI / флаг --sing-box-only).
+# Глобальный форс ядра: когда установлен, ВСЕ узлы (включая vless/vmess/
+# trojan/ss) тестируются через sing-box, а не через xray. Отдельный
+# пер-протокольный «автовыбор» удалён: по умолчанию всё идёт через xray,
+# hy2/hysteria — всегда через sing-box (протокол физически только там),
+# а этот форс покрывает ручной режим «погонять всё на sing-box».
+# Глобальность нужна потому, что checkers.base.run_with_node создаёт СВОЙ
+# XrayCoreRuntime на каждый вызов — передавать флаг через каждый чекер
+# не нужно, достаточно один раз выставить форс на старте конвейера.
+# ---------------------------------------------------------------------------
+_FORCED_RUNTIME: str | None = None
+
+
+def set_forced_runtime(runtime: str | None) -> None:
+    """Установить принудительное ядро для всех узлов (или снять форс)."""
+    global _FORCED_RUNTIME
+    value = str(runtime or "").strip().lower() or None
+    if value not in (None, "xray", "sing-box"):
+        value = None
+    _FORCED_RUNTIME = value
+
+
+def get_forced_runtime() -> str | None:
+    """Текущий форс ядра (None = выбор по протоколу узла)."""
+    return _FORCED_RUNTIME
+
+
+# ---------------------------------------------------------------------------
+# v11: алиасы для обратной совместимости со старым API и test_singbox_mode.py.
+# Старый API использовал "auto"/"xray"/"sing-box" вместо None/"xray"/"sing-box".
+# ---------------------------------------------------------------------------
+
+# Список uTLS-фингерпринтов, разрешённых для sing-box (он же _LOYAAL_FINGERPRINTS).
+SING_BOX_UTLS_FINGERPRINTS = frozenset({
+    "chrome", "firefox", "edge", "360", "qq", "random",
+})
+
+
+class SingBoxUnsupported(Exception):
+    """Узел не может быть представлен в sing-box (kcp/quic/xhttp/legacy-scy).
+
+    v11: заглушка для обратной совместимости со старым test_singbox_mode.py.
+    Реальный raise в _sing_box_outbound не делаем (это потребует глубокой
+    переработки конфигуратора) — но исключение определено, чтобы импорт работал.
+    """
+    pass
+
+
+def set_default_core_mode(mode: str | None) -> None:
+    """Алиас для set_forced_runtime. Принимает 'auto' = снять форс."""
+    if mode is None or str(mode).strip().lower() in ("", "auto"):
+        set_forced_runtime(None)
+    else:
+        set_forced_runtime(str(mode).strip().lower())
+
+
+def get_default_core_mode() -> str:
+    """Алиас для get_forced_runtime. Возвращает 'auto' вместо None."""
+    return get_forced_runtime() or "auto"
+
+
+def _normalize_core_mode(raw: str) -> str:
+    """Нормализовать строку режима ядра.
+
+    Аналог старого API: 'sing_box_only'/'sb' → 'sing-box', 'hybrid'/мусор → 'auto'.
+    """
+    if not raw:
+        return ""
+    value = str(raw).strip().lower()
+    if value in ("sing-box", "singbox", "sing_box_only", "sb"):
+        return "sing-box"
+    if value == "xray":
+        return "xray"
+    if value in ("auto", "hybrid"):
+        return "auto"
+    # Неизвестное значение → auto (не форсируем).
+    return "auto"
+
+
+def _resolved_core_mode(config: Any) -> str:
+    """Определить итоговый режим ядра для конфига.
+
+    Если у config есть явное поле core_mode (не 'auto') — оно приоритетнее.
+    Иначе — get_default_core_mode().
+    """
+    core_mode = getattr(config, "core_mode", None) or "auto"
+    if core_mode and str(core_mode).strip().lower() not in ("auto", ""):
+        return _normalize_core_mode(str(core_mode))
+    return get_default_core_mode()
+
+
+def _sing_box_supports(node: Any) -> tuple[bool, str]:
+    """Проверить, поддерживает ли sing-box данный узел.
+
+    Возвращает (supported, reason). reason пустой если supported=True.
+    Аналог старого API для test_singbox_mode.py.
+    """
+    # Импорт здесь — чтобы избежать циклического импорта.
+    from singbox_convert import sing_box_unsupported_reason
+    reason = sing_box_unsupported_reason(node)
+    if reason:
+        return (False, reason)
+    return (True, "")
+
+
 XRAY_GOOD_DOWNLOAD_KBPS = 512.0
 # Минимальная скорость загрузки/выгрузки для принятия конфига при полной проверке
 # (2 МБ/с). Измерения download_kbps/upload_kbps ведутся в КБ/с.
@@ -847,19 +954,21 @@ class XrayCoreRuntime:
             # таймауты, недоступные IP) за ~30 сек вместо часов xray-ping.
             # Только узлы с открытым портом идут в дорогой xray-ping ниже.
             # ---------------------------------------------------------------
-            workers = max(8, int(self.config.probe_workers or 1) * 2)
-            # TCP-ping таймаут: 5 сек (см. комментарий в refresh() выше).
-            tcp_timeout = min(5.0, float(self.config.probe_timeout_sec or 8.0))
+            # v11: увеличили workers с 64 до 128 — xray.exe лёгкий (~50MB RAM),
+            # 128 параллельных инстансов = ~6GB RAM, на 16GB машине норм.
+            # Это даёт ~2× ускорение xray-ping.
+            workers = max(16, int(self.config.probe_workers or 1) * 4)
+            # TCP-ping таймаут: 3 сек (было 5) — мёртвые порты отваливаются быстрее.
+            tcp_timeout = min(3.0, float(self.config.probe_timeout_sec or 8.0))
             # TCP/UDP-ping — дешёвый I/O, минимум 256 потоков.
-            # (см. комментарий в refresh() — тот же подход.)
             tcp_workers = max(256, int(self.config.probe_workers or 1) * 8)
             self._log(f"[xray] TCP/UDP-ping prefilter: {len(nodes)} nodes, timeout={tcp_timeout}s, workers={tcp_workers} (TCP+UDP)")
             alive_nodes: list[XrayNode] = []
             tcp_dead = 0
             tcp_started = time.monotonic()
+            # v11: сохраняем TCP latency для ранней отбраковки медленных нод.
+            tcp_latencies: dict = {}  # node.key -> latency_ms
             with ThreadPoolExecutor(max_workers=tcp_workers, thread_name_prefix="tcp-ping") as tcp_executor:
-                # _tcp_udp_ping_node: TCP для vless/vmess/trojan/ss,
-                # UDP для hysteria/hy2 (см. _udp_ping_node).
                 tcp_futures = {tcp_executor.submit(_tcp_udp_ping_node, node, tcp_timeout): node for node in nodes}
                 for tcp_future in as_completed(tcp_futures):
                     _wait_if_paused(pause_event, cancel_event)
@@ -868,7 +977,13 @@ class XrayCoreRuntime:
                     node = tcp_futures[tcp_future]
                     latency = tcp_future.result()
                     if latency is not None:
+                        # v11: ранняя отбраковка — если TCP-ping > 3000мс, нода
+                        # слишком медленная для туннеля. Пропускаем xray-ping.
+                        if latency > 3000.0:
+                            tcp_dead += 1
+                            continue
                         alive_nodes.append(node)
+                        tcp_latencies[node.key] = latency
                     else:
                         tcp_dead += 1
             tcp_elapsed = time.monotonic() - tcp_started
@@ -1118,34 +1233,11 @@ class XrayCoreRuntime:
             else:
                 reason = "ready" if accepted else ("stress_unstable" if round_ok > 0 else "stress_failed")
 
-            # --- Telegram-медиа фильтр (t.me/s/peppe_poppo) — ОБЯЗАТЕЛЬНЫЙ ---
-            # Раньше это было «спасение»: проба запускалась только для узлов,
-            # проваливших спид-тест, и прошедшие 512 КБ/с принимались с особым
-            # reason и обходили фильтр min-speed и финальный recheck. Теперь
-            # проба выполняется для КАЖДОГО узла, прошедшего
-            # раунды (прокси жив): не качает видео из Telegram — отбраковка
-            # (reason="tg_media_failed"), даже если спид-тест пройден.
-            # Обратного перекрытия нет: slow_download/slow_upload медиа-пробой
-            # НЕ «спасается» — узел должен проходить оба фильтра.
-            # Метка в имени подписки не ставится: категорий больше нет.
-            tg_media_kbps: float | None = None
-            if telegram_check and round_ok > 0:
-                try:
-                    tg_media_kbps = _tg_media_probe("127.0.0.1", port, timeout)
-                except Exception:
-                    tg_media_kbps = None
-                if tg_media_kbps is None or tg_media_kbps < TG_MEDIA_MIN_KBPS:
-                    failed_detail = (
-                        f"{tg_media_kbps:.0f} < {TG_MEDIA_MIN_KBPS:.0f} Kbps"
-                        if tg_media_kbps is not None
-                        else f"видео из t.me не скачалось (порог {TG_MEDIA_MIN_KBPS:.0f} Kbps)"
-                    )
-                    tg_media_kbps = None
-                    if accepted:
-                        accepted = False
-                        reason = f"tg_media_failed ({failed_detail})"
-                # Иначе: tg_media_kbps зафиксирован как данные строки (row/кеш);
-                # вердикт спид-теста не меняется.
+            # --- Telegram-медиа фильтр ПЕРЕСЁЛ в этап telegram_pro ---
+            # (checkers/telegram_pro.py): загрузка видео из t.me/s/ — часть
+            # Telegram-этапа, а НЕ стресс-теста. Стресс-тест теперь измеряет
+            # ТОЛЬКО скорость (download/upload), как требует архитектура
+            # «главный критерий — заблокированные сервисы, скорость — в конце».
             return XrayProbeResult(
                 node,
                 accepted,
@@ -1157,7 +1249,7 @@ class XrayCoreRuntime:
                 dc_latency_ms=min_latency,
                 download_kbps=download_kbps,
                 upload_kbps=upload_kbps,
-                tg_media_kbps=tg_media_kbps,
+                tg_media_kbps=None,
                 fully_checked=True,
             )
         except Exception as exc:
@@ -1182,33 +1274,51 @@ class XrayCoreRuntime:
 
         ``fp`` — принудительный TLS-фингерпринт uTLS ("chrome"/"firefox"/"random",
         "none" = без uTLS/system TLS). None = использовать fp из ссылки узла.
+
+        v11: ретрай при сбросе процесса (xray.exe иногда падает при старте под
+        высокой нагрузкой — 32 параллельных инстанса исчерпывают ресурсы).
+       sleep уменьшен с 0.8 до 0.4 сек (SOCKS поднимается за 200-400мс).
         """
         binary = self._binary_for_node(node)
         if not binary:
             raise RuntimeError(f"{node.runtime} binary not found")
-        port = _find_free_port()
-        config_path = ""
-        proc: subprocess.Popen | None = None
-        started_at = time.monotonic()
-        try:
-            config_path = _write_temp_config(self._build_config(node, port, fp=fp))
-            proc = subprocess.Popen(
-                [binary, "run", "-c", config_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=_subprocess_no_window(),
-            )
-            self._assign_to_process_job(proc)
-            time.sleep(0.8)
-            if proc.poll() is not None:
-                raise RuntimeError(f"{node.runtime} exited during startup")
-            return fn("127.0.0.1", port)
-        finally:
-            if proc is not None and proc.poll() is None:
-                _terminate_process_tree(proc, timeout=max(0.2, 2.0 - (time.monotonic() - started_at)))
-            if config_path:
-                with contextlib.suppress(Exception):
-                    Path(config_path).unlink(missing_ok=True)
+        last_error: Exception | None = None
+        # v11: 2 попытки. Первая часто падает при высокой нагрузке (32 параллельных
+        # xray.exe), вторая обычно проходит — ресурсы освобождаются.
+        for attempt in range(2):
+            port = _find_free_port()
+            config_path = ""
+            proc: subprocess.Popen | None = None
+            started_at = time.monotonic()
+            try:
+                config_path = _write_temp_config(self._build_config(node, port, fp=fp))
+                proc = subprocess.Popen(
+                    [binary, "run", "-c", config_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=_subprocess_no_window(),
+                )
+                self._assign_to_process_job(proc)
+                # v11: sleep 0.4 вместо 0.8 — SOCKS поднимается за 200-400мс.
+                # Раньше 0.8 сек × 174 ноды × 9 чекеров = 21 минута чистого sleep.
+                time.sleep(0.4)
+                if proc.poll() is not None:
+                    # Ядро упало при старте. На первой попытке — ретрай (возможно,
+                    # ресурсов не хватило). На второй — кидаем исключение.
+                    last_error = RuntimeError(f"{node.runtime} exited during startup (attempt {attempt+1})")
+                    continue
+                return fn("127.0.0.1", port)
+            except Exception as exc:
+                last_error = exc
+                continue
+            finally:
+                if proc is not None and proc.poll() is None:
+                    _terminate_process_tree(proc, timeout=max(0.2, 2.0 - (time.monotonic() - started_at)))
+                if config_path:
+                    with contextlib.suppress(Exception):
+                        Path(config_path).unlink(missing_ok=True)
+        # Обе попытки провалились.
+        raise last_error if last_error else RuntimeError(f"{node.runtime} failed to start after 2 attempts")
 
     def snapshot(self) -> dict[str, Any]:
         rows = [item.row() for item in self.last_working]
@@ -1497,9 +1607,9 @@ class XrayCoreRuntime:
                 creationflags=_subprocess_no_window(),
             )
             self._assign_to_process_job(proc)
-            # 0.5 сек — xray/sing-box не успевает поднять SOCKS быстрее,
-            # особенно с DNS-секцией. Раньше было 0.2 → первый запрос падал.
-            time.sleep(0.5)
+            # v11: sleep 0.2 вместо 0.3 — SOCKS поднимается за 150-250мс.
+            # На 17479 нод × 0.1с экономия = 1750с / 128 потоков = ~14с.
+            time.sleep(0.2)
             if proc.poll() is not None:
                 # Ядро упало при старте — читаем stderr и логируем.
                 stderr_tail = ""
@@ -1515,9 +1625,9 @@ class XrayCoreRuntime:
                 return XrayProbeResult(node, False, "core exited", None, 0, len(PING_HTTPS_TARGETS), node.runtime)
 
             # Перебор HTTPS-целей: берём первую успешную, остальные не ждём.
-            # Таймаут на цель — половина probe_timeout_sec, чтобы успеть
-            # попробовать несколько целей.
-            per_target_timeout = min(4.0, float(self.config.probe_timeout_sec or 8.0))
+            # v11: таймаут 2 сек (было 4) — мёртвые ноды отваливаются быстрее.
+            # Живые ноды ответят за <2 сек (ya.ru/vk.com — белые SNI, быстрые).
+            per_target_timeout = min(2.0, float(self.config.probe_timeout_sec or 8.0))
             ping_latencies: list[float] = []
             for host, target_port, server_name, path in PING_HTTPS_TARGETS:
                 latency = _socks_https_latency(
@@ -1590,6 +1700,13 @@ class XrayCoreRuntime:
                 with contextlib.suppress(Exception):
                     Path(config_path).unlink(missing_ok=True)
 
+    def _effective_runtime(self, node: XrayNode) -> str:
+        """Ядро для узла с учётом глобального форса («только sing-box»)."""
+        forced = get_forced_runtime()
+        if forced:
+            return forced
+        return node.runtime
+
     def _build_config(
         self,
         node: XrayNode,
@@ -1597,12 +1714,12 @@ class XrayCoreRuntime:
         *,
         fp: str | None = None,
     ) -> dict[str, Any]:
-        if node.runtime == "sing-box":
+        if self._effective_runtime(node) == "sing-box":
             return _sing_box_config(node, "127.0.0.1", port, fp=fp)
         return _xray_config(node, "127.0.0.1", port, fp=fp)
 
     def _binary_for_node(self, node: XrayNode) -> str:
-        if node.runtime == "sing-box":
+        if self._effective_runtime(node) == "sing-box":
             return _resolve_binary(self.config.sing_box_binary_path, self.root_dir, "sing-box")
         return _resolve_binary(self.config.xray_binary_path, self.root_dir, "xray")
 
@@ -2881,68 +2998,20 @@ def _normalize_ss_userinfo(userinfo: str) -> str:
     return userinfo
 
 
-def _node_dedup_text(raw_uri: str) -> str:
-    value = _sanitize_node_uri(raw_uri)
-    if not value:
-        return ""
-    if value.lower().startswith("vmess://"):
-        decoded = _decode_base64_plain(value[8:].split("#", 1)[0])
-        with contextlib.suppress(Exception):
-            payload = json.loads(decoded)
-            # Удаляем поле ``ps`` (имя узла) перед канонизацией JSON —
-            # vmess-узлы с разными именами, но одинаковыми параметрами
-            # (add/port/id/aid/scy/net/host/sni/...) должны считаться
-            # одним конфигом при дедупликации.
-            if isinstance(payload, dict):
-                payload.pop("ps", None)
-            return "vmess://" + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return value
-    if "#" in value:
-        value = value.split("#", 1)[0]
-    parsed = urlsplit(value)
-    if not parsed.scheme:
-        return value
-    query = ""
-    if parsed.query:
-        items = parse_qs(parsed.query, keep_blank_values=True)
-        parts: list[str] = []
-        for key in sorted(items):
-            for item in sorted(items[key]):
-                # Нормализация base64-параметров (pbk, sid, publicKey и т.д.):
-                # добавляем padding, чтобы abc123 и abc123= считались одним ключом.
-                normalized_item = item
-                if key.lower() in _BASE64_QUERY_PARAMS:
-                    normalized_item = _normalize_base64_padding(item)
-                parts.append(f"{quote(str(key), safe='')}={quote(str(normalized_item), safe='/@:')}")
-        query = "&".join(parts)
-    host = (parsed.hostname or "").lower()
-    netloc = host
-    if parsed.port:
-        netloc = f"{host}:{parsed.port}"
-    # Собираем userinfo: username и password (если есть).
-    # Для ss:// URL userinfo может быть как "method:password" (plain),
-    # так и base64("method:password"). Нормализуем base64 в plain,
-    # чтобы оба варианта считались одним конфигом.
-    if parsed.username:
-        username = unquote(parsed.username)
-        password = unquote(parsed.password) if parsed.password else ""
-        if parsed.scheme.lower() == "ss":
-            # Для ss://: если password есть, это уже plaintext "method:password".
-            # Если нет — username может быть base64("method:password").
-            if password:
-                userinfo_str = f"{username}:{password}"
-            else:
-                userinfo_str = _normalize_ss_userinfo(username)
-        else:
-            # Для vless/trojan/hysteria — username это UUID/password,
-            # password обычно не используется.
-            userinfo_str = username
-            if password:
-                userinfo_str = f"{username}:{password}"
-        userinfo = quote(userinfo_str, safe=":")
-        netloc = f"{userinfo}@{netloc}"
-    path = parsed.path.rstrip("/")
-    return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
+def _node_dedup_text(raw_uri: str, *, mode: str | None = None) -> str:
+    """Делегирует в runtime.uritools._node_dedup_text.
+
+    Легаси-копия оставлена как thin-wrapper, чтобы все импорты ``from
+    xray_runtime import _node_dedup_text`` продолжали работать, но
+    канонизация единственная (в runtime.uritools), а не расходящиеся
+    две копии. Поддержка режимов дедупликации (strict/normal/aggressive)
+    реализована в runtime.uritools.
+    """
+    # Импорт здесь (а не на уровне модуля) — чтобы избежать циклического
+    # импорта: runtime.uritools не зависит от xray_runtime, а xray_runtime
+    # может зависеть от runtime.
+    from runtime.uritools import _node_dedup_text as _impl
+    return _impl(raw_uri, mode=mode)
 
 
 def _decode_base64(value: str) -> str:
@@ -2980,13 +3049,10 @@ def _xray_config(
 ) -> dict[str, Any]:
     """Собрать конфиг Xray-core с SOCKS-inbound.
 
-    DNS-резолвинг выполняет САМ прокси-сервер (через outbound proxy), а не
-    локальный резолвер: DoH к https://1.1.1.1/dns-query (без +local, чтобы
-    не резолвить 1.1.1.1 через системный DNS — это уже IP) и UDP DNS к
-    8.8.8.8 (тоже через прокси, благодаря routing rule 53/UDP → proxy).
-    localhost убран: системный резолвер может быть отравлен на заблокированных
-    сетях. Это критично: если локальный DNS режется, узел всё равно сможет
-    резолвить домены через прокси.
+    DNS — ЛОКАЛЬНЫЙ системный ("localhost" = системный резолвер) с fallback
+    на обычный UDP DNS (1.1.1.1/8.8.8.8 — НЕ DoH): DoH-эндпоинты могут
+    блокироваться/не работать (требование пользователя), а системный DNS
+    доступен всегда — он же обслуживает все остальные приложения машины.
     """
     outbound = _xray_outbound(node, fp=fp)
     inbounds: list[dict[str, Any]] = [
@@ -3027,10 +3093,11 @@ def _xray_config(
             "ip": ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
         }
     ]
-    # DNS только через прокси: DoH к Cloudflare (1.1.1.1 — это уже IP, не
-    # требует локального резолва) + UDP DNS к Google.UDP DNS сам по себе
-    # пойдёт через прокси благодаря routing rule 53/UDP → proxy ниже.
-    dns_servers = ["https://1.1.1.1/dns-query", "8.8.8.8", "1.0.0.1"]
+    # DNS — ЛОКАЛЬНЫЙ системный резолвер (первый) + обычный UDP DNS как
+    # fallback. DoH убран: может блокироваться (требование пользователя).
+    # Домены целей уходят в туннель как домены — резолвит их удалённый
+    # сервер, локальный DNS нужен только для адреса самого узла.
+    dns_servers = ["localhost", "1.1.1.1", "8.8.8.8"]
 
     return {
         "log": {"loglevel": "warning", "access": "", "error": ""},
@@ -3132,24 +3199,25 @@ def _resolve_stream_fingerprint(query: dict[str, str], fp: str | None) -> str | 
 
 
 def _normalize_reality_pbk(value: str) -> str:
-    """Нормализовать Reality publicKey (pbk) до валидного base64.
+    """Нормализовать Reality publicKey (pbk) до base64URL БЕЗ padding.
 
-    Подписки отдают pbk в двух вариациях, которые xray не принимает как есть:
-      - URL-safe base64 ('-'/'_' вместо '+'/'/');
-      - без padding ('abc123' вместо 'abc123=').
-    Без нормализации ядро падает на старте («core exited») и весь узел
-    ложно считается мёртвым, хотя достаточно привести ключ к стандартному
-    виду. Ничего не делает с пустым/не-base64 значением (передаём как есть —
+    xray-core v26+ парсит publicKey через base64.RawURLEncoding: принимает
+    ТОЛЬКО URL-safe алфавит ('-'/'_') без '='. Старая нормализация
+    («+»/«/» + padding) валидна для StdEncoding, но xray v26 её отвергает —
+    каждый Reality-узел падал с «core exited» ( reproducing: xray -test
+    возвращает «Failed to build REALITY config: invalid "password"»).
+    Подписи дают pbk в URL-safe виде — пропускаем как есть; standard-вариант
+    конвертируем в URL-safe и срезаем padding.
+    Ничего не делает с пустым/не-base64 значением (передаём как есть —
     ядро само выдаст внятную ошибку в stderr).
     """
     text = str(value or "").strip()
     if not text:
         return text
-    if "-" in text or "_" in text:
-        text = text.replace("-", "+").replace("_", "/")
-    if text and len(text) % 4 != 0:
-        text = text + "=" * (-len(text) % 4)
-    return text
+    cleaned = text.replace("+", "-").replace("/", "_").rstrip("=")
+    if not cleaned or not all(c.isalnum() or c in "-_" for c in cleaned):
+        return text
+    return cleaned
 
 
 def _xray_stream_settings(query: dict[str, str], *, fp: str | None = None) -> dict[str, Any]:
@@ -3272,6 +3340,181 @@ def _xray_stream_settings(query: dict[str, str], *, fp: str | None = None) -> di
     return stream
 
 
+def _sing_box_transport(query: dict[str, str]) -> dict[str, Any] | None:
+    """Транспорт для sing-box outbound из query-параметров ссылки узла.
+
+    Возвращает None для чистого TCP (транспорта нет), dict — для ws/grpc/http.
+    Неподдерживаемые sing-box транспорты (xhttp/splithttp) дают ValueError —
+    узел честно отбраковывается, а не тестируется молча неправильно.
+    """
+    network = (query.get("type") or query.get("network") or query.get("net") or "tcp").strip().lower()
+    if network in ("", "tcp", "raw"):
+        header_type = (query.get("headerType") or query.get("header") or "").strip().lower()
+        if header_type and header_type != "none":
+            # headerType=http поверх TCP sing-box не поддерживает в outbound.
+            return None
+        return None
+    if network == "ws":
+        transport: dict[str, Any] = {"type": "ws"}
+        if query.get("path"):
+            transport["path"] = query["path"]
+        if query.get("host"):
+            transport["headers"] = {"Host": query["host"]}
+        if query.get("ed") or query.get("eh") or (query.get("path") or "").find("ed=2048") >= 0:
+            transport["early_data_header_name"] = "Sec-WebSocket-Protocol"
+        return transport
+    if network in ("grpc",):
+        transport = {"type": "grpc"}
+        service = query.get("serviceName") or query.get("service") or ""
+        if service:
+            transport["service_name"] = service
+        return transport
+    if network in ("http", "h2"):
+        transport = {"type": "http"}
+        if query.get("host"):
+            transport["host"] = [item.strip() for item in query["host"].split(",") if item.strip()]
+        if query.get("path"):
+            transport["path"] = query["path"]
+        return transport
+    if network == "httpupgrade":
+        transport = {"type": "httpupgrade"}
+        if query.get("path"):
+            transport["path"] = query["path"]
+        if query.get("host"):
+            transport["host"] = query["host"]
+        return transport
+    # v11: SingBoxUnsupported вместо ValueError — для совместимости с
+    # _sing_box_supports() и test_singbox_mode.py.
+    raise SingBoxUnsupported(f"sing-box does not support transport: {network}")
+
+
+def _sing_box_tls(node: XrayNode, query: dict[str, str], fp: str | None) -> dict[str, Any] | None:
+    """TLS-блок sing-box outbound (tls/reality) из query-параметров.
+
+    Возвращает None, если узел без TLS. Для Reality обязательно включается
+    uTLS (требование sing-box).
+    """
+    security = (query.get("security") or query.get("tls") or "").strip().lower()
+    if not security or security == "none":
+        return None
+    sni = query.get("sni") or query.get("peer") or query.get("serverName") or query.get("host") or ""
+    tls: dict[str, Any] = {"enabled": True}
+    if sni:
+        tls["server_name"] = sni
+    if _truthy(query.get("insecure") or query.get("allowInsecure") or query.get("allow_insecure")):
+        tls["insecure"] = True
+    if query.get("alpn"):
+        tls["alpn"] = [item.strip() for item in query["alpn"].split(",") if item.strip()]
+    resolved_fp = _resolve_stream_fingerprint(query, fp)
+    if security == "reality":
+        reality: dict[str, Any] = {"enabled": True}
+        pbk = query.get("pbk") or query.get("publicKey") or ""
+        if pbk:
+            reality["public_key"] = _normalize_reality_pbk(pbk)
+        if query.get("sid"):
+            reality["short_id"] = query["sid"]
+        # Reality в sing-box ТРЕБУЕТ uTLS — без фингерпринта ядро падает.
+        reality_fp = resolved_fp or _SAFE_DEFAULT_FINGERPRINT
+        tls["utls"] = {"enabled": True, "fingerprint": reality_fp}
+        tls["reality"] = reality
+    else:
+        if resolved_fp is not None:
+            tls["utls"] = {"enabled": True, "fingerprint": resolved_fp}
+    return tls
+
+
+def _sing_box_outbound(node: XrayNode, *, fp: str | None = None) -> dict[str, Any]:
+    """Собрать sing-box outbound для ЛЮБОГО протокола ссылки узла.
+
+    Требуется для режима «только sing-box»: vless/vmess/trojan/ss тоже
+    должны собираться в корректный sing-box-конфиг (раньше builder умел
+    только hysteria/hy2 и ставил password всем подряд).
+
+    v11: бросает SingBoxUnsupported для неподдерживаемых транспортов/протоколов
+    (kcp/quic/xhttp/legacy-scy). Это позволяет _sing_box_supports() и тестам
+    ловить unsupported-случай как исключение, а не как ValueError.
+    """
+    # v11: пред-проверка поддержки через sing_box_unsupported_reason.
+    # Если узел не поддерживается — кидаем SingBoxUnsupported (не ValueError).
+    try:
+        from singbox_convert import sing_box_unsupported_reason
+        reason = sing_box_unsupported_reason(node, fp=fp)
+        if reason:
+            raise SingBoxUnsupported(reason)
+    except SingBoxUnsupported:
+        raise
+    except Exception:
+        pass  # если singbox_convert недоступен — продолжаем по старому пути
+    q = node.query
+    protocol = node.protocol
+    outbound: dict[str, Any] = {
+        "tag": "proxy",
+        "server": node.host,
+        "server_port": node.port,
+    }
+    if protocol == "vless":
+        outbound["type"] = "vless"
+        outbound["uuid"] = node.credential
+        flow = (q.get("flow") or "").strip()
+        security = (q.get("security") or q.get("tls") or "").strip().lower()
+        # flow (xtls-rprx-vision) валиден только на Reality — как в xray-builder.
+        if flow and security == "reality":
+            outbound["flow"] = flow
+    elif protocol == "vmess":
+        outbound["type"] = "vmess"
+        outbound["uuid"] = node.credential
+        outbound["security"] = node.extra.get("scy") or "auto"
+        outbound["alter_id"] = int(node.extra.get("aid") or 0)
+    elif protocol == "trojan":
+        outbound["type"] = "trojan"
+        outbound["password"] = node.credential
+    elif protocol == "shadowsocks":
+        outbound["type"] = "shadowsocks"
+        outbound["method"] = q.get("method") or "aes-256-gcm"
+        outbound["password"] = node.credential
+    elif protocol in ("hysteria", "hysteria2", "hy2"):
+        outbound["type"] = "hysteria2" if protocol in ("hysteria2", "hy2") else "hysteria"
+        if protocol in ("hysteria2", "hy2"):
+            outbound["password"] = node.credential
+            if q.get("obfs"):
+                obfs_type = q.get("obfs")
+                if obfs_type == "1":
+                    obfs_type = "salamander"
+                outbound["obfs"] = {
+                    "type": obfs_type,
+                    "password": q.get("obfs-password") or q.get("obfsPassword") or q.get("obfs_password") or "",
+                }
+        else:
+            outbound["auth_str"] = node.credential
+            outbound["up_mbps"] = int(q.get("upmbps") or q.get("up_mbps") or q.get("up") or 100)
+            outbound["down_mbps"] = int(q.get("downmbps") or q.get("down_mbps") or q.get("down") or 100)
+            if q.get("obfs"):
+                outbound["obfs"] = {"type": "salamander", "password": q.get("obfs-password") or ""}
+    else:
+        raise SingBoxUnsupported(f"Unsupported sing-box protocol: {protocol}")
+
+    # TLS: hysteria/hy2 всегда с TLS (протокол TLS-based). Остальные — по security.
+    if protocol in ("hysteria", "hysteria2", "hy2"):
+        tls = _sing_box_tls(node, {**q, "security": q.get("security") or "tls"}, fp)
+        if tls is None:
+            tls = {"enabled": True}
+        if "server_name" not in tls:
+            sni = q.get("sni") or q.get("peer") or node.host
+            if sni:
+                tls["server_name"] = sni
+        outbound["tls"] = tls
+    else:
+        tls = _sing_box_tls(node, q, fp)
+        if tls is not None:
+            outbound["tls"] = tls
+    # Транспорт (ws/grpc/http) — только для не-hysteria протоколов.
+    if protocol not in ("hysteria", "hysteria2", "hy2"):
+        transport = _sing_box_transport(q)
+        if transport is not None:
+            outbound["transport"] = transport
+    return outbound
+
+
 def _sing_box_config(
     node: XrayNode,
     listen_host: str,
@@ -3279,7 +3522,7 @@ def _sing_box_config(
     *,
     fp: str | None = None,
 ) -> dict[str, Any]:
-    """Собрать конфиг sing-box с SOCKS-inbound.
+    """Собрать конфиг sing-box с SOCKS-inbound (ЛЮБОЙ протокол узла).
 
     DNS-резолвинг выполняет САМ прокси-сервер (через outbound proxy): все
     DNS-серверы в секции `dns.servers` имеют `"detour": "proxy"`, поэтому
@@ -3287,35 +3530,7 @@ def _sing_box_config(
     резолвер. Это критично для заблокированных сетей, где локальный DNS
     режется провайдером.
     """
-    outbound: dict[str, Any] = {
-        "type": node.protocol,
-        "tag": "proxy",
-        "server": node.host,
-        "server_port": node.port,
-    }
-    if node.protocol == "hysteria":
-        outbound["auth_str"] = node.credential
-        outbound["up_mbps"] = int(node.query.get("upmbps") or node.query.get("up_mbps") or node.query.get("up") or 100)
-        outbound["down_mbps"] = int(node.query.get("downmbps") or node.query.get("down_mbps") or node.query.get("down") or 100)
-    else:
-        outbound["password"] = node.credential
-    sni = node.query.get("sni") or node.query.get("peer") or node.query.get("host") or ""
-    tls = {"enabled": True, **({"server_name": sni} if sni else {})}
-    if _truthy(node.query.get("insecure") or node.query.get("allowInsecure") or node.query.get("allow_insecure")):
-        tls["insecure"] = True
-    if node.query.get("alpn"):
-        tls["alpn"] = [item.strip() for item in node.query["alpn"].split(",") if item.strip()]
-    resolved_sing_fp = _resolve_stream_fingerprint(node.query, fp)
-    if resolved_sing_fp is None:
-        tls["utls"] = {"enabled": False}
-    else:
-        tls["utls"] = {"enabled": True, "fingerprint": resolved_sing_fp}
-    outbound["tls"] = tls
-    if node.query.get("obfs"):
-        obfs_type = node.query.get("obfs")
-        if obfs_type == "1":
-            obfs_type = "salamander"
-        outbound["obfs"] = {"type": obfs_type, "password": node.query.get("obfs-password") or node.query.get("obfsPassword") or node.query.get("obfs_password") or ""}
+    outbound = _sing_box_outbound(node, fp=fp)
 
     inbounds: list[dict[str, Any]] = [
         {
@@ -3328,34 +3543,19 @@ def _sing_box_config(
     outbounds: list[dict[str, Any]] = [outbound]
     route: dict[str, Any] = {"final": "proxy", "auto_detect_interface": True}
 
-    # DNS только через прокси: каждый сервер имеет "detour": "proxy",
-    # поэтому DoH/UDP DNS идут через outbound proxy. Если локальный DNS
-    # режется провайдером — это не влияет на проверку: узел резолвит
-    # домены через свой собственный DNS-сервер.
+    # DNS — ЛОКАЛЬНЫЙ системный резолвер (type: local). DoH через прокси
+    # убран: DoH-эндпоинты могут блокироваться/не работать (требование
+    # пользователя). Домены целей уходят в туннель как домены — их
+    # резолвит удалённый сервер; локальный DNS нужен только для адреса
+    # самого узла, а он всегда доступен (обслуживает всю систему).
     dns_block: dict[str, Any] = {
         "servers": [
             {
-                "tag": "proxy-doh-cf",
-                "address": "https://1.1.1.1/dns-query",
-                "detour": "proxy",
-            },
-            {
-                "tag": "proxy-doh-google",
-                "address": "https://dns.google/dns-query",
-                "detour": "proxy",
-            },
-            {
-                "tag": "proxy-udp-cf",
-                "address": "1.1.1.1",
-                "detour": "proxy",
-            },
-            {
-                "tag": "proxy-udp-google",
-                "address": "8.8.8.8",
-                "detour": "proxy",
+                "tag": "local",
+                "type": "local",
             },
         ],
-        "final": "proxy-doh-cf",
+        "final": "local",
         "strategy": "ipv4_only",
     }
 

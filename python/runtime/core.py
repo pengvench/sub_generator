@@ -1546,6 +1546,33 @@ def _collect_from_source(
     log_sink: Callable[[str], None] | None,
     on_source_result: Callable[[str, bool], None] | None,
 ) -> list[XrayNode]:
+    # HARD FIX: If source_url is a direct config (vless://, vmess://, etc),
+    # parse it directly via parse_node_link instead of fetching as HTTP URL.
+    # This protects against bad sources.txt with inline configs even when
+    # the upstream _load_sources filter missed them (e.g. old .exe).
+    _DIRECT_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "hysteria://")
+    if source_url.lower().startswith(_DIRECT_SCHEMES):
+        try:
+            node = parse_node_link(source_url)
+            if node is not None:
+                if log_sink is not None:
+                    log_sink(f"[xray] direct config parsed: {source_url[:80]}")
+                if on_source_result is not None:
+                    on_source_result(source_url, ok=True)
+                return [node]
+        except Exception as exc:
+            if log_sink is not None:
+                log_sink(f"[xray] direct config parse failed {source_url[:80]}: {exc}")
+        if on_source_result is not None:
+            on_source_result(source_url, ok=False)
+        return []
+
+    # Skip comment lines that leaked through (defensive)
+    if source_url.lstrip().startswith("#"):
+        if log_sink is not None:
+            log_sink(f"[xray] skipping comment as source: {source_url[:60]}")
+        return []
+
     try:
         text = _fetch_text(source_url, timeout=timeout, log_sink=log_sink)
     except Exception as exc:

@@ -311,7 +311,7 @@ check("telegram-проверка стоит ДО DPI-этапа",
 check("telegram-блок завершается до DPI (отчёт tg выше dpi)",
       0 < pos_tg_report < pos_dpi, f"tg_report={pos_tg_report} dpi={pos_dpi}")
 check("кэш dpi хранит итог классика+сьют (res.row)",
-      "cache_result(w.node.raw_url, \"dpi\", passed, res.row()" in src)
+      "cache_result(w.node.raw_url, \"dpi\", res.accepted, res.row())" in src)
 check("suite встроен в DPI-этап (log-строка как у юзера)",
       "suite=on (zapret-методика" in src)
 check("DPI+suite-файлы сохраняются из DPI-этапа",
@@ -348,9 +348,10 @@ check("zapret-тьюмблер старой версии НЕ вернулся (
 
 recheck_page = (ROOT / "ui" / "pages" / "recheck_page.py").read_text(encoding="utf-8")
 check("STAGE_ORDER синхронизирован с recheck_page (включая новый порядок)",
-      set(pipeline.STAGE_ORDER) == {"ping", "initial", "telegram_pro", "dpi", "dpi_active",
+      set(pipeline.STAGE_ORDER) == {"ping", "initial", "telegram_pro", "services", "dpi", "dpi_active",
                                     "ai_geo", "route", "resilience", "recheck"}
-      and pipeline.STAGE_ORDER.index("telegram_pro") < pipeline.STAGE_ORDER.index("dpi"))
+      and pipeline.STAGE_ORDER.index("telegram_pro") < pipeline.STAGE_ORDER.index("services")
+      < pipeline.STAGE_ORDER.index("dpi"))
 check("recheck_page: telegram_pro стоит до dpi в списке UI",
       recheck_page.find('("telegram_pro"') < recheck_page.find('("dpi"'))
 

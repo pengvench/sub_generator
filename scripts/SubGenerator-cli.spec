@@ -21,6 +21,13 @@ hiddenimports = [
     'subgen.settings',
     'checkers.dpi', 'checkers.cidr', 'checkers.zapret', 'checkers.base',
     'checkers.initial_check', 'checkers.telegram_pro', 'checkers.route',
+    'checkers.blocked_services', 'checkers.dpi_active', 'checkers.hostres',
+    'checkers.net_baseline', 'checkers.net_diagnostic', 'checkers.resilience',
+    'checkers.tg_media', 'checkers.ai_geo',
+    'ui.app', 'ui.runner', 'ui.paths', 'ui.tooltip', 'ui.theme', 'ui.main',
+    'ui.pages.start_page', 'ui.pages.sources_page', 'ui.pages.log_page',
+    'ui.pages.settings_page', 'ui.pages.recheck_page',
+    'ui.pages.diag_page', 'ui.pages.import_page',
 ]
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

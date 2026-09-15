@@ -3,7 +3,7 @@
 
 Проверяет:
   1. Импорт всех модулей конвейера (топ-уровень).
-  2. Парсер принимает все 9 значений --start-stage из UI (recheck_page).
+  2. Парсер принимает все 10 значений --start-stage из UI (recheck_page).
   3. STAGE_ORDER синхронизирован с ui/pages/recheck_page.py.
   4. run() не падает с NameError: перепроверка без кеша возвращает код 1.
   5. IDNA-фикс: _socks_open_connection в checkers.base больше не использует
@@ -60,8 +60,8 @@ def main() -> int:
     def _stages():
         from subgen.pipeline import build_parser
         parser = build_parser()
-        # 9 значений из recheck_page + устаревший алиас 'zapret' (ремапится на 'dpi').
-        for stage in ("ping", "initial", "dpi", "dpi_active", "telegram_pro", "ai_geo", "route", "resilience", "recheck", "zapret"):
+        # 10 значений из recheck_page + устаревший алиас 'zapret' (ремапится на 'dpi').
+        for stage in ("ping", "initial", "services", "dpi", "dpi_active", "telegram_pro", "ai_geo", "route", "resilience", "recheck", "zapret"):
             args = parser.parse_args(["--start-stage", stage])
             assert args.start_stage == stage, stage
         # алиас ремапится пост-обработкой
@@ -79,7 +79,7 @@ def main() -> int:
         ui = open(os.path.join(ROOT, "ui", "pages", "recheck_page.py"), encoding="utf-8").read()
         ui_stages = set(re.findall(r'\("(\w+)",', ui)) & {
             s for s in re.findall(r'\("(\w+)",', ui)
-            if s in ("ping", "initial", "dpi", "dpi_active", "telegram_pro", "ai_geo", "route", "resilience", "recheck")
+            if s in ("ping", "initial", "services", "dpi", "dpi_active", "telegram_pro", "ai_geo", "route", "resilience", "recheck")
         }
         assert ui_stages == set(STAGE_ORDER), f"{ui_stages} != {set(STAGE_ORDER)}"
         assert "zapret" not in set(STAGE_ORDER), "zapret-этап должен быть объединён с dpi"
@@ -170,10 +170,13 @@ def main() -> int:
         key = base64.b64encode(b"\x01" * 32).decode()
         nopad = key.rstrip("=")
         urlsafe = nopad.replace("+", "-").replace("/", "_")
-        assert xr._normalize_reality_pbk(nopad) == key
-        assert xr._normalize_reality_pbk(urlsafe) == key
+        # xray v26 парсит pbk через RawURLEncoding: результат нормализации —
+        # URL-safe алфавит БЕЗ padding (StdEncoding+padding отвергается ядром).
+        assert xr._normalize_reality_pbk(nopad) == urlsafe, "nopad -> urlsafe"
+        assert xr._normalize_reality_pbk(urlsafe) == urlsafe, "urlsafe as-is"
+        assert xr._normalize_reality_pbk(key) == urlsafe, "std+padding -> urlsafe"
 
-    check("pbk: padding и URL-safe нормализация", _pbk)
+    check("pbk: RawURL без padding (формат xray v26+)", _pbk)
 
     print("=== Тест 8: мёртвое ядро не роняет конвейер ===")
 

@@ -14,12 +14,16 @@
 """
 from __future__ import annotations
 
+import logging
+
 import customtkinter as ctk
 
 from .. import theme
 from ..runner import PipelineOptions
 from ..tooltip import CTkToolTip, info_label
 from subgen.settings import get_test_options, save_test_options
+
+_logger = logging.getLogger(__name__)
 
 HELP = {
     "workers": "Параллельных потоков. 32 — норма.",
@@ -427,8 +431,10 @@ class StartPage(ctk.CTkFrame):
         }
         try:
             save_test_options(opts)
-        except Exception:
-            pass  # настройки — не критичны, не роняем запуск из-за ошибки записи
+        except Exception as exc:
+            # Настройки теста не сохранились — запуск НЕ срываем, но
+            # пользователь должен понять, почему тумблеры «откатились».
+            _logger.warning("настройки теста не сохранены: %s", exc)
 
     # ------------------------------------------------------------ options
     @staticmethod

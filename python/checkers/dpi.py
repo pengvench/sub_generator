@@ -25,9 +25,6 @@ from . import base
 from .base import (
     TCP1620_DETECTED,
     TCP1620_NOT_DETECTED,
-    TCP1620_POSSIBLE,
-    TCP1620_PROBABLY,
-    TCP1620_UNLIKELY,
 )
 
 logger = logging.getLogger(__name__)

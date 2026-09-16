@@ -2,17 +2,17 @@
 from __future__ import annotations
 
 import json
-import os
+import logging
 import threading
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote
+
+_logger = logging.getLogger(__name__)
 
 import customtkinter as ctk
 
 from .. import paths, theme
-from ..tooltip import CTkToolTip
 
 NODE_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "hysteria://")
 
@@ -48,8 +48,10 @@ def _extract_configs(text: str) -> list[str]:
                                     seen.add(config)
                                     configs.append(config)
                                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                # Горячий цикл разбора вставленного текста: битые строки
+                # пропускаем, причину — в debug (SUBGEN_DEBUG=1).
+                _logger.debug("строка импорта пропущена: %s", exc)
     if not configs:
         try:
             data = json.loads(text)
@@ -59,8 +61,9 @@ def _extract_configs(text: str) -> list[str]:
                     if item not in seen:
                         seen.add(item)
                         configs.append(item)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Файл сохранённых конфигов побит/нестандартен — берём что дали.
+            _logger.debug("файл сохранённых конфигов разобран частично: %s", exc)
     return configs
 
 
@@ -188,8 +191,10 @@ class ImportPage(ctk.CTkFrame):
             text = self.app.clipboard_get()
             self.txt_input.delete("1.0", "end")
             self.txt_input.insert("1.0", text)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Пустой/недоступный буфер обмена — пользователь поймёт по пустому
+            # полю, но причину оставляем в предупреждении.
+            _logger.warning("вставка из буфера обмена не удалась: %s", exc)
 
     def _saved_subs_dir(self) -> Path:
         d = paths.data_dir() / "saved_subs"
@@ -239,7 +244,9 @@ class ImportPage(ctk.CTkFrame):
                     text=f"Сохранено {count} конфигов", text_color=theme.SUCCESS))
                 self.after(0, self._refresh_saved_list)
             except Exception as e:
-                self.after(0, lambda: self.lbl_url_status.configure(
+                # Багфикс: e удаляется Python-ом при выходе из except-блока,
+                # а lambda вызывается отложенно (self.after) — привязываем сейчас.
+                self.after(0, lambda e=e: self.lbl_url_status.configure(
                     text=f"Ошибка: {e}", text_color=theme.DANGER))
             finally:
                 self.after(0, lambda: self.btn_import_url.configure(state="normal"))
@@ -292,5 +299,7 @@ class ImportPage(ctk.CTkFrame):
         try:
             path.unlink()
             self._refresh_saved_list()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Пользователь просил удалить файл — молчаливый сбой выглядит
+            # как «кнопка не работает».
+            _logger.warning("не удалось удалить %s: %s", path, exc)

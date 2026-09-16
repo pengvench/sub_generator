@@ -23,6 +23,21 @@ def _fetch_text(
 ) -> str:
     clean_url = str(url or "").strip()
 
+    # Happ (Hiddify) зашифрованные подписки happ://cryptN/... — расшифровываем
+    # RSA-ключом в обычный https:// URL и идём дальше по стандартному пути.
+    # Без ключей / без cryptography — внятная ошибка (не молчаливый fetch failed).
+    if clean_url.lower().startswith("happ://"):
+        from .happ_decrypt import decrypt_happ_link
+        plain_url = decrypt_happ_link(clean_url)
+        if not plain_url:
+            raise RuntimeError(
+                "happ subscription decrypt failed "
+                "(keys in data/happ_keys/pkcs1_keys.json, pip install cryptography)"
+            )
+        if log_sink is not None:
+            log_sink(f"[xray] happ subscription decrypted: {plain_url[:80]}")
+        clean_url = plain_url
+
     # Локальный файл (кастомный кеш конфигов, выбранный пользователем):
     # читаем как есть, а декодирование base64 / извлечение только ссылок
     # выполняет _subscription_lines ниже по конвейеру.

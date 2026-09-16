@@ -46,8 +46,6 @@ from typing import Optional
 from . import base
 from .tg_media import TG_MEDIA_MIN_KBPS, run_tg_media_check
 from xray_runtime import (
-    TELEGRAM_API_HEAD_TARGET,
-    TELEGRAM_MEDIA_DC,
     _encode_abridged_packet,
     _read_abridged_packet,
     _socks_mtproto_latency,

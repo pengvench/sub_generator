@@ -6,10 +6,10 @@
 Формат: JSON с комментариями (поддерживается python jsonc parser или обычный JSON).
 """
 import json
-from pathlib import Path
 from typing import Any
 
 from subgen.config import DATA_DIR
+from subgen.logging import log
 
 _CHECKER_THRESHOLDS_PATH = DATA_DIR / "checker_thresholds.json"
 
@@ -45,24 +45,6 @@ DEFAULT_THRESHOLDS = {
             "auth": 0.30,
             "upload": 0.40,
         },
-    },
-    
-    # Видео-проверка (checkers/video.py)
-    "video": {
-        "timeout": 5.0,
-        "segment_timeout": 6.0,
-        "segments_count": 20,
-        "segment_bytes": 2 * 1024 * 1024,  # 2 МБ
-        "max_timeouts": 4,  # допустимое число таймаутов
-        "min_avg_kbps": 1024.0,  # ~8 Мбит/с
-    },
-    
-    # CIDR/маскировка (checkers/cidr.py)
-    "cidr": {
-        "timeout": 10.0,
-        "min_score": 50,  # минимум 50 из 100 для принятия
-        "target_host": "www.google.com",
-        "target_port": 443,
     },
     
     # Zapret-проверка (checkers/zapret.py)
@@ -122,8 +104,9 @@ def load_thresholds() -> dict[str, Any]:
                         thresholds[key] = {**thresholds[key], **value}
                     else:
                         thresholds[key] = value
-    except Exception:
-        pass
+    except Exception as exc:
+        # Пользовательские пороги игнорировались молча — теперь причина видна.
+        log(f"[warn] checker_thresholds.json не прочитан — встроенные пороги: {type(exc).__name__}: {exc}")
     return thresholds
 
 

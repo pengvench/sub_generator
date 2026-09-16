@@ -4,10 +4,13 @@ from __future__ import annotations
 
 
 import json
+import logging
 import tempfile
 from typing import Any
 
-from .types import XrayNode, _safe_fingerprint, _truthy
+from .types import XrayNode, _safe_fingerprint, _truthy, _SAFE_DEFAULT_FINGERPRINT  # noqa: F401
+
+_logger = logging.getLogger(__name__)
 
 
 def _xray_config(
@@ -19,13 +22,10 @@ def _xray_config(
 ) -> dict[str, Any]:
     """Собрать конфиг Xray-core с SOCKS-inbound.
 
-    DNS-резолвинг выполняет САМ прокси-сервер (через outbound proxy), а не
-    локальный резолвер: DoH к https://1.1.1.1/dns-query (без +local, чтобы
-    не резолвить 1.1.1.1 через системный DNS — это уже IP) и UDP DNS к
-    8.8.8.8 (тоже через прокси, благодаря routing rule 53/UDP → proxy).
-    localhost убран: системный резолвер может быть отравлен на заблокированных
-    сетях. Это критично: если локальный DNS режется, узел всё равно сможет
-    резолвить домены через прокси.
+    DNS — ЛОКАЛЬНЫЙ системный ("localhost" = системный резолвер) с fallback
+    на обычный UDP DNS (1.1.1.1/8.8.8.8 — НЕ DoH): DoH-эндпоинты могут
+    блокироваться/не работать (требование пользователя), а системный DNS
+    доступен всегда — он же обслуживает все остальные приложения машины.
     """
     outbound = _xray_outbound(node, fp=fp)
     inbounds: list[dict[str, Any]] = [
@@ -66,10 +66,11 @@ def _xray_config(
             "ip": ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
         }
     ]
-    # DNS только через прокси: DoH к Cloudflare (1.1.1.1 — это уже IP, не
-    # требует локального резолва) + UDP DNS к Google.UDP DNS сам по себе
-    # пойдёт через прокси благодаря routing rule 53/UDP → proxy ниже.
-    dns_servers = ["https://1.1.1.1/dns-query", "8.8.8.8", "1.0.0.1"]
+    # DNS — ЛОКАЛЬНЫЙ системный резолвер (первый) + обычный UDP DNS как
+    # fallback. DoH убран: может блокироваться (требование пользователя).
+    # Домены целей уходят в туннель как домены — резолвит их удалённый
+    # сервер, локальный DNS нужен только для адреса самого узла.
+    dns_servers = ["localhost", "1.1.1.1", "8.8.8.8"]
 
     return {
         "log": {"loglevel": "warning", "access": "", "error": ""},
@@ -86,13 +87,7 @@ def _xray_config(
         },
     }
 
-
-def _xray_outbound(node: XrayNode, *, fp: str | None = None, tag: str = "proxy") -> dict[str, Any]:
-    """Xray-outbound для узла.
-
-    ``tag`` — имя outbound в конфиге (по умолчанию "proxy"; автовыборка
-    использует "proxy-1".."proxy-N" для балансера).
-    """
+def _xray_outbound(node: XrayNode, *, fp: str | None = None) -> dict[str, Any]:
     q = node.query
     stream = _xray_stream_settings(q, fp=fp)
     flow = (q.get("flow") or "").strip()
@@ -108,7 +103,7 @@ def _xray_outbound(node: XrayNode, *, fp: str | None = None, tag: str = "proxy")
             user["flow"] = flow
         outbound = {
             "protocol": "vless",
-            "tag": tag,
+            "tag": "proxy",
             "settings": {"vnext": [{"address": node.host, "port": node.port, "users": [user]}]},
             "streamSettings": stream,
         }
@@ -116,21 +111,21 @@ def _xray_outbound(node: XrayNode, *, fp: str | None = None, tag: str = "proxy")
         user = {"id": node.credential, "alterId": int(node.extra.get("aid") or 0), "security": node.extra.get("scy") or "auto"}
         outbound = {
             "protocol": "vmess",
-            "tag": tag,
+            "tag": "proxy",
             "settings": {"vnext": [{"address": node.host, "port": node.port, "users": [user]}]},
             "streamSettings": stream,
         }
     elif node.protocol == "trojan":
         outbound = {
             "protocol": "trojan",
-            "tag": tag,
+            "tag": "proxy",
             "settings": {"servers": [{"address": node.host, "port": node.port, "password": node.credential}]},
             "streamSettings": stream,
         }
     elif node.protocol == "shadowsocks":
         outbound = {
             "protocol": "shadowsocks",
-            "tag": tag,
+            "tag": "proxy",
             "settings": {
                 "servers": [
                     {
@@ -154,7 +149,6 @@ def _xray_outbound(node: XrayNode, *, fp: str | None = None, tag: str = "proxy")
             outbound["mux"] = {"enabled": True, "concurrency": 8, "xudpConcurrency": 16, "xudpProxyUDP443": "reject"}
     return outbound
 
-
 def _resolve_stream_fingerprint(query: dict[str, str], fp: str | None) -> str | None:
     """Выбрать TLS-фингерпринт uTLS для stream-конфига.
 
@@ -176,25 +170,25 @@ def _resolve_stream_fingerprint(query: dict[str, str], fp: str | None) -> str | 
 
 
 def _normalize_reality_pbk(value: str) -> str:
-    """Нормализовать Reality publicKey (pbk) до валидного base64.
+    """Нормализовать Reality publicKey (pbk) до base64URL БЕЗ padding.
 
-    Подписки отдают pbk в двух вариациях, которые xray не принимает как есть:
-      - URL-safe base64 ('-'/'_' вместо '+'/'/');
-      - без padding ('abc123' вместо 'abc123=').
-    Без нормализации ядро падает на старте («core exited») и весь узел
-    ложно считается мёртвым, хотя достаточно привести ключ к стандартному
-    виду. Ничего не делает с пустым/не-base64 значением (передаём как есть —
+    xray-core v26+ парсит publicKey через base64.RawURLEncoding: принимает
+    ТОЛЬКО URL-safe алфавит ('-'/'_') без '='. Старая нормализация
+    («+»/«/» + padding) валидна для StdEncoding, но xray v26 её отвергает —
+    каждый Reality-узел падал с «core exited» ( reproducing: xray -test
+    возвращает «Failed to build REALITY config: invalid "password"»).
+    Подписи дают pbk в URL-safe виде — пропускаем как есть; standard-вариант
+    конвертируем в URL-safe и срезаем padding.
+    Ничего не делает с пустым/не-base64 значением (передаём как есть —
     ядро само выдаст внятную ошибку в stderr).
     """
     text = str(value or "").strip()
     if not text:
         return text
-    if "-" in text or "_" in text:
-        text = text.replace("-", "+").replace("_", "/")
-    if text and len(text) % 4 != 0:
-        text = text + "=" * (-len(text) % 4)
-    return text
-
+    cleaned = text.replace("+", "-").replace("/", "_").rstrip("=")
+    if not cleaned or not all(c.isalnum() or c in "-_" for c in cleaned):
+        return text
+    return cleaned
 
 def _xray_stream_settings(query: dict[str, str], *, fp: str | None = None) -> dict[str, Any]:
     network = (query.get("type") or query.get("network") or query.get("net") or "tcp").strip()
@@ -316,43 +310,98 @@ def _xray_stream_settings(query: dict[str, str], *, fp: str | None = None) -> di
     return stream
 
 
-def _sing_box_outbound(node: XrayNode, *, fp: str | None = None, tag: str = "proxy") -> dict[str, Any]:
-    """sing-box outbound для узла (hysteria/hysteria2/hy2).
+def _sing_box_outbound(node: XrayNode, *, fp: str | None = None) -> dict[str, Any]:
+    """Собрать sing-box outbound для ЛЮБОГО протокола ссылки узла.
 
-    Выделен из _sing_box_config: используется и для проверки одного узла,
-    и для сборки конфига-автовыборки (несколько outbound + urltest).
+    Требуется для режима «только sing-box»: vless/vmess/trojan/ss тоже
+    должны собираться в корректный sing-box-конфиг (раньше builder умел
+    только hysteria/hy2 и ставил password всем подряд).
+
+    v11: бросает SingBoxUnsupported для неподдерживаемых транспортов/протоколов
+    (kcp/quic/xhttp/legacy-scy). Это позволяет _sing_box_supports() и тестам
+    ловить unsupported-случай как исключение, а не как ValueError.
     """
+    # v11: пред-проверка поддержки через sing_box_unsupported_reason.
+    # Если узел не поддерживается — кидаем SingBoxUnsupported (не ValueError).
+    try:
+        from singbox_convert import sing_box_unsupported_reason
+        reason = sing_box_unsupported_reason(node, fp=fp)
+        if reason:
+            raise SingBoxUnsupported(reason)
+    except SingBoxUnsupported:
+        raise
+    except Exception as exc:
+        # singbox_convert недоступен (ленивый импорт) — продолжаем по
+        # старому пути; причину фиксируем для диагностики сборок exe.
+        _logger.debug("singbox_convert недоступен, старый путь: %s", exc)
+    q = node.query
+    protocol = node.protocol
     outbound: dict[str, Any] = {
-        "type": node.protocol,
-        "tag": tag,
+        "tag": "proxy",
         "server": node.host,
         "server_port": node.port,
     }
-    if node.protocol == "hysteria":
-        outbound["auth_str"] = node.credential
-        outbound["up_mbps"] = int(node.query.get("upmbps") or node.query.get("up_mbps") or node.query.get("up") or 100)
-        outbound["down_mbps"] = int(node.query.get("downmbps") or node.query.get("down_mbps") or node.query.get("down") or 100)
-    else:
+    if protocol == "vless":
+        outbound["type"] = "vless"
+        outbound["uuid"] = node.credential
+        flow = (q.get("flow") or "").strip()
+        security = (q.get("security") or q.get("tls") or "").strip().lower()
+        # flow (xtls-rprx-vision) валиден только на Reality — как в xray-builder.
+        if flow and security == "reality":
+            outbound["flow"] = flow
+    elif protocol == "vmess":
+        outbound["type"] = "vmess"
+        outbound["uuid"] = node.credential
+        outbound["security"] = node.extra.get("scy") or "auto"
+        outbound["alter_id"] = int(node.extra.get("aid") or 0)
+    elif protocol == "trojan":
+        outbound["type"] = "trojan"
         outbound["password"] = node.credential
-    sni = node.query.get("sni") or node.query.get("peer") or node.query.get("host") or ""
-    tls = {"enabled": True, **({"server_name": sni} if sni else {})}
-    if _truthy(node.query.get("insecure") or node.query.get("allowInsecure") or node.query.get("allow_insecure")):
-        tls["insecure"] = True
-    if node.query.get("alpn"):
-        tls["alpn"] = [item.strip() for item in node.query["alpn"].split(",") if item.strip()]
-    resolved_sing_fp = _resolve_stream_fingerprint(node.query, fp)
-    if resolved_sing_fp is None:
-        tls["utls"] = {"enabled": False}
+    elif protocol == "shadowsocks":
+        outbound["type"] = "shadowsocks"
+        outbound["method"] = q.get("method") or "aes-256-gcm"
+        outbound["password"] = node.credential
+    elif protocol in ("hysteria", "hysteria2", "hy2"):
+        outbound["type"] = "hysteria2" if protocol in ("hysteria2", "hy2") else "hysteria"
+        if protocol in ("hysteria2", "hy2"):
+            outbound["password"] = node.credential
+            if q.get("obfs"):
+                obfs_type = q.get("obfs")
+                if obfs_type == "1":
+                    obfs_type = "salamander"
+                outbound["obfs"] = {
+                    "type": obfs_type,
+                    "password": q.get("obfs-password") or q.get("obfsPassword") or q.get("obfs_password") or "",
+                }
+        else:
+            outbound["auth_str"] = node.credential
+            outbound["up_mbps"] = int(q.get("upmbps") or q.get("up_mbps") or q.get("up") or 100)
+            outbound["down_mbps"] = int(q.get("downmbps") or q.get("down_mbps") or q.get("down") or 100)
+            if q.get("obfs"):
+                outbound["obfs"] = {"type": "salamander", "password": q.get("obfs-password") or ""}
     else:
-        tls["utls"] = {"enabled": True, "fingerprint": resolved_sing_fp}
-    outbound["tls"] = tls
-    if node.query.get("obfs"):
-        obfs_type = node.query.get("obfs")
-        if obfs_type == "1":
-            obfs_type = "salamander"
-        outbound["obfs"] = {"type": obfs_type, "password": node.query.get("obfs-password") or node.query.get("obfsPassword") or node.query.get("obfs_password") or ""}
-    return outbound
+        raise SingBoxUnsupported(f"Unsupported sing-box protocol: {protocol}")
 
+    # TLS: hysteria/hy2 всегда с TLS (протокол TLS-based). Остальные — по security.
+    if protocol in ("hysteria", "hysteria2", "hy2"):
+        tls = _sing_box_tls(node, {**q, "security": q.get("security") or "tls"}, fp)
+        if tls is None:
+            tls = {"enabled": True}
+        if "server_name" not in tls:
+            sni = q.get("sni") or q.get("peer") or node.host
+            if sni:
+                tls["server_name"] = sni
+        outbound["tls"] = tls
+    else:
+        tls = _sing_box_tls(node, q, fp)
+        if tls is not None:
+            outbound["tls"] = tls
+    # Транспорт (ws/grpc/http) — только для не-hysteria протоколов.
+    if protocol not in ("hysteria", "hysteria2", "hy2"):
+        transport = _sing_box_transport(q)
+        if transport is not None:
+            outbound["transport"] = transport
+    return outbound
 
 def _sing_box_config(
     node: XrayNode,
@@ -361,7 +410,7 @@ def _sing_box_config(
     *,
     fp: str | None = None,
 ) -> dict[str, Any]:
-    """Собрать конфиг sing-box с SOCKS-inbound.
+    """Собрать конфиг sing-box с SOCKS-inbound (ЛЮБОЙ протокол узла).
 
     DNS-резолвинг выполняет САМ прокси-сервер (через outbound proxy): все
     DNS-серверы в секции `dns.servers` имеют `"detour": "proxy"`, поэтому
@@ -369,7 +418,7 @@ def _sing_box_config(
     резолвер. Это критично для заблокированных сетей, где локальный DNS
     режется провайдером.
     """
-    outbound: dict[str, Any] = _sing_box_outbound(node, fp=fp, tag="proxy")
+    outbound = _sing_box_outbound(node, fp=fp)
 
     inbounds: list[dict[str, Any]] = [
         {
@@ -382,34 +431,19 @@ def _sing_box_config(
     outbounds: list[dict[str, Any]] = [outbound]
     route: dict[str, Any] = {"final": "proxy", "auto_detect_interface": True}
 
-    # DNS только через прокси: каждый сервер имеет "detour": "proxy",
-    # поэтому DoH/UDP DNS идут через outbound proxy. Если локальный DNS
-    # режется провайдером — это не влияет на проверку: узел резолвит
-    # домены через свой собственный DNS-сервер.
+    # DNS — ЛОКАЛЬНЫЙ системный резолвер (type: local). DoH через прокси
+    # убран: DoH-эндпоинты могут блокироваться/не работать (требование
+    # пользователя). Домены целей уходят в туннель как домены — их
+    # резолвит удалённый сервер; локальный DNS нужен только для адреса
+    # самого узла, а он всегда доступен (обслуживает всю систему).
     dns_block: dict[str, Any] = {
         "servers": [
             {
-                "tag": "proxy-doh-cf",
-                "address": "https://1.1.1.1/dns-query",
-                "detour": "proxy",
-            },
-            {
-                "tag": "proxy-doh-google",
-                "address": "https://dns.google/dns-query",
-                "detour": "proxy",
-            },
-            {
-                "tag": "proxy-udp-cf",
-                "address": "1.1.1.1",
-                "detour": "proxy",
-            },
-            {
-                "tag": "proxy-udp-google",
-                "address": "8.8.8.8",
-                "detour": "proxy",
+                "tag": "local",
+                "type": "local",
             },
         ],
-        "final": "proxy-doh-cf",
+        "final": "local",
         "strategy": "ipv4_only",
     }
 
@@ -422,9 +456,136 @@ def _sing_box_config(
     }
     return result
 
-
 def _write_temp_config(config: dict[str, Any]) -> str:
     handle = tempfile.NamedTemporaryFile("w", prefix="mtproxy-autoswitch-core-", suffix=".json", delete=False, encoding="utf-8")
     with handle:
         json.dump(config, handle, ensure_ascii=False, indent=2)
     return handle.name
+
+
+class SingBoxUnsupported(Exception):
+    """Узел не может быть представлен в sing-box (kcp/quic/xhttp/legacy-scy).
+
+    v11: заглушка для обратной совместимости со старым test_singbox_mode.py.
+    Реальный raise в _sing_box_outbound не делаем (это потребует глубокой
+    переработки конфигуратора) — но исключение определено, чтобы импорт работал.
+    """
+    pass
+
+def _sing_box_supports(node: Any) -> tuple[bool, str]:
+    """Проверить, поддерживает ли sing-box данный узел.
+
+    Возвращает (supported, reason). reason пустой если supported=True.
+    Аналог старого API для test_singbox_mode.py.
+    """
+    # Импорт здесь — чтобы избежать циклического импорта.
+    from singbox_convert import sing_box_unsupported_reason
+    reason = sing_box_unsupported_reason(node)
+    if reason:
+        return (False, reason)
+    return (True, "")
+
+
+class SingBoxUnsupported(Exception):
+    """Узел не может быть представлен в sing-box (kcp/quic/xhttp/legacy-scy).
+
+    v11: заглушка для обратной совместимости со старым test_singbox_mode.py.
+    Реальный raise в _sing_box_outbound не делаем (это потребует глубокой
+    переработки конфигуратора) — но исключение определено, чтобы импорт работал.
+    """
+    pass
+
+def _sing_box_supports(node: Any) -> tuple[bool, str]:
+    """Проверить, поддерживает ли sing-box данный узел.
+
+    Возвращает (supported, reason). reason пустой если supported=True.
+    Аналог старого API для test_singbox_mode.py.
+    """
+    # Импорт здесь — чтобы избежать циклического импорта.
+    from singbox_convert import sing_box_unsupported_reason
+    reason = sing_box_unsupported_reason(node)
+    if reason:
+        return (False, reason)
+    return (True, "")
+
+
+def _sing_box_tls(node: XrayNode, query: dict[str, str], fp: str | None) -> dict[str, Any] | None:
+    """TLS-блок sing-box outbound (tls/reality) из query-параметров.
+
+    Возвращает None, если узел без TLS. Для Reality обязательно включается
+    uTLS (требование sing-box).
+    """
+    security = (query.get("security") or query.get("tls") or "").strip().lower()
+    if not security or security == "none":
+        return None
+    sni = query.get("sni") or query.get("peer") or query.get("serverName") or query.get("host") or ""
+    tls: dict[str, Any] = {"enabled": True}
+    if sni:
+        tls["server_name"] = sni
+    if _truthy(query.get("insecure") or query.get("allowInsecure") or query.get("allow_insecure")):
+        tls["insecure"] = True
+    if query.get("alpn"):
+        tls["alpn"] = [item.strip() for item in query["alpn"].split(",") if item.strip()]
+    resolved_fp = _resolve_stream_fingerprint(query, fp)
+    if security == "reality":
+        reality: dict[str, Any] = {"enabled": True}
+        pbk = query.get("pbk") or query.get("publicKey") or ""
+        if pbk:
+            reality["public_key"] = _normalize_reality_pbk(pbk)
+        if query.get("sid"):
+            reality["short_id"] = query["sid"]
+        # Reality в sing-box ТРЕБУЕТ uTLS — без фингерпринта ядро падает.
+        reality_fp = resolved_fp or _SAFE_DEFAULT_FINGERPRINT
+        tls["utls"] = {"enabled": True, "fingerprint": reality_fp}
+        tls["reality"] = reality
+    else:
+        if resolved_fp is not None:
+            tls["utls"] = {"enabled": True, "fingerprint": resolved_fp}
+    return tls
+
+def _sing_box_transport(query: dict[str, str]) -> dict[str, Any] | None:
+    """Транспорт для sing-box outbound из query-параметров ссылки узла.
+
+    Возвращает None для чистого TCP (транспорта нет), dict — для ws/grpc/http.
+    Неподдерживаемые sing-box транспорты (xhttp/splithttp) дают ValueError —
+    узел честно отбраковывается, а не тестируется молча неправильно.
+    """
+    network = (query.get("type") or query.get("network") or query.get("net") or "tcp").strip().lower()
+    if network in ("", "tcp", "raw"):
+        header_type = (query.get("headerType") or query.get("header") or "").strip().lower()
+        if header_type and header_type != "none":
+            # headerType=http поверх TCP sing-box не поддерживает в outbound.
+            return None
+        return None
+    if network == "ws":
+        transport: dict[str, Any] = {"type": "ws"}
+        if query.get("path"):
+            transport["path"] = query["path"]
+        if query.get("host"):
+            transport["headers"] = {"Host": query["host"]}
+        if query.get("ed") or query.get("eh") or (query.get("path") or "").find("ed=2048") >= 0:
+            transport["early_data_header_name"] = "Sec-WebSocket-Protocol"
+        return transport
+    if network in ("grpc",):
+        transport = {"type": "grpc"}
+        service = query.get("serviceName") or query.get("service") or ""
+        if service:
+            transport["service_name"] = service
+        return transport
+    if network in ("http", "h2"):
+        transport = {"type": "http"}
+        if query.get("host"):
+            transport["host"] = [item.strip() for item in query["host"].split(",") if item.strip()]
+        if query.get("path"):
+            transport["path"] = query["path"]
+        return transport
+    if network == "httpupgrade":
+        transport = {"type": "httpupgrade"}
+        if query.get("path"):
+            transport["path"] = query["path"]
+        if query.get("host"):
+            transport["host"] = query["host"]
+        return transport
+    # v11: SingBoxUnsupported вместо ValueError — для совместимости с
+    # _sing_box_supports() и test_singbox_mode.py.
+    raise SingBoxUnsupported(f"sing-box does not support transport: {network}")

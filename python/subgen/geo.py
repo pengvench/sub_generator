@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 from subgen.config import (

@@ -14,12 +14,9 @@ from __future__ import annotations
 
 import argparse
 import base64
-import contextlib
 import socket
-import ssl
 import threading
 import time
-import urllib.request
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -50,7 +47,6 @@ from subgen.geo import load_geo_cache, serialize_working
 from subgen.logging import log
 from subgen.output import (
     append_text,
-    build_subscription,
     urls_text,
     write_file,
     write_geo_cache,
@@ -377,8 +373,10 @@ def _preflight_dns_doh(timeout: float = 5.0) -> dict[str, bool]:
         response, _ = udp_sock.recvfrom(512)
         if len(response) >= 12 and response[:2] == transaction_id:
             result["system_dns"] = True
-    except Exception:
-        pass
+    except Exception as exc:
+        # Причина недоступности системного DNS — часть диагностики preflight.
+        result["system_dns_error"] = f"{type(exc).__name__}: {exc}"
+        log(f"[net] системный DNS недоступен: {type(exc).__name__}: {exc}")
     finally:
         if udp_sock is not None:
             with _cl.suppress(Exception):
@@ -400,8 +398,10 @@ def _preflight_dns_doh(timeout: float = 5.0) -> dict[str, bool]:
         )
         if response.ok and response.status == 200 and response.body:
             result["doh"] = True
-    except Exception:
-        pass
+    except Exception as exc:
+        # Причина недоступности DoH — часть диагностики preflight.
+        result["doh_error"] = f"{type(exc).__name__}: {exc}"
+        log(f"[net] DoH (cloudflare-dns.com) недоступен: {type(exc).__name__}: {exc}")
 
     return result
 
@@ -503,8 +503,8 @@ def run(
         saved_files = [f for f in saved_files if f.name != "README.txt"]
         if saved_files:
             log(f"[sub] auto-loaded {len(saved_files)} saved_subs files (HARD FIX in run())")
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"[warn] не удалось просканировать каталог saved_subs: {type(exc).__name__}: {exc}")
 
     # Режим «только sing-box» (тумблер UI / флаг CLI): глобальный форс ядра
     # для ВСЕХ проверок конвейера (быстрая распинговка, initial, telegram,
@@ -1523,21 +1523,38 @@ def run(
 
         for idx, (w, res) in enumerate(pairs, 1):
             resilience_node_details[w.node.title()] = res.to_dict() if res else None
-            if res and res.alive:
+            # Route-стабильность (RTT/jitter/loss) — часть стресс-теста v12:
+            # живой, но нестабильный маршрут (loss>5%, p95>800мс, джиттер>80мс)
+            # бракуется с явной причиной; «not_measured» (батарея съела бюджет)
+            # не наказываем — данных нет, вердикта нет.
+            route_info = ""
+            route_failed = False
+            route_row = getattr(res, "route", None) if res else None
+            if isinstance(route_row, dict):
+                if route_row.get("reason") not in ("not_measured",) and route_row.get("probes_total", 0) >= 3:
+                    route_info = (
+                        f", route={route_row.get('ping_avg')}ms"
+                        f"/p95 {route_row.get('ping_p95')}ms"
+                        f"/jit {route_row.get('jitter')}ms"
+                        f"/loss {route_row.get('loss')}"
+                    )
+                    route_failed = not bool(route_row.get("accepted", False))
+            if res and res.alive and not route_failed:
                 checked_resilience.append(w)
                 log(
                     f"[resilience] PASS {idx}/{resilience_orig_count}: {w.node.title()} "
-                    f"(mode={res.recommended_mode}, tcp={res.tcp_works}, doh={res.doh_works}, tg={not res.telegram_blocked}, white_sni={res.white_sni_works})"
+                    f"(mode={res.recommended_mode}, tcp={res.tcp_works}, doh={res.doh_works}, tg={not res.telegram_blocked}, white_sni={res.white_sni_works}{route_info})"
                 )
             else:
                 failed_resilience += 1
                 # Честная причина отвала: ошибка запуска ядра/бюджета — это НЕ
                 # «узел мёртв», раньше оба случая писались как completely_dead.
-                fail_reason = (
-                    "run_failed (ядро узла не поднялось/бюджет)"
-                    if res and res.recommended_mode == "error"
-                    else "completely_dead"
-                )
+                if res and res.alive and route_failed:
+                    fail_reason = f"route_unstable ({route_row.get('reason')})"
+                elif res and res.recommended_mode == "error":
+                    fail_reason = "run_failed (ядро узла не поднялось/бюджет)"
+                else:
+                    fail_reason = "completely_dead"
                 log(
                     f"[resilience] FAIL {idx}/{resilience_orig_count}: {w.node.title()} "
                     f"({fail_reason})"
@@ -1554,6 +1571,7 @@ def run(
             "failed": failed_resilience,
             "timeout_sec": resilience_timeout,
             "rtt_hint_ms": round(resilience_rtt_hint, 1) if resilience_rtt_hint else None,
+            "route_check": True,  # v12: RTT/jitter/loss в стресс-тесте
             "nodes": resilience_node_details,
         }
     else:
@@ -2029,9 +2047,8 @@ def run(
             write_file(_resolve_path(args.working_dpi), final_urls)
             write_file(_resolve_path(args.out_dpi), base64.b64encode(final_urls.encode("utf-8")).decode("ascii"))
             log(f"[sub] финальный набор (после спидтеста) записан в DPI-файлы: {len(working)} nodes")
-            if run_suite:
-                write_file(_resolve_path(args.zapret_working), final_urls)
-                write_file(_resolve_path(args.zapret_out), base64.b64encode(final_urls.encode("utf-8")).decode("ascii"))
+            # v11: Zapret-suite удалён из конвейера; блок `if run_suite:` убран —
+            # переменная не существовала, NameError при --dpi-check.
 
     progress.close()
 

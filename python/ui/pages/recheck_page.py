@@ -14,12 +14,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 import customtkinter as ctk
 
 from .. import paths, theme
 from ..tooltip import CTkToolTip, info_label
+
+_logger = logging.getLogger(__name__)
 
 
 # Полный список этапов pipeline в порядке выполнения.
@@ -176,8 +179,10 @@ class RecheckPage(ctk.CTkFrame):
             else:
                 import subprocess
                 subprocess.run(["xdg-open", path], check=False)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Пользователь нажал «открыть папку» — молчаливый сбой выглядит
+            # как «кнопка не работает»; предупреждаем.
+            _logger.warning("не удалось открыть папку кеша (%s): %s", path, exc)
 
     # ------------------------------------------------------------ API
     def get_start_stage(self) -> str:

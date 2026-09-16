@@ -1,7 +1,5 @@
-# SubGenerator sources - cleaned (rule-providers removed)
-# 133 subscription URLs (rule-providers like discord.yaml/mrs removed)
-# Generated: 2026-09-14
-
+https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/PODVALMIX.txt
+https://mifa.world/wind
 https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/APTEKAxWHITExLIST
 https://gist.githubusercontent.com/Diman331/8c868070c0b5a5ec0c7d94507717b67b/raw/subscription.txt
 https://gitverse.ru/api/repos/gidro/white/raw/branch/master/subscription.txt
@@ -105,6 +103,7 @@ https://raw.githubusercontent.com/hiztin/VLESS-PO-GRIBI/main/deploy/subscription
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt
 https://0dceb06f.withblancvpn.online/s/a91b6cba9cec463cb20cbb8d17e71b35#BlancVPN
 https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/%D0%91%D0%B5%D0%BB%D1%8B%D0%B5_%D1%81%D0%BF%D0%B8%D1%81%D0%BA%D0%B8229.txt
+https://tetragidropiranilciklopentiltetragidropiridopiridinovye.ru/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2FdGdnZywxNzg5NDgzODQ2gAGqR17zTs/auto
 https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/whitelist.txt
 vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.grey-lance.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=promokod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Германия 🇩🇪
 vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.vast-mesa.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=lovikod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Швеция 🇸🇪
@@ -129,3 +128,4 @@ vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.iron-mine.test-cdn-kkk.com:443
 vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.bay-glep.test-cdn-kkk.com:443?encryption=none&type=grpc&serviceName=ads.x5.ru&mode=gun&security=reality&sni=gazeta-business.ru&fp=firefox&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE #3
 vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test10.firm-dune.test-cdn-kkk.com:10443?encryption=none&type=grpc&serviceName=ads.x5.ru&mode=gun&security=reality&sni=www.google.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE Reserve
 vless://dd76e0a5-9079-423d-afc2-d372f8106160@telegram.private-networks-zk.com:443?flow=xtls-rprx-vision&type=tcp&headerType=none&security=reality&fp=chrome&sni=ads.x5.ru&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#[FREE] ТОЛЬКО TG БОТ + САЙТ
+

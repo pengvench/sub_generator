@@ -16,14 +16,12 @@ import threading
 import time
 import subprocess
 import socket
-import ssl
 import urllib.request
-import json
+import logging
 
 import customtkinter as ctk
 
-from .. import theme, paths
-from ..tooltip import CTkToolTip
+from .. import theme
 
 
 class DiagPage(ctk.CTkFrame):
@@ -97,8 +95,9 @@ class DiagPage(ctk.CTkFrame):
     def _post(self, fn) -> None:
         try:
             self.after_idle(fn)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Окно/страница уже разрушены — штатный путь при закрытии GUI.
+            logging.getLogger(__name__).debug("_post пропущен: %s", exc)
 
     # ------------------------------------------------------------ запуск
     def _on_run_clicked(self) -> None:

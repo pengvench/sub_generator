@@ -24,7 +24,6 @@ import contextlib
 import logging
 import socket
 import ssl
-import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,11 +122,23 @@ def _run_route(
     socks_host: str,
     socks_port: int,
     timeout: float,
+    *,
+    probes: int = ROUTE_PROBES,
+    deadline: float | None = None,
 ) -> RouteCheckResult:
-    """Выполнить серию замеров RTT через поднятый SOCKS-прокси узла."""
+    """Выполнить серию замеров RTT через поднятый SOCKS-прокси узла.
+
+    ``probes`` — число замеров (стресс-тест resilience использует укороченную
+    серию — те же пороги, но меньше попыток).
+    ``deadline`` — time.monotonic() момент, после которого новые пробы не
+    начинаются (уже идущая попытка дорабатывает до своего timeout).
+    """
+    probe_count = max(3, int(probes))
     rtts: list[float] = []
     lost = 0
-    for _ in range(ROUTE_PROBES):
+    for i in range(probe_count):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         ms = _rtt_probe(socks_host, socks_port, timeout)
         if ms is None:
             lost += 1
@@ -135,7 +146,7 @@ def _run_route(
             rtts.append(ms)
 
     probes_ok = len(rtts)
-    probes_total = ROUTE_PROBES
+    probes_total = probes_ok + lost
 
     ping_avg: float | None = None
     ping_p95: float | None = None
@@ -156,6 +167,7 @@ def _run_route(
 
     accepted = (
         probes_ok > 0
+        and probes_total >= 3
         and loss is not None
         and loss <= ROUTE_MAX_LOSS
         and ping_avg is not None
@@ -168,6 +180,9 @@ def _run_route(
     reason = "ready" if accepted else "route_unstable"
     if loss is not None and loss > ROUTE_MAX_LOSS:
         reason = "high_loss"
+    elif probes_total < 3:
+        # Дедлайн батареи съел время на пробы — данных мало, вердикта нет.
+        reason = "not_measured"
 
     return RouteCheckResult(
         accepted=accepted,

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-from xray_runtime import XrayCoreRuntime, XrayNode, parse_node_link
+from xray_runtime import XrayCoreRuntime, parse_node_link
 
 # Размер случайного payload для проверки tcp 16-20 / l4-25 (как в dpich).
 TCP1620_PAYLOAD_BYTES = 64 * 1024

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import logging
+import os
 import queue
 import sys
 import threading
@@ -107,8 +109,10 @@ def _flush_batch(batch: list[str]) -> None:
             try:
                 _log_file_handle.write("".join(line + "\n" for line in batch))
                 _log_file_handle.flush()
-            except Exception:
-                pass
+            except Exception as exc:
+                # ВАЖНО: только stderr, НЕ через logging — иначе рекурсия
+                # (мост stdlib logging -> log() -> очередь -> _flush_batch).
+                print(f"[log] запись в run.log не удалась: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def _ensure_writer_started() -> None:
@@ -146,8 +150,10 @@ def log(message: str) -> None:
             try:
                 _log_file_handle.write(line + "\n")
                 _log_file_handle.flush()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Аварийный путь переполнения очереди: только stderr (без
+                # logging — защита от рекурсии, см. _flush_batch).
+                print(f"[log] аварийная запись в run.log не удалась: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def shutdown() -> None:
@@ -157,10 +163,61 @@ def shutdown() -> None:
         try:
             _log_queue.put_nowait(_SHUTDOWN_SENTINEL)
         except queue.Full:
-            pass
+            # Очередь переполнена — writer сам заметит остановку по join-таймауту
+            # (поток daemon); диагностическую заметку выводим в stderr.
+            print("[log] очередь переполнена, writer остановлен по таймауту", file=sys.stderr)
         _writer_thread.join(timeout=2.0)
         _writer_started = False
 
 
+# ---------------------------------------------------------------------------
+# Мост stdlib logging -> асинхронная очередь проекта.
+#
+# Модули движка (runtime/*) не могут импортировать subgen.logging напрямую
+# (цикл: subgen -> xray_runtime -> runtime), поэтому они пишут в стандартный
+# logging.getLogger(__name__). Этот мост, установленный на старте приложения,
+# перенаправляет записи в очередь log() — они попадают в stdout и data/run.log.
+#
+# Уровень по умолчанию WARNING (тихие debug-сообщения горячих путей не шумят);
+# SUBGEN_DEBUG=1 включает DEBUG (диагностика при разборе проблем).
+# ---------------------------------------------------------------------------
+_bridge_installed = False
+
+
+class _StdlibQueueHandler(logging.Handler):
+    """Пересылает записи stdlib logging в очередь log() (без блокировки)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            log(f"[{record.levelname}] {record.name}: {record.getMessage()}")
+        except Exception:
+            self.handleError(record)
+
+
+def install_stdlib_bridge(level: int | None = None) -> None:
+    """Подключить stdlib logging к stdout + data/run.log (вызывать на старте).
+
+    Идемпотентна: повторные вызовы (GUI + CLI точки входа) не дублируют мост.
+    ``level`` по умолчанию: DEBUG если SUBGEN_DEBUG=1, иначе WARNING.
+    """
+    global _bridge_installed
+    if _bridge_installed:
+        return
+    _bridge_installed = True
+    if level is None:
+        level = logging.DEBUG if os.environ.get("SUBGEN_DEBUG") else logging.WARNING
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.addHandler(_StdlibQueueHandler())
+
+
 atexit.register(shutdown)
+
+
+# Ранний вызов моста прямо из этого модуля: даже если точка входа не успела
+# вызвать install_stdlib_bridge() (например, библиотечное использование
+# конвейера), предупреждения stdlib logging не теряются молча.
+# Уровень остаётся WARNING, если переменная окружения не задана.
+with contextlib.suppress(Exception):
+    install_stdlib_bridge()
 

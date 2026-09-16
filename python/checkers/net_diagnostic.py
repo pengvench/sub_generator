@@ -37,7 +37,6 @@ import contextlib
 import socket
 import subprocess
 import time
-import urllib.request
 from dataclasses import dataclass, field
 
 

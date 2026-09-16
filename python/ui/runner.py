@@ -243,11 +243,11 @@ class PipelineRunner:
         self._flush_batch()
 
         events: list[RunEvent] = []
-        try:
-            while True:
+        while True:
+            try:
                 events.append(self._events.get(timeout=timeout))
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                break  # штатное окончание очереди событий (не ошибка)
         self._flush_batch()
         return events
 

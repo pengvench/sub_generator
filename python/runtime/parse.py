@@ -671,3 +671,43 @@ def _clash_query(item: dict[str, Any]) -> str:
         if h2_opts.get("host"):
             params["host"] = str(h2_opts.get("host"))
     return "&".join(f"{quote(str(k), safe='')}={quote(str(v), safe='/@:')}" for k, v in params.items() if v)
+
+
+DEFAULT_XRAY_SUBSCRIPTIONS = [
+    "https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/2.txt",
+    "https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/4.txt",
+    "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt",
+    "https://yax.nenadoblokirowatgnidda.ru/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2FVGdSdSwxNzg2MDE1NDU56hnfxM-O2I",
+]
+
+LEGACY_XRAY_SUBSCRIPTION_PATTERNS = (
+    "charity.invisibleshrimp.su/",
+    "s3.toostep.top/",
+    "github.com/zieng2/wl",
+    "github.com/whoahaow/rjsxrd",
+    "github.com/igareck/vpn-configs-for-russia",
+)
+
+def is_legacy_xray_subscription(url: str) -> bool:
+    """True, если URL относится к удалённому списку подписок."""
+    return any(pattern in url for pattern in LEGACY_XRAY_SUBSCRIPTION_PATTERNS)
+
+
+DEFAULT_XRAY_SUBSCRIPTIONS = [
+    "https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/2.txt",
+    "https://raw.githubusercontent.com/misha12333211-ctrl/proxy-subs/refs/heads/main/4.txt",
+    "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/refs/heads/main/configs.txt",
+    "https://yax.nenadoblokirowatgnidda.ru/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2FVGdSdSwxNzg2MDE1NDU56hnfxM-O2I",
+]
+
+LEGACY_XRAY_SUBSCRIPTION_PATTERNS = (
+    "charity.invisibleshrimp.su/",
+    "s3.toostep.top/",
+    "github.com/zieng2/wl",
+    "github.com/whoahaow/rjsxrd",
+    "github.com/igareck/vpn-configs-for-russia",
+)
+
+def is_legacy_xray_subscription(url: str) -> bool:
+    """True, если URL относится к удалённому списку подписок."""
+    return any(pattern in url for pattern in LEGACY_XRAY_SUBSCRIPTION_PATTERNS)

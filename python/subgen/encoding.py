@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -40,8 +41,10 @@ def setup_console_encoding() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+        except Exception as exc:
+            # Лучшее усилие: без reconfigure возможны кракозябры в cp1251-консоли,
+            # но работа продолжается. Причину фиксируем в debug.
+            logging.getLogger(__name__).debug("reconfigure %s на utf-8 не удался: %s", getattr(stream, "name", "?"), exc)
 
     # Для надёжности также выставляем переменную окружения, чтобы дочерние
     # процессы Python наследовали UTF-8.

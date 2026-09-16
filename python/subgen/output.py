@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
-from subgen.config import SUBSCRIPTION_DESCRIPTION
 from subgen.settings import get_description, get_prefix
 from xray_runtime import XrayProbeResult
 

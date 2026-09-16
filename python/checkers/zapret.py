@@ -585,8 +585,10 @@ def _post_payload_probe(
                 parts = head.split(b" ", 2)
                 if len(parts) >= 2:
                     result.http_code = int(parts[1])
-            except Exception:
-                pass
+            except Exception as exc:
+                # Нестандартная строка статуса: http_code остаётся 0 —
+                # классификация ниже учтёт это. Причина — в debug.
+                logger.debug("http_code не разобран из %r: %s", head[:24], exc)
 
         # Классификация статуса (как в Zapret).
         if result.http_code >= 100:
@@ -695,8 +697,10 @@ def _head_http_probe(
                 parts = head.split(b" ", 2)
                 if len(parts) >= 2:
                     result.http_code = int(parts[1])
-            except Exception:
-                pass
+            except Exception as exc:
+                # Нестандартная строка статуса: http_code остаётся 0 —
+                # классификация ниже учтёт это. Причина — в debug.
+                logger.debug("http_code не разобран из %r: %s", head[:24], exc)
 
         if result.http_code >= 100:
             result.status = STATUS_OK

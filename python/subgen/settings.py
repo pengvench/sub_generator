@@ -12,9 +12,9 @@ from __future__ import annotations
 import json
 import threading
 
-from pathlib import Path
 
 from subgen.config import DATA_DIR, SUBSCRIPTION_DESCRIPTION
+from subgen.logging import log
 
 _SETTINGS_PATH = DATA_DIR / "settings.json"
 _lock = threading.Lock()
@@ -89,8 +89,10 @@ def load_settings() -> dict[str, object]:
                         # строка "32" вместо числа 32 — приводим к дефолту.
                         if isinstance(value, type(default_val)):
                             test_opts[key] = value
-    except Exception:
-        pass
+    except Exception as exc:
+        # Повреждённый/несовместимый settings.json не должен молча
+        # обнулять настройки пользователя: сообщаем и применяем дефолты.
+        log(f"[warn] settings.json не прочитан — применены значения по умолчанию: {type(exc).__name__}: {exc}")
     return settings
 
 

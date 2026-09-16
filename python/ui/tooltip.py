@@ -1,7 +1,11 @@
 """Всплывающая подсказка в стиле ZapretUI (тёмный фон, рамка, (?) иконка)."""
 from __future__ import annotations
 
+import logging
+
 import tkinter as tk
+
+_logger = logging.getLogger(__name__)
 
 
 class CTkToolTip:
@@ -25,8 +29,9 @@ class CTkToolTip:
         if self._after_id is not None:
             try:
                 self.widget.after_cancel(self._after_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Виджет уже разрушен — отменять нечего (штатно при закрытии).
+                _logger.debug("after_cancel пропущен: %s", exc)
             self._after_id = None
 
     def _show(self) -> None:
@@ -61,8 +66,9 @@ class CTkToolTip:
         if self._tip is not None:
             try:
                 self._tip.destroy()
-            except Exception:
-                pass
+            except Exception as exc:
+                # Окно подсказки уже разрушено вместе с родителем.
+                _logger.debug("destroy подсказки пропущен: %s", exc)
             self._tip = None
 
 

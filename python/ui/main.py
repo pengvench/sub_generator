@@ -23,9 +23,12 @@ from ui.paths import ensure_sources_file
 
 def _run_cli(argv):
     from subgen.encoding import setup_console_encoding
+    from subgen.logging import install_stdlib_bridge
     from subgen.pipeline import run
 
     setup_console_encoding()
+    # Мост stdlib logging -> stdout + data/run.log (WARNING; SUBGEN_DEBUG=1 -> DEBUG).
+    install_stdlib_bridge()
     os.environ["SUB_GEN_PS_WRAPPER"] = "1"
     return run(argv)
 

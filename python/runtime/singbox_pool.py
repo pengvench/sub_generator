@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import contextlib
 import json
-import socket
+import logging
+import os
 import subprocess
 import tempfile
 import threading
@@ -40,12 +41,15 @@ from typing import Any, Callable
 
 from .procs import (
     _assign_process_to_job,
+    _close_windows_handle,
     _create_kill_on_close_job,
     _find_free_port,
     _resolve_binary,
     _subprocess_no_window,
     _terminate_process_tree,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 # Размер батча по умолчанию. На 200 узлов sing-box стартует за 1.5-2 сек,
@@ -121,6 +125,7 @@ class SingBoxBatchPool:
         # Процесс и Job Object.
         self._proc: subprocess.Popen | None = None
         self._config_path: str = ""
+        self._stderr_path: str = ""   # лог stderr sing-box (файл, не PIPE)
         self._job_handle: int | None = None
         self._started_at: float = 0.0
         self._lock = threading.Lock()  # serializes select() across threads
@@ -265,17 +270,39 @@ class SingBoxBatchPool:
         # Job Object — kill-on-close, чтобы при падении Python процесс не осел.
         self._job_handle = _create_kill_on_close_job()
 
+        # Багфикс (P1): stderr — во временный ФАЙЛ, а не в PIPE. PIPE никто
+        # не читает, пока процесс жив, а sing-box пишет warnings всю жизнь
+        # батча (каждая неудачная проба — строка): буфер трубы ОС (~64 КБ)
+        # переполняется, sing-box блокируется на write → виснет весь батч.
+        # Файл растёт свободно; хвост читаем только при падении старта.
+        stderr_fd: int | None = None
         try:
-            # v11: stderr=PIPE чтобы при падении sing-box прочитать причину.
+            stderr_fd, self._stderr_path = tempfile.mkstemp(
+                prefix=f"sb-batch-{self.batch_id}-", suffix=".stderr.log", text=True
+            )
+        except Exception as exc:
+            _logger.debug("stderr-файл пула #%s не создан: %s", self.batch_id, exc)
+            self._stderr_path = ""
+
+        try:
+            # v11: stderr в файл, чтобы при падении sing-box прочитать причину.
             self._proc = subprocess.Popen(
                 [self.binary, "run", "-c", self._config_path],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=stderr_fd if stderr_fd is not None else subprocess.DEVNULL,
                 creationflags=_subprocess_no_window(),
             )
         except Exception as exc:
             self._log(f"[sb-pool#{self.batch_id}] не удалось запустить sing-box: {exc}")
+            if stderr_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(stderr_fd)
+            self.stop()
             return False
+        # Popen дублирует дескриптор в дочерний процесс — свою копию закрываем.
+        if stderr_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(stderr_fd)
 
         if self._job_handle is not None:
             with contextlib.suppress(Exception):
@@ -285,15 +312,20 @@ class SingBoxBatchPool:
         time.sleep(STARTUP_DELAY_SEC)
 
         if self._proc.poll() is not None:
-            # sing-box упал — читаем stderr для диагностики.
+            # sing-box упал — читаем хвост stderr-файла для диагностики.
             stderr_tail = ""
             try:
-                stderr_bytes, _ = self._proc.communicate(timeout=2.0)
-                stderr_text = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
-                if stderr_text:
-                    stderr_tail = "\n".join(stderr_text.splitlines()[-5:])
-            except Exception:
-                pass
+                if self._stderr_path:
+                    with open(self._stderr_path, "rb") as fh:
+                        fh.seek(0, 2)  # в конец
+                        size = fh.tell()
+                        fh.seek(max(0, size - 16384))  # последние 16 КБ
+                        stderr_text = fh.read().decode("utf-8", errors="replace").strip()
+                    if stderr_text:
+                        stderr_tail = "\n".join(stderr_text.splitlines()[-5:])
+            except Exception as exc:
+                # Диагностика падения sing-box не критична для вердикта батча.
+                _logger.debug("stderr sing-box (пул #%s) не прочитан: %s", self.batch_id, exc)
             if stderr_tail:
                 self._log(f"[sb-pool#{self.batch_id}] sing-box упал при старте: {stderr_tail}")
             else:
@@ -329,8 +361,10 @@ class SingBoxBatchPool:
                     encoding="utf-8",
                 )
                 self._log(f"[sb-pool#{self.batch_id}] конфиг сохранён для диагностики: {debug_path}")
-        except Exception:
-            pass
+        except Exception as exc:
+            # Дамп — сам диагностический инструмент: его сбой не должен
+            # маскировать исходную проблему, но причина должна быть видна.
+            _logger.warning("дамп конфига пула #%s не записан: %s", self.batch_id, exc)
 
     def _wait_clash_api(self, *, timeout: float = 3.0) -> bool:
         """Подождать, пока Clash API начнёт отвечать."""
@@ -343,13 +377,14 @@ class SingBoxBatchPool:
                 ) as resp:
                     if resp.status == 200:
                         return True
-            except Exception:
-                pass
+            except Exception as exc:
+                # Горячий retry-цикл старта: пока API не поднялся — это норма.
+                _logger.debug("Clash API ещё не отвечает (пул #%s): %s", self.batch_id, exc)
             time.sleep(0.1)
         return False
 
     def stop(self) -> None:
-        """Остановить sing-box процесс."""
+        """Остановить sing-box процесс и освободить все ресурсы."""
         if self._proc is not None:
             with contextlib.suppress(Exception):
                 _terminate_process_tree(self._proc, timeout=2.0)
@@ -358,6 +393,17 @@ class SingBoxBatchPool:
             with contextlib.suppress(Exception):
                 Path(self._config_path).unlink(missing_ok=True)
             self._config_path = ""
+        # Багфикс (P1): Job Object handle никогда не закрывался — утечка
+        # kernel-handle на каждый батч (14000 узлов / 200 = 70 батчей за прогон;
+        # пустые job-объекты накапливались до конца процесса Python).
+        if self._job_handle is not None:
+            _close_windows_handle(self._job_handle)
+            self._job_handle = None
+        # stderr-лог батча больше не нужен.
+        if self._stderr_path:
+            with contextlib.suppress(Exception):
+                Path(self._stderr_path).unlink(missing_ok=True)
+            self._stderr_path = ""
 
     def select(self, node: Any) -> bool:
         """Переключить selector на outbound узла. Возвращает True при успехе.
@@ -408,10 +454,6 @@ class SingBoxBatchPool:
 
     def __exit__(self, *exc_info: Any) -> None:
         self.stop()
-
-
-# Импорт os нужен для fdopen/mkstemp — размещаем внизу, чтобы не загромождать.
-import os  # noqa: E402
 
 
 def iter_batches(

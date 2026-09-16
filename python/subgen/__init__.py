@@ -13,3 +13,5 @@ from __future__ import annotations
 
 from subgen.config import DATA_DIR
 from subgen.pipeline import main
+
+__all__ = ["DATA_DIR", "main"]

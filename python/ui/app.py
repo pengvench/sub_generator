@@ -1,6 +1,7 @@
 """Главное окно SubGenerator (customtkinter, Material-тема как ZapretUI)."""
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import threading
@@ -10,7 +11,6 @@ from tkinter import messagebox
 
 
 import customtkinter as ctk
-
 
 from . import paths, theme
 from .pages.log_page import LogPage
@@ -23,6 +23,8 @@ from .pages.import_page import ImportPage
 
 from .runner import PipelineRunner, build_pipeline_args, filter_sources_by_history
 from .tooltip import CTkToolTip
+
+_logger = logging.getLogger(__name__)
 
 theme.apply_theme()
 
@@ -48,8 +50,9 @@ class SubGenApp(ctk.CTk):
                 icon_path = paths.app_root() / "icon.ico"
             if icon_path.exists():
                 self.iconbitmap(str(icon_path))
-        except Exception:
-            pass
+        except Exception as exc:
+            # Иконка — косметика: на некоторых Linux/Wayland bitmap не ставится.
+            _logger.debug("иконка окна не установлена: %s", exc)
         # Центрируем окно на экране
         self.update_idletasks()
 
@@ -715,13 +718,17 @@ class SubGenApp(ctk.CTk):
         """Отложить вызов в поток Tk из фонового потока."""
         try:
             self.after_idle(fn)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Окно уже разрушено — отложенный вызов не нужен; это штатный
+            # путь при закрытии приложения во время фонового конвейера.
+            _logger.debug("_post пропущен (окно закрыто): %s", exc)
 
     # ------------------------------------------------------------ close
     def _on_close(self) -> None:
         try:
             self.runner.stop()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Сбой остановки конвейера = возможные живые потоки/ядра после
+            # закрытия окна — предупреждаем, а не молчим.
+            _logger.warning("остановка конвейера при закрытии не удалась: %s", exc)
         self.destroy()

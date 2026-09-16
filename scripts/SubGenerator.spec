@@ -10,9 +10,14 @@ PYTHON = os.path.join(ROOT, 'python')
 
 datas = [
     (os.path.join(ROOT, 'bin'), 'bin'),
-    (os.path.join(ROOT, 'data', 'sources.txt'), 'data'),
     (os.path.join(ROOT, 'assets', 'icon.ico'), '.'),
 ]
+# sources.txt НЕ хранится в репо (политика приватности подписок).
+# Если у сборщика он есть локально — бандлим; если нет — НЕ падаем:
+# пустышку создаёт ensure_sources_file() при первом запуске рядом с exe.
+_sources_txt = os.path.join(ROOT, 'data', 'sources.txt')
+if os.path.exists(_sources_txt):
+    datas.append((_sources_txt, 'data'))
 
 binaries = []
 hiddenimports = [
@@ -20,11 +25,22 @@ hiddenimports = [
     'subgen.output', 'subgen.logging', 'subgen.progress', 'subgen.config',
     'subgen.checker_thresholds', 'subgen.checker_cache',
     'subgen.settings',
-    'checkers.dpi', 'checkers.cidr', 'checkers.zapret', 'checkers.base',
+    'checkers.dpi', 'checkers.zapret', 'checkers.base',
     'checkers.initial_check', 'checkers.telegram_pro', 'checkers.route',
     'checkers.blocked_services', 'checkers.dpi_active', 'checkers.hostres',
-    'checkers.net_baseline', 'checkers.net_diagnostic', 'checkers.resilience',
+    'checkers.net_diagnostic', 'checkers.resilience',
     'checkers.tg_media', 'checkers.ai_geo',
+    # Пакет runtime/ — единственная реализация движка (xray_runtime — обёртка).
+    # Ленивые импорты (happ_decrypt в fetch, singbox_convert в configs)
+    # прописываем явно, чтобы PyInstaller их не потерял.
+    'runtime', 'runtime.types', 'runtime.uritools', 'runtime.parse',
+    'runtime.fetch', 'runtime.netsocks', 'runtime.probes_ping',
+    'runtime.probes_telegram', 'runtime.probes_speed', 'runtime.configs',
+    'runtime.procs', 'runtime.core', 'runtime.singbox_pool',
+    # Слои движка после модуляризации core.py (примеси XrayCoreRuntime).
+    'runtime.lifecycle', 'runtime.probing', 'runtime.sorting',
+    'runtime.stress', 'runtime.collect', 'runtime.results',
+    'runtime.happ_decrypt', 'singbox_convert',
     'ui.app', 'ui.runner', 'ui.paths', 'ui.tooltip', 'ui.theme', 'ui.main',
     'ui.pages.start_page', 'ui.pages.sources_page', 'ui.pages.log_page',
     'ui.pages.settings_page', 'ui.pages.recheck_page',

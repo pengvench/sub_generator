@@ -35,13 +35,15 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import socket
 import ssl
-import struct
 import time
 from typing import Any
 
 from checkers.base import _socks_open_connection, _socks_udp_associate, run_with_node
+
+_logger = logging.getLogger(__name__)
 
 
 # --- Адаптация под медленный канал (инцидент 2026-09-04, лог4) ---
@@ -60,6 +62,12 @@ RTT_SCALE_DIVISOR_MS = 500.0  # RTT канала, выше которого ра
 RTT_SCALE_MAX = 4.0           # потолок масштабирования подтестов (x4)
 SUB_TIMEOUT_CAP = 12.0        # потолок таймаута одного подтеста
 BATTERY_HARD_CAP = 90.0       # жёсткий потолок бюджета проверки одного узла
+
+# Route-стабильность (RTT/jitter/loss) как часть стресс-теста: укороченная
+# серия замеров в ТОМ ЖЕ поднятом core-процессе (без второго запуска ядра).
+ROUTE_STRESS_PROBES = 5        # замеров вместо полных 10 (checkers/route.py)
+ROUTE_STRESS_TIMEOUT_SEC = 3.0 # таймаут одного замера
+ROUTE_BUDGET_SEC = 15.0        # добавка к бюджету узла на route-серию
 
 
 # Цели для альтернативных проверок (обновлено на основе логов Karing)
@@ -478,9 +486,11 @@ def udp_dns_check(
             # Проверяем, что ответ содержит правильный transaction ID
             if dns_response[:2] == transaction_id:
                 return True, latency, f"{dns_host}:{dns_port}"
-                
-        except Exception:
-            pass
+
+        except Exception as exc:
+            # Горячий цикл DNS-пробы узла: таймауты/битые ответы — часть
+            # методики (проверка устойчивости), причину пишем в debug.
+            _logger.debug("DNS-проба через узел не удалась (%s): %s", dns_host, exc)
         finally:
             if udp_sock is not None:
                 with contextlib.suppress(Exception):
@@ -740,6 +750,7 @@ def check_node_resilience_detailed(
     node_url: str,
     timeout: float = 5.0,
     rtt_hint_ms: float | None = None,
+    route_check: bool = True,
 ) -> "ResilienceCheckResult":
     """Проверка живучести узла через SOCKS-прокси.
     
@@ -753,6 +764,10 @@ def check_node_resilience_detailed(
     худшего времени батареи (~21с+), поэтому живые медленные узлы
     получали ``failed_to_run``/``completely_dead`` (инцидент 2026-09-04,
     лог4: 13 из 17 узлов отвалились на этом этапе).
+    
+    ``route_check=True`` — после батареи выполнить route-серию
+    (RTT/jitter/loss, checkers/route.py) в том же процессе узла и
+    приложить метрики стабильности маршрута к результату.
     
     Возвращает ResilienceCheckResult с подробными метриками.
     """
@@ -772,15 +787,30 @@ def check_node_resilience_detailed(
         + 7.0 * _rtt_overhead
     )
     _budget = min(BATTERY_HARD_CAP, 0.8 + _est_battery + 3.0)
+    if route_check:
+        # Route-серия идёт ПОСЛЕ батареи в том же core-процессе:
+        # расширяем бюджет на её худшее время.
+        _budget += ROUTE_BUDGET_SEC
     
     def _check(host: str, port: int) -> ResilienceCheckResult:
         # Дедлайн чуть раньше внешнего бюджета, чтобы батарея успела
         # вернуть частичный результат, а не убиваться по FutureTimeout.
+        battery_deadline = time.monotonic() + _budget - 3.0
         report = resilience_check(
             host, port, node_url, timeout,
             rtt_hint_ms=rtt_hint_ms,
-            deadline=time.monotonic() + _budget - 3.0,
+            deadline=battery_deadline - (ROUTE_BUDGET_SEC if route_check else 0.0),
         )
+        route_row: dict | None = None
+        if route_check:
+            from .route import _run_route
+            route_res = _run_route(
+                host, port,
+                ROUTE_STRESS_TIMEOUT_SEC,
+                probes=ROUTE_STRESS_PROBES,
+                deadline=time.monotonic() + ROUTE_BUDGET_SEC,
+            )
+            route_row = route_res.row()
         return ResilienceCheckResult(
             node=node_url,
             alive=report.get("summary", {}).get("alive", False),
@@ -793,6 +823,7 @@ def check_node_resilience_detailed(
             fake_ip_works=report.get("tests", {}).get("fake_ip", {}).get("success", False),
             recommended_mode=report.get("summary", {}).get("recommended_mode", "unknown"),
             details=report,
+            route=route_row,
         )
     
     result = run_with_node(node_url, _check, timeout=timeout, budget=_budget)
@@ -829,6 +860,7 @@ class ResilienceCheckResult:
         doh_works: bool = False,
         udp_dns_works: bool = False,
         fake_ip_works: bool = False,
+        route: dict[str, Any] | None = None,
     ):
         self.node = node
         self.alive = alive
@@ -841,6 +873,7 @@ class ResilienceCheckResult:
         self.fake_ip_works = fake_ip_works
         self.recommended_mode = recommended_mode
         self.details = details
+        self.route = route
     
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -854,5 +887,6 @@ class ResilienceCheckResult:
             "udp_dns_works": self.udp_dns_works,
             "fake_ip_works": self.fake_ip_works,
             "recommended_mode": self.recommended_mode,
+            "route": self.route,
             **self.details,
         }

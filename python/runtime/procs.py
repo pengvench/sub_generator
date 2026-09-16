@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import logging
 import os
 import shutil
 import socket
@@ -14,6 +15,8 @@ import sys
 import time
 from ctypes import wintypes
 from pathlib import Path
+
+_logger = logging.getLogger(__name__)
 
 
 if os.name == "nt":
@@ -248,8 +251,10 @@ def _windows_terminate_process(pid: int) -> None:
             kernel32.TerminateProcess(handle, 1)
         finally:
             kernel32.CloseHandle(handle)
-    except Exception:
-        pass
+    except Exception as exc:
+        # WARNING: неудачная терминация = возможный процесс-зомби, который
+        # переживёт приложение. Молчание здесь маскировало утечку ядер.
+        _logger.warning("TerminateProcess(%s) не удался: %s", pid, exc)
 
 
 def _pid_exists(pid: int) -> bool:

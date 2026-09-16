@@ -29,19 +29,19 @@ pip-selfcheck.json
 .vscode/
 .idea/
 
-# Runtime data (создаётся при запуске; sources.txt — исключение, хранится)
-data/sources.txt
+# Runtime data (создаётся при запуске).
+# data/sources.txt в репо НЕ хранится: при первом запуске создаётся пустым
+# (ui/paths.py::ensure_sources_file); сборка тоже генерирует пустышку.
 data/*
-data/report.json
-data/run.log
-data/settings.json
-data/geo_cache.json
-data/working*.txt
-data/subs*.txt
-data/.runtime_cache/
-subs.txt
-working*.txt
-subs_*.txt
+!data/happ_keys/
+data/happ_keys/*
+!data/happ_keys/README.md
+
+# Секреты happ-ключей — никогда в репо (README выше — единственное исключение).
+*.pem
+*.key
+pkcs1_keys.json
+data/happ_keys/pkcs1_keys.json
 
 # Build artifacts (ПК)
 build/

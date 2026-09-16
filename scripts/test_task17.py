@@ -167,72 +167,7 @@ def test_baseline_upload_cascade_signature():
 
 
 # =====================================================================
-# 3. Автовыборка
-# =====================================================================
-def test_autoselect_xray_structure():
-    from subgen.autoselect import build_xray_autoselect
-    from runtime.parse import parse_node_link
-    nodes = [
-        parse_node_link("vless://01234567-89ab-cdef-0123-456789abcdef@example.com:443?encryption=none&security=tls&sni=example.com&type=tcp#n1"),
-        parse_node_link("trojan://pw@example.net:443?security=tls&sni=example.net#n2"),
-    ]
-    cfg = build_xray_autoselect(nodes)
-    tags = [o["tag"] for o in cfg["outbounds"]]
-    assert tags == ["proxy-1", "proxy-2", "direct", "block"], tags
-    # Функциональная проба: t.me, не просто gstatic-пинг.
-    ping = cfg["burstObservatory"]["pingConfig"]
-    assert ping["destination"].startswith("https://t.me/")
-    assert ping["connectivity"].startswith("https://www.gstatic.com/")
-    bal = cfg["routing"]["balancers"][0]
-    assert bal["strategy"]["type"] == "leastLoad" and bal["selector"] == ["proxy-"]
-    rules = cfg["routing"]["rules"]
-    assert rules[-1]["balancerTag"] == "auto"
-    assert rules[1]["outboundTag"] == "block" and rules[1]["port"] == 443  # QUIC block
-    assert cfg["inbounds"][0]["port"] == 2080
-
-
-def test_autoselect_singbox_structure():
-    from subgen.autoselect import build_singbox_autoselect
-    from runtime.parse import parse_node_link
-    hy2 = [parse_node_link("hysteria2://pw@h.example.com:443?sni=h.example.com&insecure=1#hy")]
-    cfg = build_singbox_autoselect(hy2)
-    assert cfg["outbounds"][0]["tag"] == "proxy-1"
-    urltest = cfg["outbounds"][1]
-    assert urltest["type"] == "urltest" and urltest["url"].startswith("https://t.me/")
-    assert cfg["route"]["final"] == "auto"
-    assert cfg["inbounds"][0]["listen_port"] == 2081
-    # Xray-узлы не попадают в sing-box конфиг.
-    vless = [parse_node_link("vless://01234567-89ab-cdef-0123-456789abcdef@example.com:443?encryption=none#v")]
-    assert build_singbox_autoselect(vless) is None
-
-
-def test_autoselect_cli_flag():
-    from subgen.pipeline import build_parser, _apply_stage_aliases
-    args = _apply_stage_aliases(build_parser().parse_args(["--autoselect"]))
-    assert args.autoselect is True
-    args2 = _apply_stage_aliases(build_parser().parse_args([]))
-    assert args2.autoselect is False
-
-
-def test_autoselect_ui_wiring():
-    # settings: ключ в дефолтах.
-    from subgen.settings import DEFAULT_TEST_OPTIONS
-    assert DEFAULT_TEST_OPTIONS.get("autoselect") is False
-    # runner: опция + аргумент.
-    from ui.runner import PipelineOptions, build_pipeline_args
-    opts = PipelineOptions(autoselect=True)
-    assert "--autoselect" in build_pipeline_args(opts, [])
-    opts2 = PipelineOptions(autoselect=False)
-    assert "--autoselect" not in build_pipeline_args(opts2, [])
-    # start_page: тумблер существует.
-    src = open(os.path.join(REPO_ROOT, "python", "ui", "pages", "start_page.py"), encoding="utf-8").read()
-    assert "toggle_autoselect" in src and "Автовыборка (конфиг-балансер)" in src
-    # Никакого «Pizduk» в UI-тексте.
-    assert "pizduk" not in src.lower() and "Pizduk" not in src, "название должно быть «автовыборка», без Pizduk-стиля"
-
-
-# =====================================================================
-# 4. Таймауты этапов привязаны к базовому --timeout
+# 3. Таймауты этапов привязаны к базовому --timeout
 # =====================================================================
 def test_stage_timeouts_derived():
     from subgen.pipeline import build_parser, _apply_stage_aliases
@@ -284,9 +219,9 @@ def test_dead_code_removed():
     assert not os.path.exists(os.path.join(REPO_ROOT, "python", "checkers", "tg_media.py"))
     # 6 не-detailed обёрток удалены.
     for mod, fn in (
-        ("dpi", "check_node_dpi"), ("cidr", "check_node_cidr"),
+        ("dpi", "check_node_dpi"),
         ("zapret", "check_node_zapret"), ("dpi_active", "check_node_dpi_active"),
-        ("telegram_pro", "check_node_telegram_pro"), ("route", "check_node_route"),
+        ("telegram_pro", "check_node_telegram_pro"),
     ):
         src = open(os.path.join(REPO_ROOT, "python", "checkers", f"{mod}.py"), encoding="utf-8").read()
         assert f"def {fn}(" not in src, f"{fn} должен быть удалён"
@@ -367,9 +302,10 @@ def test_runtime_adaptive_threshold_fields():
     cfg2 = XrayRuntimeConfig()
     assert cfg2.upload_min_kbps is None
     assert cfg2.tg_media_min_kbps == 512.0
-    # Стресс-проба использует поля (исходник).
-    core_src = open(os.path.join(REPO_ROOT, "python", "runtime", "core.py"), encoding="utf-8").read()
-    assert "upload_min_kbps" in core_src and "tg_media_min_kbps" in core_src
+    # Стресс-проба использует поля (исходник; после модуляризации core.py
+    # _stress_probe_node живёт в runtime/stress.py — StressMixin).
+    stress_src = open(os.path.join(REPO_ROOT, "python", "runtime", "stress.py"), encoding="utf-8").read()
+    assert "upload_min_kbps" in stress_src and "tg_media_min_kbps" in stress_src
 
 
 def test_refresh_passes_adaptive_thresholds():
@@ -388,7 +324,6 @@ def test_pipeline_baseline_wiring():
     assert "effective_min_speed" in pipe_src
     assert "upload_min_kbps=effective_upload_min" in pipe_src
     assert '"baseline": baseline_report' in pipe_src
-    assert '"autoselect": autoselect_report' in pipe_src
     # Прогресс-этап baseline зарегистрирован.
     assert 'progress.add_stage("baseline"' in pipe_src
 
@@ -451,7 +386,7 @@ def test_sources_file_single_in_root():
     # Сборщик копирует ОДИН sources.txt в build\, без build\data\.
     bat = open(os.path.join(REPO_ROOT, "build_release.bat"), encoding="utf-8", errors="replace").read()
     assert "copy /Y sources.txt build\\sources.txt" in bat
-    assert "data\\sources.txt" not in bat, "дубля в data\ в сборке быть не должно"
+    assert "data\\sources.txt" not in bat, "дубля в data/ в сборке быть не должно"
 
     # .gitignore: data/ игнорируется ЦЕЛИКОМ (там только рантайм-мусор).
     gi = open(os.path.join(REPO_ROOT, ".gitignore"), encoding="utf-8").read()
@@ -504,10 +439,6 @@ def main() -> int:
         ("baseline: эндпоинты Яндекса и QMS (движок Билайна)", test_baseline_yandex_and_qms_endpoints),
         ("baseline: защита приёмника выгрузки (хосты Яндекса)", test_baseline_yandex_host_guard),
         ("baseline: upload-каскад возвращает источник", test_baseline_upload_cascade_signature),
-        ("автовыборка: Xray leastLoad + проба t.me", test_autoselect_xray_structure),
-        ("автовыборка: sing-box urltest для hy2", test_autoselect_singbox_structure),
-        ("автовыборка: CLI-флаг --autoselect", test_autoselect_cli_flag),
-        ("автовыборка: UI-тумблер + settings + runner (без Pizduk-стиля)", test_autoselect_ui_wiring),
         ("таймауты: derivation-формулы в pipeline", test_stage_timeouts_derived),
         ("таймауты: математика выведения (0.5/0.4/0.75/0.6)", test_stage_timeout_derivation_math),
         ("мёртвый код: crypt/tg_media/обёртки/aliases/TUN удалены", test_dead_code_removed),
@@ -516,7 +447,7 @@ def main() -> int:
         ("диагностика: NetworkDiagnosticResult API", test_net_diagnostic_result_api),
         ("рантайм: поля адаптивных порогов", test_runtime_adaptive_threshold_fields),
         ("refresh: проброс адаптивных порогов", test_refresh_passes_adaptive_thresholds),
-        ("pipeline: базлайн + автовыборка подключены", test_pipeline_baseline_wiring),
+        ("pipeline: базлайн подключён", test_pipeline_baseline_wiring),
         ("спеки PyInstaller: runtime/ в hiddenimports", test_specs_include_runtime),
         ("v1.3.2: кэп ≥100 Мбит — замер не слушаем, пороги UI", test_baseline_adapt_fast_channel_cap),
         ("v1.3.2: sources.txt единственный, в корне; data/ — рантайм", test_sources_file_single_in_root),

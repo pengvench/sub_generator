@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import logging
 import secrets
 import socket
 import ssl
@@ -31,6 +32,10 @@ from .types import (
     XRAY_SPEED_TEST_PATH,
     XRAY_SPEED_UPLOAD_PATH,
 )
+
+# stdlib-логгер: мост в stdout + data/run.log ставит subgen.logging
+# (install_stdlib_bridge); debug-уровень включается SUBGEN_DEBUG=1.
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +143,7 @@ def _mlab_ndt7_download_kbps(
     timeout: float = M_LAB_NDT7_TIMEOUT_SEC,
     sample_seconds: float = M_LAB_NDT7_SAMPLE_SEC,
 ) -> float | None:
-    """Прогнать NDT7 download-тест через SOCKS-прокси и вернуть скорость в кбит/с.
+    """Прогнать NDT7 download-тест через SOCKS-прокси и вернуть скорость в КБ/с.
 
     Если locate не вернул URL или канал недоступен — возвращаем None (без фатала).
     """
@@ -197,8 +202,9 @@ def _mlab_ndt7_download_kbps(
             if opcode == 0x9:
                 try:
                     tls.sendall(_ws_build_frame(0xA, payload))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Пинг-фрейм не критичен для замера; фиксируем причину.
+                    _logger.debug("ws pong не отправлен: %s", exc)
                 continue
             if opcode in (0x1, 0x2):
                 if started is None:
@@ -210,7 +216,15 @@ def _mlab_ndt7_download_kbps(
         if started is None or total <= 0:
             return None
         elapsed = max(0.001, time.perf_counter() - started)
-        return (total * 8.0 / 1000.0) / elapsed
+        # Багфикс (P1): единицы измерения. Во всём проекте скорость — КБ/с
+        # (types.py: «Измерения download_kbps/upload_kbps ведутся в КБ/с»;
+        # netsocks._socks_https_*_kbps: (bytes / 1024) / elapsed; пороги
+        # XRAY_MIN_MEDIA_KBPS=2048 КБ/с, TG_MEDIA_MIN_KBPS=512 КБ/с).
+        # Старая формула (total * 8 / 1000) / elapsed давала кбит/с — узел с
+        # реальными 300 КБ/с репортился как ~2400 КБ/с: медленные узлы проходили
+        # порог, а M-Lab всегда побеждал fallback-цепочку (cf/ovh/tele2)
+        # завышенным значением. Приводим к единой единице — КБ/с.
+        return (total / 1024.0) / elapsed
     except Exception:
         return None
     finally:

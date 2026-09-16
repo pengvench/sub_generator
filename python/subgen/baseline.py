@@ -51,12 +51,15 @@ VPN-конфиги всё равно не выдают 100+ Мбит, поэто
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
 from urllib.request import Request, urlopen
 
 from subgen.config import DATA_DIR
+
+_logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Каскад источников замера — только белые для РФ сервисы.
@@ -222,8 +225,10 @@ def _yandex_page_download_url(timeout: float) -> str | None:
         m = re.search(r'"download"\s*:\s*"(https://[^"]+\.svc\.cdn\.yandex\.net/[^"]+)"', html)
         if m:
             return m.group(1)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Фетч страницы интернетометра — штатный fallback-каскад:
+        # недоступность сети тут ожидаема, причину пишем только в debug.
+        _logger.debug("страница интернетометра Yandex недоступна: %s", exc)
     return None
 
 
@@ -572,5 +577,7 @@ def save_baseline_cache(baseline: BaselineResult, info: dict[str, object]) -> No
         path = baseline_cache_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass  # кеш не критичен
+    except Exception as exc:
+        # Кеш не критичен для работы, но потеря последнего замера —
+        # предупреждение: адаптивные пороги соберутся заново (дольше старт).
+        _logger.warning("кеш baseline_last.json не сохранён: %s", exc)

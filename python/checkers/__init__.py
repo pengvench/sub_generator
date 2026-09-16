@@ -5,7 +5,6 @@
 
 - ``checkers.dpi`` — DPI-проверка (методы dpi-ch через прокси) со
   встроенным Zapret-suite (слияние: один core-процесс на узел);
-- ``checkers.cidr`` — проверка CIDR-whitelist ограничений;
 - ``checkers.zapret`` — движок DPI suite (tcp 16-20 POST 64KB по 3
   протоколам + HTTP-тест) и загрузка целей suite.v2.json через hostres;
 - ``checkers.dpi_active`` — активное DPI-тестирование протокола узла
@@ -28,11 +27,6 @@ from .dpi import (
     check_node_dpi_detailed,
 )
 
-from .cidr import (
-    CidrCheckResult,
-    check_node_cidr,
-    check_node_cidr_detailed,
-)
 from .zapret import (
     DPI_SUITE_URL,
     STATUS_BLOCKED,
@@ -67,9 +61,6 @@ __all__ = [
     "DpiCheckResult",
     "check_node_dpi",
     "check_node_dpi_detailed",
-    "CidrCheckResult",
-    "check_node_cidr",
-    "check_node_cidr_detailed",
     "DPI_SUITE_URL",
     "STATUS_BLOCKED",
     "ZapretCheckResult",

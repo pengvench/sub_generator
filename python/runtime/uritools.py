@@ -7,8 +7,11 @@ import base64
 import contextlib
 import html
 import json
+import logging
 import re
 from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
+
+_logger = logging.getLogger(__name__)
 
 # Схемы ссылок узлов — фундаментальная константа канонизации URI.
 NODE_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "hysteria://")
@@ -134,8 +137,10 @@ def _normalize_ss_userinfo(userinfo: str) -> str:
                 decoded = decoder(padded).decode("utf-8", errors="replace")
                 if ":" in decoded:
                     return decoded
-    except Exception:
-        pass
+    except Exception as exc:
+        # Горячий путь парсинга: падение декодеров = штатный fallback
+        # ( userinfo остаётся как есть). Причина — только в debug.
+        _logger.debug("декодирование userinfo %r не удалось: %s", (userinfo or "")[:40], exc)
     return userinfo
 
 

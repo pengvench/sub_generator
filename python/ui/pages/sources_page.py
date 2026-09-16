@@ -1,12 +1,16 @@
 """Страница «Подписки» — управление списком подписок (Material)."""
 from __future__ import annotations
 
+import logging
+
 import tkinter as tk
 
 import customtkinter as ctk
 
 from .. import theme
 from ..tooltip import CTkToolTip
+
+_logger = logging.getLogger(__name__)
 
 
 class SourcesPage(ctk.CTkFrame):
@@ -323,8 +327,10 @@ class SourcesPage(ctk.CTkFrame):
                     fp = str(f.resolve())
                     if fp not in sources:
                         sources.append(fp)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Пользователь включил «saved_subs»: если каталог не прочитался —
+            # часть источников молча пропадёт из проверки, предупреждаем.
+            _logger.warning("saved_subs не прочитаны: %s", exc)
         return sources
 
     def _on_saved_subs_toggle(self) -> None:

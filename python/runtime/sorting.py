@@ -113,6 +113,13 @@ class SortingMixin:
             alive_nodes: list[XrayNode] = []
             tcp_dead = 0
             tcp_started = time.monotonic()
+            # v16: узлы, убитые TCP/UDP-предфильтром, — с причиной. Раньше они
+            # не попадали в last_rejected и в трассировке значились «—» на
+            # стадии quick (в лог2 юзера: 16537 узлов «потерялись хрен пойми
+            # где» — а это просто закрытые порты). Теперь у каждого причина:
+            # tcp_prefilter_dead (порт закрыт/таймаут) или tcp_prefilter_slow
+            # (connect дольше 3с).
+            prefilter_dead: list[XrayProbeResult] = []
             # v11: сохраняем TCP latency для ранней отбраковки медленных нод.
             tcp_latencies: dict = {}  # node.key -> latency_ms
             with ThreadPoolExecutor(max_workers=tcp_workers, thread_name_prefix="tcp-ping") as tcp_executor:
@@ -128,11 +135,21 @@ class SortingMixin:
                         # слишком медленная для туннеля. Пропускаем xray-ping.
                         if latency > 3000.0:
                             tcp_dead += 1
+                            prefilter_dead.append(
+                                XrayProbeResult(
+                                    node, False,
+                                    f"tcp_prefilter_slow ({latency:.0f}мс > 3000мс)",
+                                    None, 0, 1, node.runtime,
+                                )
+                            )
                             continue
                         alive_nodes.append(node)
                         tcp_latencies[node.key] = latency
                     else:
                         tcp_dead += 1
+                        prefilter_dead.append(
+                            XrayProbeResult(node, False, "tcp_prefilter_dead", None, 0, 1, node.runtime)
+                        )
             tcp_elapsed = time.monotonic() - tcp_started
             self._log(
                 f"[xray] TCP/UDP-ping done in {tcp_elapsed:.1f}s: "
@@ -159,6 +176,10 @@ class SortingMixin:
                     reason_counts={"tcp_ping_failed": len(nodes)},
                 )
                 return 0
+
+            # v16: предфильтр-мёртвые попадают в last_rejected — трассировка
+            # видит их причину, а не «—». Сюда же — «все мертвы» случай выше
+            # (он отдельно сохраняет совместимость причины tcp_ping_failed).
 
             # Заменяем nodes на TCP-живые — дальше пингуем только их.
             nodes = alive_nodes
@@ -187,13 +208,24 @@ class SortingMixin:
                 # Быстрая ping-сортировка НЕ трогает last_working (там только
                 # полностью проверенные). Она обновляет ping_candidates и при
                 # необходимости переключает активную ноду на лучший пинг.
-                old_rejected = [item for item in self.last_rejected if item.reason != "quick_ping_failed"]
+                old_rejected = [
+                    item
+                    for item in self.last_rejected
+                    if item.reason != "quick_ping_failed"
+                    and not str(item.reason or "").startswith("tcp_prefilter_")
+                ]
                 new_candidates = sorted(
                     (item for item in outcomes if item.accepted),
                     key=lambda item: (float("inf") if item.latency_ms is None else float(item.latency_ms)),
                 )
                 self.ping_candidates = new_candidates
-                self.last_rejected = old_rejected + [item for item in outcomes if not item.accepted]
+                # v16: предфильтр-мёртвые идут в rejected ПЕРВЫМИ (хронология:
+                # они умерли до xray-ping) — их причины попадают в трассировку.
+                self.last_rejected = (
+                    old_rejected
+                    + prefilter_dead
+                    + [item for item in outcomes if not item.accepted]
+                )
                 if new_candidates:
                     best = new_candidates[0]
                     if self.active_result is None or (

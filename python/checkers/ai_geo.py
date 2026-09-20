@@ -42,6 +42,18 @@ DNS-модуль ядра (IP-literal DoH 1.1.1.1/8.8.8.8). Системный h
 - True  — хотя бы один сигнал (CF loc или Google footer) показывает не-РФ;
 - False — доступный сигнал показывает РФ;
 - None  — сигналы не получены (сервис недоступен/не спарсились) — не фильтрует.
+
+V14: EXIT-IP УЗЛА И ПРОВЕРКА «ПРОЗРАЧНЫХ» УЗЛОВ.
+Пробы ipinfo/ip-api теперь возвращают не только страну, но и сам exit-IP
+узла (``AiGeoResult.exit_ip``); ``fetch_real_ip()`` определяет IP
+пользователя ПРЯМЫМ соединением (без прокси). Если exit-IP узла == ваш
+IP — узел прозрачный: подключение есть, но трафик НЕ туннелируется (ваш
+IP видят все сервисы — ноль анонимности, ахиллесова пята из статьи
+Amnezia «exit-IP ≠ ваш IP»). Конвейер отбрасывает такие узлы ЖЁСТКО —
+но только при ПОЛОЖИТЕЛЬНОМ доказательстве совпадения: любой из IP не
+определён — узел НЕ отсеивается. Важно: сравнение — только SOCKS-путь
+узла (как и все проверки приложения), это НЕ системный leak-тест
+(DNS/WebRTC/IPv6 системы вне области — мы и не должны их проверять).
 """
 from __future__ import annotations
 
@@ -109,6 +121,10 @@ class AiGeoResult:
     ipinfo_country: str = ""  # ISO-код от ipinfo.io/json
     ipapi_country: str = ""   # ISO-код от ip-api.com/json
     consensus_country: str = ""  # финальный вердикт (консенсус 2-of-3)
+    # v14: exit-IP узла (из тела ipinfo/ip-api) — для проверки утечки.
+    # Пусто = не получен (пробы недоступны) — проверки утечки для узла нет.
+    exit_ip: str = ""
+    exit_ip_source: str = ""  # "ipinfo" / "ip-api" (кто отдал IP)
     # Вердикты.
     openai_ok: bool = False  # CF слепок != RU
     gemini_ok: bool = False  # Google footer != Россия
@@ -127,6 +143,8 @@ class AiGeoResult:
             "ipinfo_country": self.ipinfo_country,
             "ipapi_country": self.ipapi_country,
             "consensus_country": self.consensus_country,
+            "exit_ip": self.exit_ip,
+            "exit_ip_source": self.exit_ip_source,
             "openai_ok": self.openai_ok,
             "gemini_ok": self.gemini_ok,
             "ai_unblocked": self.ai_unblocked,
@@ -283,14 +301,24 @@ def _probe_gemini(
 # к британскому прокси. ipinfo/ip-api дают реальный exit-гео.
 _IPINFO_RE = re.compile(rb'"country"\s*:\s*"([A-Za-z]{2})"')
 _IPAPI_RE = re.compile(rb'"countryCode"\s*:\s*"([A-Za-z]{2})"')
+# v14: сам exit-IP из тех же тел — ipinfo отдаёт "ip":"...", ip-api —
+# "query":"..." (поле с IP у них называется по-разному). Класс IPv4/IPv6
+# (hex/точки/двоеточия) — чтобы не захватить мусор.
+_IPINFO_IP_RE = re.compile(rb'"ip"\s*:\s*"([0-9A-Fa-f:.]{3,45})"')
+_IPAPI_IP_RE = re.compile(rb'"query"\s*:\s*"([0-9A-Fa-f:.]{3,45})"')
 
 
 def _probe_ipinfo(
     socks_host: str,
     socks_port: int,
     timeout: float,
-) -> str:
-    """Запрос ipinfo.io/json через прокси. Возвращает ISO-код страны или ''."""
+) -> tuple[str, str]:
+    """Запрос ipinfo.io/json через прокси. Возвращает (ISO-код страны, exit-IP).
+
+    v14: ipinfo отдаёт и сам IP ("ip":"...") — он нужен для проверки
+    «прозрачных» узлов (exit-IP == ваш IP). Любая из двух частей может
+    отсутствовать — тогда соответствующая строка пустая.
+    """
     ok, body, status = base.http_get_body(
         socks_host,
         socks_port,
@@ -302,23 +330,33 @@ def _probe_ipinfo(
         max_bytes=8 * 1024,
     )
     if not ok or status != 200 or not body:
-        return ""
+        return "", ""
     match = _IPINFO_RE.search(body)
-    if match is None:
-        return ""
-    return match.group(1).decode("ascii", errors="replace").upper()
+    country = (
+        match.group(1).decode("ascii", errors="replace").upper()
+        if match is not None else ""
+    )
+    ip_match = _IPINFO_IP_RE.search(body)
+    ip = (
+        ip_match.group(1).decode("ascii", errors="replace")
+        if ip_match is not None else ""
+    )
+    return country, ip
 
 
 def _probe_ipapi(
     socks_host: str,
     socks_port: int,
     timeout: float,
-) -> str:
-    """Запрос ip-api.com/json через прокси. Возвращает ISO-код страны или ''.
+) -> tuple[str, str]:
+    """Запрос ip-api.com/json через прокси. Возвращает (ISO-код страны, exit-IP).
 
     ip-api.com работает по HTTP (без TLS) на 80 порту — это даже надёжнее
     через прокси (нет TLS-handshake DPI-риска). Но мы используем HTTPS на 443
     для единообразия — ip-api.com поддерживает и то, и другое.
+
+    v14: IP узла лежит в поле "query" (нестандартное имя) — достаём тем же
+    запросом, что и страну, без второй пробы.
     """
     ok, body, status = base.http_get_body(
         socks_host,
@@ -331,11 +369,18 @@ def _probe_ipapi(
         max_bytes=8 * 1024,
     )
     if not ok or status != 200 or not body:
-        return ""
+        return "", ""
     match = _IPAPI_RE.search(body)
-    if match is None:
-        return ""
-    return match.group(1).decode("ascii", errors="replace").upper()
+    country = (
+        match.group(1).decode("ascii", errors="replace").upper()
+        if match is not None else ""
+    )
+    ip_match = _IPAPI_IP_RE.search(body)
+    ip = (
+        ip_match.group(1).decode("ascii", errors="replace")
+        if ip_match is not None else ""
+    )
+    return country, ip
 
 
 def _consensus_country(
@@ -388,11 +433,18 @@ def _run_ai_geo_checks(host: str, port: int, timeout: float) -> AiGeoResult:
     result.gemini_reachable = _probe_gemini(host, port, timeout)
     # v11: прямые пробы exit-IP — критичны для CF Worker-узлов, где CF trace
     # показывает гео CF-кеша, а не реальный exit.
-    result.ipinfo_country = _probe_ipinfo(host, port, timeout)
-    result.ipapi_country = _probe_ipapi(host, port, timeout)
+    # v14: те же пробы теперь отдают и сам exit-IP узла (проверка утечки).
+    result.ipinfo_country, ipinfo_ip = _probe_ipinfo(host, port, timeout)
+    result.ipapi_country, ipapi_ip = _probe_ipapi(host, port, timeout)
     result.consensus_country = _consensus_country(
         result.cf_loc, result.ipinfo_country, result.ipapi_country
     )
+    # v14: exit-IP узла — приоритет ipinfo (точнее для non-CF exit),
+    # fallback ip-api. Оба пусты -> exit_ip пуст (проверки утечки нет).
+    if ipinfo_ip:
+        result.exit_ip, result.exit_ip_source = ipinfo_ip, "ipinfo"
+    elif ipapi_ip:
+        result.exit_ip, result.exit_ip_source = ipapi_ip, "ip-api"
 
     # v11: вердикт ai_unblocked теперь строится по consensus_country
     # (а не только по CF), что исправляет ложный «РФ» для CF Worker-узлов.
@@ -416,6 +468,7 @@ def _run_ai_geo_checks(host: str, port: int, timeout: float) -> AiGeoResult:
         "ipinfo_country": result.ipinfo_country,
         "ipapi_country": result.ipapi_country,
         "consensus_country": result.consensus_country,
+        "exit_ip": result.exit_ip,
     }
     return result
 
@@ -449,6 +502,76 @@ def check_node_ai_geo_detailed(
     if result is None:
         return AiGeoResult(checked=False, accepted=False, reason="node_start_failed")
     return result
+
+
+# ---------------------------------------------------------------------
+# v14: IP пользователя ПРЯМЫМ соединением (без прокси) — эталон для
+# проверки «прозрачных» узлов. Тело ipify = сам IP (plain text).
+# ---------------------------------------------------------------------
+_IPIFY_RE = re.compile(rb"^([0-9A-Fa-f:.]{3,45})\s*$", re.DOTALL)
+
+
+def fetch_real_ip(timeout: float = 6.0) -> tuple[str, str]:
+    """Определить IP пользователя ПРЯМЫМ соединением (без прокси).
+
+    Для жёсткого отбора «прозрачных» узлов: если exit-IP узла совпадает с
+    этим IP — узел не туннелирует трафик (подключение есть, анонимности
+    нет). Запрос идёт через checkers.hostres.direct_https_get — DoH-резолв
+    на IP-literal + прямое соединение с SNI: системный hosts-файл не
+    участвует, локальный SOCKS не используется.
+
+    ВАЖНО (ответ на вопрос юзера): сравнение — это только SOCKS-путь узла,
+    как и все проверки приложения. Это НЕ системный leak-тест: DNS/WebRTC/
+    IPv6-утечки системы вне области — мы тестируем узел, а не всю систему.
+
+    Возвращает (ip, источник) или ("", "") при недоступности обоих
+    эндпоинтов — тогда конвейер пропускает проверку утечек (нет эталона).
+    """
+    try:
+        from checkers.hostres import direct_https_get
+    except Exception:
+        return "", ""
+
+    # ipinfo.io/json — тем же парсером, что и прокси-проба ("ip":"...").
+    try:
+        response = direct_https_get(
+            "https://ipinfo.io/json",
+            timeout=timeout,
+            max_bytes=8 * 1024,
+            headers={
+                "User-Agent": "SubGenerator/1.0",
+                "Accept": "application/json",
+            },
+        )
+        if response.ok and response.status == 200 and response.body:
+            match = _IPINFO_IP_RE.search(response.body)
+            if match is not None:
+                return (
+                    match.group(1).decode("ascii", errors="replace"),
+                    "ipinfo.io",
+                )
+    except Exception:
+        pass
+
+    # api.ipify.org — тело ответа = сам IP (plain text).
+    try:
+        response = direct_https_get(
+            "https://api.ipify.org/",
+            timeout=timeout,
+            max_bytes=512,
+            headers={"User-Agent": "SubGenerator/1.0"},
+        )
+        if response.ok and response.status == 200 and response.body:
+            match = _IPIFY_RE.search(response.body.strip())
+            if match is not None:
+                return (
+                    match.group(1).decode("ascii", errors="replace"),
+                    "api.ipify.org",
+                )
+    except Exception:
+        pass
+
+    return "", ""
 
 
 if __name__ == "__main__":

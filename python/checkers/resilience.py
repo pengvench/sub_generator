@@ -804,11 +804,15 @@ def check_node_resilience_detailed(
         route_row: dict | None = None
         if route_check:
             from .route import _run_route
+            # rtt_hint_ms: на медленных каналах (initial p50 > 500мс) базовые
+            # пороги avg/p95/jitter масштабируются от латентности канала —
+            # иначе собственный канал юзера бракует все живые ноды.
             route_res = _run_route(
                 host, port,
                 ROUTE_STRESS_TIMEOUT_SEC,
                 probes=ROUTE_STRESS_PROBES,
                 deadline=time.monotonic() + ROUTE_BUDGET_SEC,
+                rtt_hint_ms=rtt_hint_ms,
             )
             route_row = route_res.row()
         return ResilienceCheckResult(

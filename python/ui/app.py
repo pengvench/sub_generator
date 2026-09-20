@@ -13,13 +13,16 @@ from tkinter import messagebox
 import customtkinter as ctk
 
 from . import paths, theme
+from . import hotkeys
 from .pages.log_page import LogPage
 from .pages.recheck_page import RecheckPage
-from .pages.settings_page import SettingsPage
+from .pages.settings_page import SettingsPage, SettingsRootPage
 from .pages.sources_page import SourcesPage
 from .pages.start_page import StartPage
+from .pages.filters_page import FiltersPage
 from .pages.diag_page import DiagPage
 from .pages.import_page import ImportPage
+from .pages.mysubs_page import MySubsPage
 
 from .runner import PipelineRunner, build_pipeline_args, filter_sources_by_history
 from .tooltip import CTkToolTip
@@ -55,6 +58,11 @@ class SubGenApp(ctk.CTk):
             _logger.debug("иконка окна не установлена: %s", exc)
         # Центрируем окно на экране
         self.update_idletasks()
+
+        # Хоткеи копирования/вставки (Ctrl+C/V/A/X), работающие при ЛЮБОЙ
+        # раскладке — в русской раскладке Tk не матчит <Control-v> по
+        # кириллическому keysym (жалоба юзера 2026-09-20).
+        hotkeys.install(self)
 
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
@@ -112,24 +120,99 @@ class SubGenApp(ctk.CTk):
             return
         self._show_results_dialog(data)
 
+    def _dialog_scale(self) -> float:
+        """Коэффициент DPI-масштаба для диалогов на чистом tk.
+
+        Диалоги результатов — чистый tkinter с геометрией в ФИЗИЧЕСКИХ
+        пикселях, а шрифты в них заданы в ПУНКТАХ и растут вместе с DPI
+        системы (customtkinter делает процесс DPI-aware, tk scaling =
+        dpi/72). При DPI 125–150% контент становился шире окна, и значения,
+        прижатые к правому краю grid-колонки, улетали за видимую область —
+        окно «Результаты» показывало подписи без цифр (инцидент 2026-09-19).
+        Возвращаем множитель относительно эталонных 96 DPI (tk scaling
+        1.333): на 96 DPI это 1.0, на 125% — 1.25, на 150% — 1.5.
+        """
+        try:
+            s = float(self.tk.call("tk", "scaling"))
+        except Exception:
+            s = 96.0 / 72.0
+        if s <= 0.9:
+            # X11 с bitmap-шрифтами рапортует ~1.0 (72 dpi) — не сжимаем окно.
+            return 1.0
+        return max(1.0, s / (96.0 / 72.0))
+
     def _show_results_dialog(self, report: dict) -> None:
-        """Показать модальное окно с результатами прогона."""
-        from tkinter import Toplevel, Label, Button
+        """Показать модальное окно с результатами прогона.
+
+        БАГФИКС (2026-09-19, «заголовки есть, а цифр нет»): при DPI > 100%
+        (или подстановке широкого шрифта вместо Segoe UI) текстовый
+        разделитель «─»×60 и подписи раздували grid-таблицу шире окна —
+        значения со sticky="e" оказывались за правым краем окна. Теперь:
+        размер окна масштабируется под DPI, разделитель — Frame высотой
+        2px (ширина не зависит от шрифта), grid замкнут на размер окна
+        (propagate off), у колонки подписей weight=1 — значения всегда
+        прижаты к правому краю ВИДИМОЙ области.
+        """
+        from tkinter import Toplevel, Label, Button, Frame
+
+        # Считаем строки заранее — высота окна зависит от числа этапов.
+        stage_keys = [
+            ("initial_check", "Initial check"),
+            ("dpi", "DPI-проверка"),
+            ("dpi_active", "DPI-актив"),
+            ("telegram_pro", "Telegram-PRO"),
+            ("ai_geo", "ИИ-гео (Gemini/OpenAI)"),
+            ("route", "Route"),
+            ("resilience", "Resilience"),
+            ("recheck", "Финальный спидтест"),
+        ]
+        sources_report = report.get("sources_report")
+        has_sources = isinstance(sources_report, dict) and sources_report.get("enabled")
+        # v14: строка «Утечки exit-IP» — если leak_check в ai_geo-отчёте включён.
+        ai_geo_stage = report.get("ai_geo")
+        leak_check = (
+            ai_geo_stage.get("leak_check")
+            if isinstance(ai_geo_stage, dict) else None
+        )
+        has_leak = isinstance(leak_check, dict) and leak_check.get("enabled")
+        n_stages = sum(
+            1 for key, _ in stage_keys
+            if isinstance(report.get(key), dict) and report[key].get("enabled")
+        )
+        n_rows = (
+            6
+            + (1 if report.get("pending") else 0)
+            + n_stages
+            + (1 if has_leak else 0)
+            + (1 if has_sources else 0)
+        )
+
+        k = self._dialog_scale()
+        W = int(560 * k)
+        H = int((185 + 26 * n_rows) * k)
 
         dlg = Toplevel(self)
         dlg.title("📊 Результаты прогона")
-        dlg.geometry("520x560")
-        dlg.resizable(False, False)
         dlg.transient(self)
         dlg.configure(bg=str(theme.BG))
 
-        # Центрируем окно.
+        # Центрируем и вписываем в экран.
         dlg.update_idletasks()
         sw = dlg.winfo_screenwidth()
         sh = dlg.winfo_screenheight()
-        x = (sw - 520) // 2
-        y = (sh - 560) // 2
-        dlg.geometry(f"520x560+{x}+{y}")
+        W = max(420, min(W, sw - 80))
+        H = max(400, min(H, sh - 80))
+        x = max(0, (sw - W) // 2)
+        y = max(0, (sh - H) // 2)
+        dlg.geometry(f"{W}x{H}+{x}+{y}")
+        dlg.resizable(False, False)
+
+        # Grid жёстко замкнут на размер окна: колонка подписей забирает всё
+        # дополнительное место, колонка значений прижата к правому краю ОКНА
+        # (а не к правому краю раздутого контента, как раньше).
+        dlg.grid_propagate(False)
+        dlg.columnconfigure(0, weight=1)
+        dlg.columnconfigure(1, weight=0, minsize=110)
 
         def _add_row(row: int, label: str, value: str, color: str = str(theme.TEXT)) -> None:
             lbl = Label(
@@ -161,21 +244,24 @@ class SubGenApp(ctk.CTk):
         _add_row(6, "Экспортировано в подписку:", str(report.get("exported", 0)),
                  color=str(theme.ACCENT))
 
-        sep = Label(dlg, text="─" * 60, bg=str(theme.BG), fg=str(theme.BORDER))
-        sep.grid(row=7, column=0, columnspan=2, padx=20, pady=(10, 4), sticky="ew")
+        # БАГФИКС (2026-09-16): крашнутый прогон раньше не оставлял отчёта
+        # вовсе — окно показывало пустые цифры. Теперь pipeline пишет
+        # pending-отчёт в начале прогона; помечаем его явным предупреждением.
+        sep_row = 7
+        if report.get("pending"):
+            _add_row(7, "⚠ Статус прогона:", "НЕ ЗАВЕРШИЛСЯ (краш/остановка)",
+                     color=str(theme.ERROR))
+            sep_row = 8
+
+        # Разделитель — Frame высотой 2px: ширина не зависит от шрифта/DPI
+        # (текстовый «─»×60 при крупном/подставленном шрифте раздувал
+        # grid-таблицу до тысяч пикселей и выталкивал цифры за край).
+        sep = Frame(dlg, height=2, bg=str(theme.BORDER), bd=0, highlightthickness=0)
+        sep.grid(row=sep_row, column=0, columnspan=2, padx=20, pady=(10, 6), sticky="ew")
 
         # Этапы с количеством прошедших/отбракованных.
-        stage_row = 8
-        for stage_key, stage_label in [
-            ("initial_check", "Initial check"),
-            ("dpi", "DPI-проверка"),
-            ("dpi_active", "DPI-актив"),
-            ("telegram_pro", "Telegram-PRO"),
-            ("ai_geo", "ИИ-гео (Gemini/OpenAI)"),
-            ("route", "Route"),
-            ("resilience", "Resilience"),
-            ("recheck", "Финальный спидтест"),
-        ]:
+        stage_row = sep_row + 1
+        for stage_key, stage_label in stage_keys:
             stage = report.get(stage_key)
             if not isinstance(stage, dict) or not stage.get("enabled"):
                 continue
@@ -187,15 +273,170 @@ class SubGenApp(ctk.CTk):
             )
             _add_row(stage_row, f"{stage_label}:", f"{passed}/{checked} прошли", color)
             stage_row += 1
+            # v14: сразу под ИИ-гео — счётчик прозрачных узлов (утечка
+            # SOCKS-пути: exit-IP узла == ваш IP). Зелёный — утечек нет.
+            if stage_key == "ai_geo":
+                leak = stage.get("leak_check")
+                if isinstance(leak, dict) and leak.get("enabled"):
+                    n_leak = int(leak.get("rejected", 0) or 0)
+                    leak_color = (
+                        str(theme.SUCCESS) if n_leak == 0 else str(theme.ERROR)
+                    )
+                    _add_row(
+                        stage_row,
+                        "Утечки exit-IP (прозрачные):",
+                        f"{n_leak} узлов",
+                        leak_color,
+                    )
+                    stage_row += 1
 
+        # v13: из каких подписок собрана итоговая подписка.
+        sources_report = report.get("sources_report")
+        if isinstance(sources_report, dict) and sources_report.get("enabled"):
+            contributed = sources_report.get("contributed", 0)
+            total_src = sources_report.get("sources_total", 0)
+            dead_src = sources_report.get("dead", 0)
+            src_color = str(theme.SUCCESS) if contributed > 0 else str(theme.ERROR)
+            _add_row(
+                stage_row,
+                "Подписок дали узлы:",
+                f"{contributed} из {total_src} (мёртвых: {dead_src})",
+                color=src_color,
+            )
+            stage_row += 1
 
-        # Кнопки.
+        # Кнопки: детализация по источникам + закрытие.
+        btn_row = stage_row
+        if isinstance(sources_report, dict) and sources_report.get("enabled"):
+            btn_sources = Button(
+                dlg,
+                text="📚 Из каких подписок собрано",
+                bg=str(theme.SIDEBAR), fg=str(theme.TEXT),
+                font=("Segoe UI", 10, "bold"),
+                command=lambda: self._show_sources_dialog(sources_report),
+            )
+            btn_sources.grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(12, 0), sticky="ew")
+            btn_row += 1
+
         btn_close = Button(
             dlg, text="Закрыть", width=14,
             bg=str(theme.ACCENT), fg="#0C1014", font=("Segoe UI", 11, "bold"),
             command=dlg.destroy,
         )
-        btn_close.grid(row=stage_row, column=0, columnspan=2, padx=20, pady=(16, 12))
+        btn_close.grid(row=btn_row, column=0, columnspan=2, padx=20, pady=(16, 12))
+
+    def _show_sources_dialog(self, sources_report: dict) -> None:
+        """Детальный отчёт: из каких подписок собрана итоговая подписка."""
+        import tkinter as tk
+        from tkinter import Toplevel, Label, Button
+        from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, Scrollbar, Text, X, Y
+
+        dlg = Toplevel(self)
+        dlg.title("📚 Из каких подписок собрано")
+        dlg.transient(self)
+        dlg.configure(bg=str(theme.BG))
+
+        # DPI-масштаб (инцидент 2026-09-19): геометрия в физических
+        # пикселях должна расти вместе с DPI, иначе шрифты в пунктах
+        # перестают влезать в окно.
+        k = self._dialog_scale()
+        W = int(760 * k)
+        H = int(560 * k)
+        dlg.update_idletasks()
+        sw = dlg.winfo_screenwidth()
+        sh = dlg.winfo_screenheight()
+        W = max(520, min(W, sw - 80))
+        H = max(360, min(H, sh - 80))
+        x = max(0, (sw - W) // 2)
+        y = max(0, (sh - H) // 2)
+        dlg.geometry(f"{W}x{H}+{x}+{y}")
+
+        header = Label(
+            dlg,
+            text=(
+                f"Итог собран из {sources_report.get('contributed', 0)} подписок — "
+                f"{sources_report.get('nodes_total', 0)} узлов "
+                f"(источников всего: {sources_report.get('sources_total', 0)})"
+            ),
+            bg=str(theme.BG), fg=str(theme.TEXT),
+            font=("Segoe UI", 12, "bold"),
+            anchor="w",
+        )
+        header.pack(fill=X, padx=16, pady=(14, 6))
+
+        frame = tk.Frame(dlg, bg=str(theme.BG))
+        frame.pack(fill=BOTH, expand=True, padx=16, pady=(0, 8))
+
+        text = Text(
+            frame, wrap="none", bg=str(theme.SIDEBAR), fg=str(theme.TEXT),
+            insertbackground=str(theme.TEXT), relief="flat",
+            font=("Consolas", 10), borderwidth=0, highlightthickness=0,
+        )
+        # Ориентации скроллов — строками "vertical"/"horizontal": валидны
+        # и в tk 8.6 (сборки юзера), и в tk 9.x (константы Y/X запрещены).
+        scroll_y = Scrollbar(frame, orient="vertical", command=text.yview)
+        scroll_x = Scrollbar(frame, orient="horizontal", command=text.xview)
+        text.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        scroll_y.pack(side=RIGHT, fill=Y)
+        scroll_x.pack(side=BOTTOM, fill=X)
+        text.pack(side=LEFT, fill=BOTH, expand=True)
+
+        contributed_color = "#7FD18A"      # тон темы: зелёный для давших узлы
+        checked_only_color = "#E0B364"     # жёлтый: узлы были, до финала не дошли
+        dead_color = str(theme.MUTED)      # серый: пустые/мёртвые
+
+        text.tag_configure("hdr", foreground=str(theme.TEXT), font=("Consolas", 10, "bold"))
+        text.tag_configure("ok", foreground=contributed_color)
+        text.tag_configure("mid", foreground=checked_only_color)
+        text.tag_configure("dead", foreground=dead_color)
+
+        text.insert(END, "вклад   узлы→финал  отвалились                 подписка\n", "hdr")
+        text.insert(END, "─" * 92 + "\n", "dead")
+        entries = sources_report.get("nodes") or []
+
+        def _lost_summary(entry: dict) -> str:
+            """v15: компактная сводка «где отвалились узлы подписки».
+
+            lost_at: {стадия: {причина: число}} — берём топ-2 стадии по
+            числу потерь (quick 82, tg 5). Пусто → «—» (всё дожило).
+            """
+            lost = entry.get("lost_at") or {}
+            if not isinstance(lost, dict) or not lost:
+                return "—"
+            stage_counts = []
+            for stage, reasons in lost.items():
+                if isinstance(reasons, dict):
+                    stage_counts.append((str(stage), sum(int(v or 0) for v in reasons.values())))
+            stage_counts.sort(key=lambda kv: -kv[1])
+            parts = [f"{stage} {n}" for stage, n in stage_counts[:2]]
+            return ", ".join(parts) if parts else "—"
+
+        for e in entries:
+            exported = int(e.get("exported", 0) or 0)
+            found = int(e.get("discovered", 0) or 0)
+            share = float(e.get("share_pct", 0.0) or 0.0)
+            src = str(e.get("source", "?"))
+            lost = _lost_summary(e)
+            if exported > 0:
+                tag, prefix = "ok", f"{share:5.1f}%  {found:>4}→{exported:<4}"
+            elif found > 0:
+                tag, prefix = "mid", f"  ---   {found:>4}→0   "
+            else:
+                tag, prefix = "dead", "  ---     0→0   "
+            text.insert(END, f"{prefix} {lost:<24} {src}\n", tag)
+
+        note = str(sources_report.get("note", "") or "")
+        if note:
+            text.insert(END, "\n" + note + "\n", "dead")
+
+        text.configure(state="disabled")
+
+        btn_close = Button(
+            dlg, text="Закрыть", width=14,
+            bg=str(theme.ACCENT), fg="#0C1014", font=("Segoe UI", 11, "bold"),
+            command=dlg.destroy,
+        )
+        btn_close.pack(pady=(2, 14))
 
 
     # ------------------------------------------------------------ sidebar
@@ -216,7 +457,7 @@ class SubGenApp(ctk.CTk):
         logo.grid(row=0, column=0, padx=16, pady=(24, 2), sticky="w")
 
         logo_sub = ctk.CTkLabel(
-            self.sidebar, text="конфиги из подписок",
+            self.sidebar, text="находит рабочие VPN-конфиги",
             text_color=theme.MUTED,
             font=ctk.CTkFont(size=11),
         )
@@ -226,34 +467,21 @@ class SubGenApp(ctk.CTk):
         sep = ctk.CTkFrame(self.sidebar, height=1, fg_color=theme.BORDER)
         sep.grid(row=2, column=0, padx=14, sticky="ew")
 
-        self.btn_start = self._nav_button(3, "▶ Тестирование", "start")
-        self.btn_sources = self._nav_button(4, "📚 Подписки", "sources")
-        self.btn_import = self._nav_button(5, "📥 Импорт", "import")
-        self.btn_recheck = self._nav_button(6, "🔁 Перепроверка", "recheck")
-        self.btn_diag = self._nav_button(7, "🔬 Диагностика", "diag")
-        self.btn_log = self._nav_button(8, "📊 Лог", "log")
-        self.btn_settings = self._nav_button(9, "⚙ Настройки", "settings")
+        # v17 (запрос юзера): меню — всего 4 пункта: Запуск / Мои
+        # подписки / Перепроверка / Настройки. Бывшие «Импорт» и «Фильтры» —
+        # вкладки страницы «Мои подписки»; «Диагностика» и «Журнал» — вкладки
+        # «Настроек». Порядок — как ими пользуются.
+        self.btn_start = self._nav_button(3, "🚀 Запуск", "start")
+        self.btn_sources = self._nav_button(4, "📚 Мои подписки", "sources")
+        self.btn_recheck = self._nav_button(5, "🔁 Перепроверка", "recheck")
+        self.btn_settings = self._nav_button(6, "⚙ Настройки", "settings")
 
         self._nav_buttons = {
             "start": self.btn_start,
             "sources": self.btn_sources,
-            "import": self.btn_import,
             "recheck": self.btn_recheck,
-            "diag": self.btn_diag,
-            "log": self.btn_log,
             "settings": self.btn_settings,
         }
-
-
-        # Низ сайдбара: версия/источник
-        foot = ctk.CTkLabel(
-            self.sidebar,
-            text=f"sources.txt · data/\nsubs.txt — рядом с exe",
-            text_color=theme.MUTED,
-            font=ctk.CTkFont(size=10),
-            justify="left",
-        )
-        foot.grid(row=10, column=0, padx=16, pady=16, sticky="sw")
 
     def _nav_button(self, row, text, page) -> ctk.CTkButton:
         btn = ctk.CTkButton(
@@ -272,6 +500,17 @@ class SubGenApp(ctk.CTk):
         return btn
 
     # ------------------------------------------------------------ pages
+    # v17: бывшие отдельные страницы — вкладки: «Импорт»/«Фильтры» внутри
+    # «Мои подписки», «Диагностика»/«Журнал» внутри «Настройки». Ключи
+    # import/filters/diag/log остаются рабочими (алиасы) — весь старый код
+    # навигации (_show_page("import") и т.д.) продолжает работать.
+    _PAGE_ALIASES = {
+        "import": ("sources", "import"),
+        "filters": ("sources", "filters"),
+        "diag": ("settings", "diag"),
+        "log": ("settings", "log"),
+    }
+
     def _build_pages(self) -> None:
         self.pages_frame = ctk.CTkFrame(self, fg_color=theme.BG)
         self.pages_frame.grid(row=0, column=1, sticky="nsew")
@@ -279,36 +518,69 @@ class SubGenApp(ctk.CTk):
         self.pages_frame.grid_rowconfigure(0, weight=1)
 
         self.page_start = StartPage(self.pages_frame, self)
-        self.page_sources = SourcesPage(self.pages_frame, self)
-        self.page_import = ImportPage(self.pages_frame, self)
+        self.page_mysubs = MySubsPage(self.pages_frame, self)
+        self.page_settings_root = SettingsRootPage(self.pages_frame, self)
         self.page_recheck = RecheckPage(self.pages_frame, self)
-        self.page_diag = DiagPage(self.pages_frame, self)
-        self.page_log = LogPage(self.pages_frame, self)
-        self.page_settings = SettingsPage(self.pages_frame, self)
+
+        # Ссылки на дочерние страницы-вкладки — ВЕСЬ существующий код
+        # (page_sources.get_sources, page_log.append_log, …) не меняется.
+        self.page_sources = self.page_mysubs.list_tab
+        self.page_import = self.page_mysubs.import_tab
+        self.page_filters = self.page_mysubs.filters_tab
+        self.page_settings = self.page_settings_root.basic_tab
+        self.page_diag = self.page_settings_root.diag_tab
+        self.page_log = self.page_settings_root.log_tab
 
         self.pages = {
             "start": self.page_start,
-            "sources": self.page_sources,
-            "import": self.page_import,
+            "sources": self.page_mysubs,
             "recheck": self.page_recheck,
-            "diag": self.page_diag,
-            "log": self.page_log,
-            "settings": self.page_settings,
+            "settings": self.page_settings_root,
         }
 
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
 
     def _show_page(self, name: str) -> None:
-        page = self.pages[name]
+        # Алиасы вкладок: показываем страницу-контейнер + включаем вкладку.
+        # Прямой клик по пункту меню открывает вкладку ПО УМОЛЧАНИЮ
+        # («Список» / «Основные») — предсказуемо для новичка; навигация
+        # кнопками-ссылками (напр. «⬇ Импорт…») открывает нужную вкладку.
+        target, tab = self._PAGE_ALIASES.get(name, (name, None))
+        page = self.pages[target]
+        if target == "sources":
+            show_tab = getattr(page, "show_tab", None)
+            if show_tab is not None:
+                show_tab(tab or "sources")
+        elif target == "settings":
+            show_tab = getattr(page, "show_tab", None)
+            if show_tab is not None:
+                show_tab(tab or "basic")
+        elif tab is not None:
+            show_tab = getattr(page, "show_tab", None)
+            if show_tab is not None:
+                show_tab(tab)
         page.tkraise()
+        # v16: при показе главной — обновить счётчик подписок в режиме «Просто»
+        # (мог измениться со страницы «Мои подписки»).
+        if target == "start":
+            try:
+                self.page_start.refresh_novice()
+            except Exception:
+                pass
         # При показе страницы перепроверки обновляем доступность этапов
         # (после завершения прогона кеш мог появиться).
-        if name == "recheck":
+        if target == "recheck":
             self.page_recheck.refresh_availability()
+        # v17: при показе «Мои подписки» — обновить список файлов импорта.
+        if target == "sources":
+            try:
+                self.page_mysubs.on_shown()
+            except Exception:
+                pass
 
         for key, btn in self._nav_buttons.items():
-            active = key == name
+            active = key == target
             btn.configure(
                 fg_color=theme.ACCENT_SOFT if active else "transparent",
                 text_color=theme.ACCENT_HOVER if active else theme.TEXT,
@@ -347,7 +619,7 @@ class SubGenApp(ctk.CTk):
 
         # Подсказка: запуск происходит в отдельном окне PowerShell.
         self.lbl_hint = ctk.CTkLabel(
-            inner, text="Запуск откроет PowerShell и закроет окно",
+            inner, text="Проверка идёт в отдельном окне консоли — не закрывайте его",
             text_color=theme.MUTED, anchor="e",
             font=ctk.CTkFont(size=11),
         )
@@ -374,11 +646,9 @@ class SubGenApp(ctk.CTk):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self.page_start.set_running(busy)
-        self.page_sources.set_busy(busy)
+        self.page_mysubs.set_busy(busy)
         self.page_recheck.set_busy(busy)
-        self.page_diag.set_busy(busy)
-        self.page_log.set_busy(busy)
-        self.page_settings.set_busy(busy)
+        self.page_settings_root.set_busy(busy)
 
 
     # ------------------------------------------------------------ actions
@@ -389,7 +659,10 @@ class SubGenApp(ctk.CTk):
         options = self.page_start.get_options()
         # Сохраняем настройки тестирования (workers, timeout, тумблеры),
         # чтобы при следующем запуске пользователь получил те же значения.
+        # Вкладка «Фильтры» сохраняет свои ключи отдельно (merge — ключи
+        # этой страницы не затираются).
         self.page_start.save_current_settings()
+        self.page_filters.save_current_settings()
         # start_stage берём со страницы «Перепроверка».
         options.start_stage = self.page_recheck.get_start_stage()
         sources = self.page_sources.get_sources()
@@ -408,7 +681,7 @@ class SubGenApp(ctk.CTk):
         # Кастомный файл конфигов (страница «Тестирование») заменяет подписки:
         # можно запускать проверку вообще без sources.txt.
         if not sources and not options.custom_file:
-            self.show_status("Список подписок пуст. Добавьте подписки на странице «Подписки».", error=True)
+            self.show_status("Список подписок пуст. Добавьте их на странице «Мои подписки».", error=True)
             self._show_page("sources")
             return
 
@@ -599,7 +872,7 @@ class SubGenApp(ctk.CTk):
         for u in failed:
             self.page_log.append_log(f"✗ не импортировалась/пустая: {u}")
         if dead:
-            self.page_log.append_log("Совет: удалите мёртвые подписки кнопкой «🧹 Отсеять мусорные» на странице «Подписки».")
+            self.page_log.append_log("Совет: удалите мёртвые подписки кнопкой «🧹 Убрать мёртвые…» на странице «Мои подписки».")
 
         self._set_progress(100, "проверка живучести завершена")
         self.show_status(f"Живых подписок: {len(alive_urls)} из {len(total)}")

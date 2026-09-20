@@ -30,21 +30,17 @@ class DiagPage(ctk.CTkFrame):
         self.app = app
         self.configure(fg_color=theme.BG)
 
+        # v17: страница живёт во вкладке «Диагностика» страницы «Настройки» —
+        # большого заголовка здесь больше нет.
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-
-        header = ctk.CTkLabel(
-            self, text="🔬 Диагностика сети",
-            font=ctk.CTkFont(size=22, weight="bold"), text_color=theme.TEXT,
-        )
-        header.grid(row=0, column=0, padx=20, pady=(16, 10), sticky="w")
+        self.grid_rowconfigure(0, weight=1)
 
         self.scroll = ctk.CTkScrollableFrame(
             self, fg_color="transparent",
             scrollbar_button_color=theme.ACCENT,
             scrollbar_button_hover_color=theme.ACCENT_HOVER,
         )
-        self.scroll.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="nsew")
+        self.scroll.grid(row=0, column=0, padx=8, pady=(8, 8), sticky="nsew")
         self.scroll.grid_columnconfigure(0, weight=1)
 
         # --- Кнопка запуска ---

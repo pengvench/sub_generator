@@ -13,6 +13,27 @@ from .types import XrayNode, _safe_fingerprint, _truthy, _SAFE_DEFAULT_FINGERPRI
 _logger = logging.getLogger(__name__)
 
 
+def _unquote_query(value: str) -> str:
+    """Раскодировать %-encoding в query-параметре, если он закодирован.
+
+    parse_qs обычно уже раскодирует значения, но звенья конвейера могут
+    передавать параметр в сыром виде (%7B%22…%7D) — поддерживаем оба.
+    """
+    text = str(value or "")
+    if "%" in text:
+        try:
+            from urllib.parse import unquote
+
+            decoded = unquote(text)
+            # Двойное кодирование встречается у некоторых генераторов.
+            if "%" in decoded:
+                decoded = unquote(decoded)
+            return decoded
+        except Exception:  # noqa: BLE001
+            return text
+    return text
+
+
 def _xray_config(
     node: XrayNode,
     listen_host: str,
@@ -142,7 +163,13 @@ def _xray_outbound(node: XrayNode, *, fp: str | None = None) -> dict[str, Any]:
     # Анти-детект ТСПУ: mux консолидирует параллельные TLS-соединения к одному
     # SNI в одно (Сигнал 3 «заморозки»). XTLS Vision несовместим с TCP-mux
     # («MUX is not compatible with XTLS raw connections») — только XUDP.
-    if node.protocol in ("vless", "vmess", "trojan"):
+    # v15: XHTTP/splithttp НЕСОВМЕСТИМ с mux (документация Xray-core:
+    # «XHTTP does not support mux») — для этих транспортов mux выключен.
+    # Раньше mux включался всем vless/vmess/trojan подряд — Happ-подобные
+    # CDN-фронтинг конфиги (vless+xhttp через Fastly) из-за этого не
+    # проходили туннелирование трафика.
+    _network_name = (node.query.get("type") or node.query.get("network") or "tcp").strip().lower()
+    if node.protocol in ("vless", "vmess", "trojan") and _network_name not in ("xhttp", "splithttp"):
         if flow == "xtls-rprx-vision":
             outbound["mux"] = {"enabled": True, "concurrency": -1, "xudpConcurrency": 16, "xudpProxyUDP443": "reject"}
         else:
@@ -277,6 +304,18 @@ def _xray_stream_settings(query: dict[str, str], *, fp: str | None = None) -> di
             xhttp["host"] = query["host"]
         if query.get("mode"):
             xhttp["mode"] = query["mode"]
+        # v15: passthrough параметра extra — Happ-подобные подписки задают
+        # tuning XHTTP (scMaxEachPostBytes/scMaxConcurrentPosts/xPaddingBytes/
+        # noGRPCHeader) именно через него; раньше параметр молча терялся и
+        # узел ходил с дефолтами транспорта.
+        _extra_raw = query.get("extra")
+        if _extra_raw:
+            try:
+                _extra = json.loads(_unquote_query(_extra_raw))
+                if isinstance(_extra, dict):
+                    xhttp["extra"] = _extra
+            except Exception:  # noqa: BLE001 — битый extra не должен ронять конфиг
+                _logger.debug("xhttp extra не разобран: %r", _extra_raw[:120])
         stream["xhttpSettings"] = xhttp
     elif network == "splithttp":
         xhttp: dict[str, Any] = {}
@@ -286,6 +325,14 @@ def _xray_stream_settings(query: dict[str, str], *, fp: str | None = None) -> di
             xhttp["host"] = query["host"]
         if query.get("mode"):
             xhttp["mode"] = query["mode"]
+        _extra_raw = query.get("extra")
+        if _extra_raw:
+            try:
+                _extra = json.loads(_unquote_query(_extra_raw))
+                if isinstance(_extra, dict):
+                    xhttp["extra"] = _extra
+            except Exception:  # noqa: BLE001
+                pass
         stream["splithttpSettings"] = xhttp
     elif network == "kcp":
         kcp: dict[str, Any] = {

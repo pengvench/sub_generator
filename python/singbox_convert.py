@@ -4,9 +4,10 @@ sing-box читает свой формат outbound'ов, отличающий�
   - транспорт и TLS живут ВНУТРИ outbound'а (transport / tls), а не в
     отдельном streamSettings;
   - reality — вложенный блок tls.reality (public_key/short_id), а не
-    realitySettings; pbk ДОЛЖЕН быть нормализован до стандартного base64
-    (URL-safe и без padding sing-box не принимает — падает на старте с
-    «decode public_key: illegal base64 data»);
+    realitySettings; pbk ДОЛЖЕН быть нормализован до URL-safe base64
+    БЕЗ padding (sing-box декодирует через base64.RawURLEncoding: std
+    '+'/'/' он отвергает — падает на старте с «decode public_key:
+    illegal base64 data at input byte K», K = позиция первого '+');
   - vless-transport'ы: tcp (в т.ч. header http), ws, grpc, httpupgrade,
     http (h2) — конвертируются; xhttp/splithttp, kcp, quic — в sing-box
     НЕТ, такие узлы пропускаются.
@@ -45,38 +46,42 @@ _SINGBOX_DEFAULT_FP = "chrome"
 
 
 def _normalize_reality_pbk(value: str) -> str:
-    """Нормализовать Reality publicKey под ДЕКОДЕР sing-box.
+    """Нормализовать Reality publicKey под ДЕКОДЕР sing-box (RawURLEncoding).
 
-    sing-box читает public_key как raw-base64 БЕЗ паддинга: ключ с
-    добитыми '=' падает на старте («decode public_key: illegal base64
-    data», инцидент лог5 — нормализация «как для xray» тут НЕ подходит,
-    xray наоборот требует паддинг). URL-safe символы ('-'/'_') sing-box
-    принимает, но приводим к std для единообразия.
+    БАГФИКС (P0, инцидент лог.zip 2026-09-16): sing-box парсит public_key
+    через base64.RawURLEncoding — ТОЛЬКО URL-safe алфавит ('-'/'_') без '='.
+    Std-символы '+'/'/' он отвергает («initialize outbound[N]: decode
+    public_key: illegal base64 data at input byte K» — K указывает ровно
+    на позицию первого '+'). Старая нормализация делала ОБРАТНОЕ: приводила
+    url-safe к std ('-'→'+', '_'→'/') и этим ЛОМАЛА рабочие ключи — 109
+    из 122 reality-нод упавшего батча содержали std-символы после
+    нормализации. Каждый пул с reality-нодой не стартовал, и все 200 узлов
+    батча сваливались в медленный per-node fallback (а там — memory-bomb
+    из полных XrayCoreRuntime на каждый узел, см. runtime/core.py).
 
-    v11: если после нормализации ключ НЕ декодируется (мусор типа '-',
-    'abc', одинарных символов) — возвращаем пустую строку. Это позволит
-    вызывающему коду отбросить ноду как unsupported, вместо того чтобы
-    валить весь sing-box процесс.
+    Возврат "" = ключ не декодируется как base64 — узел помечается
+    unsupported в sing_box_outbound и идёт через xray-путь, а не валит
+    весь батч.
     """
     import base64 as _b64
     text = str(value or "").strip()
     if not text:
         return text
-    if "-" in text or "_" in text:
-        text = text.replace("-", "+").replace("_", "/")
-    # sing-box: RawStdEncoding — паддинг ЗАПРЕЩЁН, срезаем.
-    text = text.rstrip("=")
-    # v11: валидация — пробуем декодировать. Если мусор — возвращаем "".
-    #sing-box использует RawURLEncoding (без padding), но после замены -/+ и _//
-    # это эквивалентно std base64 без padding.
+    # К URL-safe алфавиту и без паддинга — так декодирует sing-box
+    # (и xray-core v26+: RawURLEncoding, см. runtime/configs.py).
+    cleaned = text.replace("+", "-").replace("/", "_").rstrip("=")
+    # Валидация алфавита (b64decode с altchars принимает ОБА алфавита,
+    # поэтому '+'/'/' отвергаем только явной проверкой символов).
+    if not cleaned or not all(c.isalnum() or c in "-_" for c in cleaned):
+        return ""
     try:
-        padded = text + "=" * (-len(text) % 4)
-        decoded = _b64.b64decode(padded, validate=True)
-        # Reality public key — это X25519 ключ, 32 байта. Но sing-box
-        # принимает любой валидный base64 — не будем строго проверять длину.
+        padded = cleaned + "=" * (-len(cleaned) % 4)
+        decoded = _b64.b64decode(padded, altchars=b"-_", validate=True)
+        # Reality public key — X25519, 32 байта. Длину не проверяем строго
+        # (принципиальна валидность base64 для декодера sing-box).
         if len(decoded) == 0:
             return ""
-        return text
+        return cleaned
     except Exception:
         return ""
 
@@ -228,8 +233,9 @@ def _tls_block(node: "XrayNode", fp: str | None) -> tuple[dict[str, Any] | None,
             return None, "reality without public_key (pbk)"
         normalized_pbk = _normalize_reality_pbk(pbk)
         if not normalized_pbk:
-            # v11: pbk есть, но после нормализации стал пустым = мусор
-            # (например '-' или 'abc' — не валидный base64). Sing-box упадёт.
+            # pbk есть, но не декодируется как URL-safe base64 = мусор
+            # ('-', 'abc', одинарные символы). Узел помечаем unsupported —
+            # он пойдёт через xray-путь, а не уронит весь батч.
             return None, f"reality with invalid public_key (pbk={pbk!r})"
         reality: dict[str, Any] = {"enabled": True, "public_key": normalized_pbk}
         sid = _q(query, "sid", "shortId")

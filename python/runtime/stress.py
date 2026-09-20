@@ -269,8 +269,14 @@ class StressMixin:
 
         v11: ретрай при сбросе процесса (xray.exe иногда падает при старте под
         высокой нагрузкой — 32 параллельных инстанса исчерпывают ресурсы).
-       sleep уменьшен с 0.8 до 0.4 сек (SOCKS поднимается за 200-400мс).
+        v15: слепой sleep(0.4) заменён на ожидание готовности SOCKS-порта
+        (_wait_socks_port из probing): под нагрузкой порт запаздывает и все
+        пробы чекера ловили «connection refused» — узел ложно браковался;
+        на разгруженной машине ожидание завершается раньше sleep (порт
+        поднимается за ~150-250мс).
         """
+        from .probing import _wait_socks_port
+
         binary = self._binary_for_node(node)
         if not binary:
             raise RuntimeError(f"{node.runtime} binary not found")
@@ -291,13 +297,15 @@ class StressMixin:
                     creationflags=_subprocess_no_window(),
                 )
                 self._assign_to_process_job(proc)
-                # v11: sleep 0.4 вместо 0.8 — SOCKS поднимается за 200-400мс.
-                # Раньше 0.8 сек × 174 ноды × 9 чекеров = 21 минута чистого sleep.
-                time.sleep(0.4)
-                if proc.poll() is not None:
-                    # Ядро упало при старте. На первой попытке — ретрай (возможно,
-                    # ресурсов не хватило). На второй — кидаем исключение.
-                    last_error = RuntimeError(f"{node.runtime} exited during startup (attempt {attempt+1})")
+                # v15: ждём готовности SOCKS-порта вместо слепого sleep(0.4) —
+                # надёжно под нагрузкой и быстрее на разгруженной машине.
+                if not _wait_socks_port(proc, port, 2.5):
+                    if proc.poll() is not None:
+                        # Ядро упало при старте. На первой попытке — ретрай (возможно,
+                        # ресурсов не хватило). На второй — кидаем исключение.
+                        last_error = RuntimeError(f"{node.runtime} exited during startup (attempt {attempt+1})")
+                        continue
+                    last_error = RuntimeError(f"{node.runtime} SOCKS port not listening (attempt {attempt+1})")
                     continue
                 return fn("127.0.0.1", port)
             except Exception as exc:

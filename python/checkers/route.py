@@ -51,6 +51,36 @@ ROUTE_MAX_P95_MS = 800.0
 # Порог джиттера (мс).
 ROUTE_MAX_JITTER_MS = 80.0
 
+# Множители адаптивных порогов от rtt_hint (медиана сквозной латентности
+# канала из initial-check, мс). Замер RTT здесь — ПОЛНЫЙ TLS-handshake через
+# туннель (TCP connect + SOCKS CONNECT + TLS + HTTP RTT ≈ 3-5 сквозных RTT),
+# а не одиночный ping: на каналах с высокой латентностью (мобильные сети,
+# initial p50 > 500мс) базовый порог avg≤500 математически недостижим почти
+# ни для одной ноды — конвейер выкашивает живые рабочие узлы (инцидент
+# 2026-09-17: 61 из 111 живых отклонён, у 51 причиной был avg>500 при
+# собственной медиане канала юзера 614мс).
+ROUTE_RTT_SCALE_AVG = 1.0
+ROUTE_RTT_SCALE_P95 = 1.5
+ROUTE_RTT_SCALE_JITTER = 0.25
+
+
+def route_thresholds(rtt_hint_ms: float | None) -> dict[str, float]:
+    """Пороги стабильности маршрута с учётом латентности канала.
+
+    При ``rtt_hint_ms`` выше базового порога avg пороги масштабируются от
+    сквозной латентности канала: медленный канал юзера не должен браковать
+    ноды, которые на этом канале физически не могут ответить быстрее.
+    ``loss`` не масштабируется — потери не объясняются латентностью канала.
+    """
+    max_avg = ROUTE_MAX_AVG_MS
+    max_p95 = ROUTE_MAX_P95_MS
+    max_jitter = ROUTE_MAX_JITTER_MS
+    if rtt_hint_ms is not None and rtt_hint_ms > ROUTE_MAX_AVG_MS:
+        max_avg = max(max_avg, rtt_hint_ms * ROUTE_RTT_SCALE_AVG)
+        max_p95 = max(max_p95, rtt_hint_ms * ROUTE_RTT_SCALE_P95)
+        max_jitter = max(max_jitter, rtt_hint_ms * ROUTE_RTT_SCALE_JITTER)
+    return {"avg_ms": max_avg, "p95_ms": max_p95, "jitter_ms": max_jitter, "loss": ROUTE_MAX_LOSS}
+
 
 @dataclass
 class RouteCheckResult:
@@ -125,6 +155,7 @@ def _run_route(
     *,
     probes: int = ROUTE_PROBES,
     deadline: float | None = None,
+    rtt_hint_ms: float | None = None,
 ) -> RouteCheckResult:
     """Выполнить серию замеров RTT через поднятый SOCKS-прокси узла.
 
@@ -132,8 +163,15 @@ def _run_route(
     серию — те же пороги, но меньше попыток).
     ``deadline`` — time.monotonic() момент, после которого новые пробы не
     начинаются (уже идущая попытка дорабатывает до своего timeout).
+    ``rtt_hint_ms`` — медиана сквозной латентности канала (initial-check p50):
+    на медленных каналах пороги avg/p95/jitter масштабируются от неё, чтобы
+    собственная латентность канала юзера не браковала живые ноды.
     """
     probe_count = max(3, int(probes))
+    thresholds = route_thresholds(rtt_hint_ms)
+    max_avg = thresholds["avg_ms"]
+    max_p95 = thresholds["p95_ms"]
+    max_jitter = thresholds["jitter_ms"]
     rtts: list[float] = []
     lost = 0
     for i in range(probe_count):
@@ -165,20 +203,38 @@ def _run_route(
             jitter = 0.0
         loss = lost / probes_total
 
+    violations: list[str] = []
+    # v15 (инцидент 2026-09-19, лог юзера: 35 узлов убиты high_loss при
+    # ОДНОМ потерянном зонде из 5): с малым числом зондов (стресс-режим — 5)
+    # гранулярность потерь 20%: один таймаут-спайк (скачок нагрузки конвейера
+    # на 32 параллельных проверках) мгновенно давал «loss 20% > 5%» и узел
+    # отбрасывался. Допускаем ОДИН потерянный зонд: порог потерь =
+    # max(ROUTE_MAX_LOSS, 1/probes) — при 5 зондах 20% (1/5 проходит, 2/5 — нет),
+    # при 10 — 10%. Потери 2+ зондов по-прежнему бракуются.
+    eff_max_loss = max(ROUTE_MAX_LOSS, 1.0 / max(1, probe_count))
+    if loss is not None and loss > eff_max_loss:
+        violations.append(f"loss {loss:.0%} > {eff_max_loss:.0%}")
+    if ping_avg is not None and ping_avg > max_avg:
+        violations.append(f"avg {ping_avg:.0f} > {max_avg:.0f}ms")
+    if ping_p95 is not None and ping_p95 > max_p95:
+        violations.append(f"p95 {ping_p95:.0f} > {max_p95:.0f}ms")
+    if jitter is not None and jitter > max_jitter:
+        violations.append(f"jitter {jitter:.0f} > {max_jitter:.0f}ms")
+
     accepted = (
         probes_ok > 0
         and probes_total >= 3
         and loss is not None
-        and loss <= ROUTE_MAX_LOSS
+        and loss <= eff_max_loss
         and ping_avg is not None
-        and ping_avg <= ROUTE_MAX_AVG_MS
+        and ping_avg <= max_avg
         and ping_p95 is not None
-        and ping_p95 <= ROUTE_MAX_P95_MS
+        and ping_p95 <= max_p95
         and jitter is not None
-        and jitter <= ROUTE_MAX_JITTER_MS
+        and jitter <= max_jitter
     )
     reason = "ready" if accepted else "route_unstable"
-    if loss is not None and loss > ROUTE_MAX_LOSS:
+    if loss is not None and loss > eff_max_loss:
         reason = "high_loss"
     elif probes_total < 3:
         # Дедлайн батареи съел время на пробы — данных мало, вердикта нет.
@@ -197,9 +253,11 @@ def _run_route(
             "control_host": ROUTE_CONTROL_HOST,
             "probes": [round(x, 1) for x in rtts],
             "max_loss": ROUTE_MAX_LOSS,
-            "max_avg_ms": ROUTE_MAX_AVG_MS,
-            "max_p95_ms": ROUTE_MAX_P95_MS,
-            "max_jitter_ms": ROUTE_MAX_JITTER_MS,
+            "max_avg_ms": round(max_avg, 1),
+            "max_p95_ms": round(max_p95, 1),
+            "max_jitter_ms": round(max_jitter, 1),
+            "rtt_hint_ms": round(rtt_hint_ms, 1) if rtt_hint_ms is not None else None,
+            "violations": violations,
         },
     )
 

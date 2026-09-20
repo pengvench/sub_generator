@@ -30,6 +30,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -227,6 +228,51 @@ class SingBoxBatchPool:
     def is_started(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def _drop_outbound_at(self, index: int) -> tuple | None:
+        """Исключить outbound по индексу из конфига (БАГФИКС 2026-09-16).
+
+        Один битый outbound (например, reality public_key, который не
+        декодируется) раньше ронял ВЕСЬ батч из 200 узлов: sing-box check
+        завершался ошибкой, пул не стартовал, и все узлы сваливались в
+        медленный per-node fallback. Теперь битый узел исключается из
+        конфига (его key уходит в unsupported — пайплайн проверит его через
+        xray-путь), а пул стартует без него.
+
+        Возвращает node.key исключённого узла или None (индекс не указывает
+        на прокси-outbound — например, это selector/direct/block из шаблона).
+        """
+        if self._config is None or index < 0:
+            return None
+        outbounds = self._config.get("outbounds") or []
+        if index >= len(outbounds):
+            return None
+        ob = outbounds[index]
+        tag = str(ob.get("tag") or "")
+        node_key = self._tag_to_node_key.pop(tag, None)
+        if node_key is not None:
+            self._node_key_to_tag.pop(node_key, None)
+            self._unsupported_keys.add(node_key)
+        outbounds.pop(index)
+        # Тег надо убрать и из selector'а, иначе sing-box не найдёт outbound.
+        for extra in outbounds:
+            if isinstance(extra, dict) and extra.get("type") == "selector":
+                tags = [t for t in (extra.get("outbounds") or []) if t != tag]
+                extra["outbounds"] = tags
+                if extra.get("default") == tag:
+                    extra["default"] = tags[0] if tags else ""
+                break
+        return node_key
+
+    def _proxy_outbound_count(self) -> int:
+        """Сколько прокси-outbound'ов (не selector/direct/block) осталось."""
+        if self._config is None:
+            return 0
+        return sum(
+            1
+            for ob in (self._config.get("outbounds") or [])
+            if isinstance(ob, dict) and ob.get("type") not in ("selector", "direct", "block")
+        )
+
     def start(self) -> bool:
         """Запустить sing-box процесс. Возвращает True при успехе."""
         if self._config is None:
@@ -248,24 +294,64 @@ class SingBoxBatchPool:
             self._log(f"[sb-pool#{self.batch_id}] не удалось записать конфиг: {exc}")
             return False
 
-        # v11: валидация конфига ДО запуска через `sing-box check -c <path>`.
-        # Если конфиг невалиден — sing-box run всё равно упадёт через 1с, но
-        # мы потеряем время. check мгновенно возвращает ошибку с указанием строки.
-        try:
-            check = subprocess.run(
-                [self.binary, "check", "-c", self._config_path],
-                capture_output=True, text=True, timeout=5.0,
-            )
-            if check.returncode != 0:
-                stderr = (check.stderr or "").strip()
-                tail = "\n".join(stderr.splitlines()[-3:]) if stderr else "unknown"
+        # v11 + БАГФИКС (2026-09-16): валидация через `sing-box check -c`.
+        # Если конфиг невалиден из-за ОДНОГО битого outbound (ошибка содержит
+        # «initialize outbound[N]: ...») — исключаем узел N, перестраиваем
+        # конфиг и проверяем снова (до 8 битых узлов на батч). Раньше один
+        # мусорный узел ронял весь батч — 200 узлов уходили в fallback.
+        # Проверка обязательна и как быстрая страховка: конфиг-файл уже
+        # записан выше. range(9): 8 исключений + финальная перепроверка.
+        for _check_attempt in range(9):
+            try:
+                check = subprocess.run(
+                    [self.binary, "check", "-c", self._config_path],
+                    capture_output=True, text=True, timeout=5.0,
+                )
+            except Exception as exc:
+                # check не удалось выполнить (не запустился бинарник?) —
+                # пробуем стартовать пул как есть: run даст свой вердикт.
+                self._log(f"[sb-pool#{self.batch_id}] sing-box check не удался: {exc}")
+                break
+            if check.returncode == 0:
+                break
+            stderr = (check.stderr or "").strip()
+            tail = "\n".join(stderr.splitlines()[-3:]) if stderr else "unknown"
+            m = re.search(r"outbound\[(\d+)\]", stderr)
+            if not m:
                 self._log(f"[sb-pool#{self.batch_id}] конфиг невалиден: {tail}")
-                # v11: dump конфига в data/.runtime_cache для диагностики.
                 self._dump_config_for_debug()
                 self.stop()
                 return False
-        except Exception as exc:
-            self._log(f"[sb-pool#{self.batch_id}] sing-box check не удался: {exc}")
+            bad_index = int(m.group(1))
+            node_key = self._drop_outbound_at(bad_index)
+            if node_key is None or self._proxy_outbound_count() == 0:
+                self._log(
+                    f"[sb-pool#{self.batch_id}] конфиг невалиден (outbound[{bad_index}], "
+                    f"шаблон или узлы исчерпаны): {tail}"
+                )
+                self._dump_config_for_debug()
+                self.stop()
+                return False
+            self._log(
+                f"[sb-pool#{self.batch_id}] битый outbound[{bad_index}] исключён "
+                "(узел уйдёт через xray-путь) — повторная проверка конфига"
+            )
+            try:
+                with open(self._config_path, "w", encoding="utf-8") as f:
+                    json.dump(self._config, f, ensure_ascii=False, separators=(",", ":"))
+            except Exception as exc:
+                self._log(f"[sb-pool#{self.batch_id}] не удалось переписать конфиг: {exc}")
+                self.stop()
+                return False
+        else:
+            # 8 битых outbound'ов подряд — что-то системно не так с батчем.
+            self._log(
+                f"[sb-pool#{self.batch_id}] конфиг всё ещё невалиден после "
+                "исключения 8 битых outbound'ов — fallback"
+            )
+            self._dump_config_for_debug()
+            self.stop()
+            return False
 
         # Job Object — kill-on-close, чтобы при падении Python процесс не осел.
         self._job_handle = _create_kill_on_close_job()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -34,10 +35,47 @@ from .types import (
     XrayProbeResult,
 )
 
-__all__ = ["ProbingMixin"]
+__all__ = ["ProbingMixin", "_wait_socks_port", "_SOCKS_PORT_WAIT_SEC"]
 
 # stdlib-логгер: мост в stdout + data/run.log ставит subgen.logging.
 _logger = logging.getLogger(__name__)
+
+# v15: сколько ждать готовности SOCKS-порта ядра после старта процесса
+# (было: слепой time.sleep(0.2) — на Windows с 128 параллельными ядрами
+# и AV-сканом спавнов порт запаздывал на секунды; пробы ловили
+# «connection refused» и живые узлы ложно отбраковывались).
+_SOCKS_PORT_WAIT_SEC = 2.5
+
+
+def _wait_socks_port(
+    proc: subprocess.Popen,
+    port: int,
+    timeout: float = _SOCKS_PORT_WAIT_SEC,
+) -> bool:
+    """Дождаться, пока ядро начнёт слушать SOCKS-порт.
+
+    Мелкие connect-пробы каждые ~50мс до потолка ``timeout``. Возвращает
+    True, если порт принял соединение (сразу закрываем — это только
+    проверка listen, не SOCKS-хендшейк). False — порт так и не поднялся
+    (ядро живо, но слушает слишком долго — причина будет в core_not_listening).
+    Процессы, упавшие при старте, отслеживает вызывающий код (proc.poll()).
+    """
+    deadline = time.monotonic() + max(0.2, float(timeout))
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        probe_sock: socket.socket | None = None
+        try:
+            probe_sock = socket.create_connection(("127.0.0.1", int(port)), timeout=0.25)
+            return True
+        except OSError:
+            pass
+        finally:
+            if probe_sock is not None:
+                with contextlib.suppress(Exception):
+                    probe_sock.close()
+        time.sleep(0.05)
+    return False
 
 
 class ProbingMixin:
@@ -270,9 +308,14 @@ class ProbingMixin:
                 creationflags=_subprocess_no_window(),
             )
             self._assign_to_process_job(proc)
-            # v11: sleep 0.2 вместо 0.3 — SOCKS поднимается за 150-250мс.
-            # На 17479 нод × 0.1с экономия = 1750с / 128 потоков = ~14с.
-            time.sleep(0.2)
+            # v15 (инцидент 2026-09-19, лог юзера: 50/50 живых узлов BlancVPN
+            # помечены quick_ping_failed за 7 секунд пачкой): слепой sleep(0.2)
+            # не гарантирует, что SOCKS-порт уже слушает. На Windows при 128
+            # параллельных xray.exe (AV-скан каждого спавна, 35МБ PE) старт
+            # ядра легко занимает 1-3с — проба ловит «connection refused»,
+            # мгновенно проваливает все 6 целей и узел ложно отбраковывается.
+            # Теперь ЖДЁМ готовности порта (мелкие connect-пробы, потолок 2.5с).
+            _socks_ready = _wait_socks_port(proc, port, _SOCKS_PORT_WAIT_SEC)
             if proc.poll() is not None:
                 # Ядро упало при старте — читаем stderr и логируем.
                 stderr_tail = ""
@@ -287,11 +330,16 @@ class ProbingMixin:
                 if stderr_tail:
                     self._log(f"[xray] {node.protocol} {node.host}:{node.port} core exited — {stderr_tail}")
                 return XrayProbeResult(node, False, "core exited", None, 0, len(PING_HTTPS_TARGETS), node.runtime)
+            if not _socks_ready:
+                return XrayProbeResult(node, False, "core_not_listening", None, 0, len(PING_HTTPS_TARGETS), node.runtime)
 
             # Перебор HTTPS-целей: берём первую успешную, остальные не ждём.
-            # v11: таймаут 2 сек (было 4) — мёртвые ноды отваливаются быстрее.
-            # Живые ноды ответят за <2 сек (ya.ru/vk.com — белые SNI, быстрые).
-            per_target_timeout = min(2.0, float(self.config.probe_timeout_sec or 8.0))
+            # v15: таймаут 2.5с (было 2.0): на канале с RTT ~300мс (Сквозная
+            # латентность initial p50 ~800мс у юзера) хендшейк reality/vless
+            # + TLS до цели = 4-6 RTT ≈ 1.2-2.0с — старый потолок 2.0с
+            # срезал живые узлы на грани. Мёртвые всё равно отваливаются
+            # быстрее — по refusal на SOCKS CONNECT, а не по таймауту.
+            per_target_timeout = min(2.5, float(self.config.probe_timeout_sec or 8.0))
             ping_latencies: list[float] = []
             for host, target_port, server_name, path in PING_HTTPS_TARGETS:
                 latency = _socks_https_latency(

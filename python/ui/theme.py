@@ -120,3 +120,45 @@ def apply_theme() -> None:
     t["CTkComboBox"]["dropdown_fg_color"] = CARD
     t["CTkComboBox"]["dropdown_hover_color"] = CARD_ALT
     t["CTkComboBox"]["dropdown_text_color"] = TEXT
+
+    _apply_smart_scrollbars()
+
+
+# ---------------------------------------------------------------------------
+# Умное скрытие скроллбаров
+# ---------------------------------------------------------------------------
+def _apply_smart_scrollbars() -> None:
+    """Скроллбар исчезает, когда всё содержимое и так видно.
+
+    Жалоба юзера 2026-09-20: на маленьких блоках скроллбар висит «просто
+    так» (customtkinter 5.2.2 показывает его всегда). Патчим CTkScrollbar.set:
+    когда диапазон прокрутки покрывает всё (end - start >= 1) — grid_remove,
+    при частичном — вернуть на место (grid восстановит запомненные опции).
+    Трогаем только скроллбары, которыми управляет библиотека (grid_info()
+    не пуст); самописные не-гридженые скроллбары не трогаем.
+    """
+    from customtkinter.windows.widgets.ctk_scrollbar import CTkScrollbar
+
+    if getattr(CTkScrollbar, "_smart_hide_patched", False):
+        return  # уже патчено (например, при повторном импорте)
+
+    _orig_set = CTkScrollbar.set
+
+    def _smart_set(self, first, last):
+        _orig_set(self, first, last)
+        try:
+            full = float(last) - float(first) >= 0.999
+            hidden = getattr(self, "_smart_hidden", False)
+            if full and not hidden and self.grid_info():
+                self.grid_remove()
+                self._smart_hidden = True
+            elif not full and hidden:
+                self.grid()
+                self._smart_hidden = False
+        except Exception:
+            # Виджет разрушается/ещё не готов — молча пропускаем,
+            # штатное позиционирование (_orig_set) уже выполнено.
+            pass
+
+    CTkScrollbar.set = _smart_set
+    CTkScrollbar._smart_hide_patched = True

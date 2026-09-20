@@ -13,20 +13,16 @@ class LogPage(ctk.CTkFrame):
         self.app = app
         self.configure(fg_color=theme.BG)
 
+        # v17: страница живёт во вкладке «Журнал» страницы «Настройки» —
+        # большого заголовка здесь больше нет.
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=3)
-        self.grid_rowconfigure(2, weight=4)
-
-        header = ctk.CTkLabel(
-            self, text="Лог выполнения",
-            font=ctk.CTkFont(size=22, weight="bold"), text_color=theme.TEXT,
-        )
-        header.grid(row=0, column=0, padx=24, pady=(22, 14), sticky="w")
+        self.grid_rowconfigure(0, weight=3)
+        self.grid_rowconfigure(1, weight=4)
 
         # ---------------- Статистика по подпискам ----------------
         self.stats_card = ctk.CTkFrame(self, fg_color=theme.CARD, corner_radius=10,
                                        border_width=1, border_color=theme.BORDER)
-        self.stats_card.grid(row=1, column=0, padx=24, pady=(0, 12), sticky="nsew")
+        self.stats_card.grid(row=0, column=0, padx=24, pady=(8, 12), sticky="nsew")
         self.stats_card.grid_columnconfigure(0, weight=1)
         self.stats_card.grid_rowconfigure(1, weight=1)
 
@@ -57,7 +53,7 @@ class LogPage(ctk.CTkFrame):
         # ---------------- Журнал выполнения ----------------
         self.log_card = ctk.CTkFrame(self, fg_color=theme.CARD, corner_radius=10,
                                      border_width=1, border_color=theme.BORDER)
-        self.log_card.grid(row=2, column=0, padx=24, pady=(0, 16), sticky="nsew")
+        self.log_card.grid(row=1, column=0, padx=24, pady=(0, 16), sticky="nsew")
         self.log_card.grid_columnconfigure(0, weight=1)
         self.log_card.grid_rowconfigure(1, weight=1)
 
@@ -129,7 +125,7 @@ class LogPage(ctk.CTkFrame):
                 f"{'ИТОГО':<46} {total_discovered:>8} {total_ping:>8} {total_working:>8} {total_rejected:>9}\n",
             )
             self.lbl_stats_summary.configure(
-                text=f"Всего подписок: {len(stats)} · рабочих конфигов: {total_working} · subs.txt уже рядом с exe"
+                text=f"Всего подписок: {len(stats)} · рабочих конфигов: {total_working}"
             )
         else:
             self.stats_box.insert("end", "Статистики пока нет — запустите тестирование.")

@@ -1,6 +1,0 @@
-# SubGenerator — зависимости разработки (не нужны для запуска из исходников).
-
-pyinstaller>=6.0          # сборка SubGenerator.exe / SubGenerator-CLI.exe
-                          # (build_release.bat сам ставит при отсутствии)
-pillow>=10.0              # генерация иконки (tools/_make_icon.py)
-ruff>=0.6                 # линтер: ruff check python/ --select F821,F401

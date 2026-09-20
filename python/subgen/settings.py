@@ -54,6 +54,15 @@ DEFAULT_TEST_OPTIONS: dict[str, object] = {
     "use_singbox_pool": True,      # один sing-box + Clash API для initial_check
     "singbox_pool_batch": 200,     # размер батча
     "resilience_check": True,      # живучесть в блокировках
+    # v12: фильтр по параметрам конфигов (вкладка «Фильтры»).
+    # params_filter_enabled — мастер-тумблер фильтра; выбранные значения —
+    # списки строк (нормализованные имена из subgen/params_filter.py:DIMENSIONS
+    # + "other"). Пустой список = измерение не фильтруется.
+    "params_filter_enabled": False,
+    "params_protocols": [],
+    "params_security": [],
+    "params_transport": [],
+    "params_flow": [],
 }
 
 
@@ -136,7 +145,17 @@ def get_test_options() -> dict[str, object]:
 
 
 def save_test_options(test_options: dict[str, object]) -> None:
-    """Сохранить только параметры тестирования (не трогая description/prefix)."""
+    """Сохранить параметры тестирования (merge, не затирая чужие ключи).
+
+    Настройки теперь пишут ДВЕ страницы UI («Тестирование» и «Фильтры»),
+    каждая — только свои ключи. Замена всего test_options одним словарём
+    стирала бы ключи другой страницы (например, выключение гео-исключения
+    при сохранении воркеров). Поэтому: читаем существующие, обновляем
+    переданными, сохраняем. description/prefix не трогаем.
+    """
     settings = load_settings()
-    settings["test_options"] = dict(test_options)
+    existing = settings.get("test_options")
+    merged = dict(existing) if isinstance(existing, dict) else dict(DEFAULT_TEST_OPTIONS)
+    merged.update(test_options)
+    settings["test_options"] = merged
     save_settings(settings)

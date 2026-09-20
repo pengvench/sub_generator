@@ -45,6 +45,7 @@ from xray_runtime import _download_speed_probe, _socks_https_head_status, set_fo
 from subgen.config import DEFAULT_SOURCES_FILE, DATA_DIR, SAVED_SUBS_DIR, GEOIP_FALLBACK_CODE, ROOT
 from subgen.geo import load_geo_cache, serialize_working
 from subgen.logging import log
+from subgen.params_filter import apply_params_filter, build_matcher, parse_csv_spec
 from subgen.output import (
     append_text,
     urls_text,
@@ -57,6 +58,7 @@ from subgen.progress import _PowerShellProgress
 from subgen.refresh import run_refresh
 from subgen.checker_thresholds import get_threshold
 from subgen.checker_cache import check_cached, cache_result
+from subgen.trace import FunnelTracker, trace_key
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,6 +79,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=8.0, help="Таймаут проверки, сек (по умолчанию 8).")
     parser.add_argument("--limit", type=int, default=0, help="Максимум узлов после проверки (0 = без лимита).")
     parser.add_argument("--max-ping", type=int, default=1000, help="Максимальный пинг в мс (0 - без ограничения).")
+    # --- Фильтр по параметрам конфигов (vless reality xhttp и т.п.): ---
+    # Каждый аргумент — CSV белый список; пусто/не указано = не фильтровать
+    # по этому измерению. Нормализация синонимов — subgen/params_filter.py
+    # (type=h2→http, security=xtls→tls, splithttp↔xhttp, «other» — прочие).
+    parser.add_argument(
+        "--proto-filter", default="",
+        help="Только эти протоколы, CSV: vless,vmess,trojan,ss,hysteria2. Пусто — без фильтра.",
+    )
+    parser.add_argument(
+        "--security-filter", default="",
+        help="Только эти типы шифрования, CSV: none,tls,reality. Пусто — без фильтра.",
+    )
+    parser.add_argument(
+        "--transport-filter", default="",
+        help="Только эти транспорты, CSV: tcp,ws,grpc,xhttp,splithttp,httpupgrade,http,kcp,quic. Пусто — без фильтра.",
+    )
+    parser.add_argument(
+        "--flow-filter", default="",
+        help="Только эти flow, CSV: none,vision (xtls-rprx-vision). Пусто — без фильтра.",
+    )
     parser.add_argument("--no-stress", action="store_true", help="Пропустить стресс-тест (оставить только пропингованных).")
     parser.add_argument("--no-telegram", action="store_true", help="Отключить ВСЕ Telegram-проверки, включая медиа-фильтр (t.me/s/) на этапе telegram_pro.")
     parser.add_argument("--no-services", action="store_true", help="Отключить проверку заблокированных сервисов (инста/ютуб/дискорд через IP реестра + TLS-SNI). По умолчанию сервисы — ГЛАВНЫЙ отсеивающий этап.")
@@ -154,7 +176,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--singbox-pool-batch",
         type=int,
         default=200,
-        help="Размер батча для sing-box pool (по умолчанию 200 узлов на один процесс).",
+        help="Размер батча для группового теста (по умолчанию 200 узлов на один процесс).",
+    )
+    parser.add_argument(
+        "--pool-engine",
+        choices=["xray", "singbox"],
+        default="xray",
+        help=(
+            "Ядро группового теста. xray (по умолчанию) — одно ядро xray "
+            "с N SOCKS-портами: узлы тестируются ТЕМ ЖЕ ядром, что и в "
+            "клиентах юзера (Happ/v2rayN), поддержка xhttp/kcp/quic. "
+            "singbox — прежний пул с selector'ом через Clash API "
+            "(xhttp/splithttp/kcp/quic/hysteria2 уходят в per-node fallback)."
+        ),
     )
     parser.add_argument(
         "--start-stage",
@@ -406,6 +440,207 @@ def _preflight_dns_doh(timeout: float = 5.0) -> dict[str, bool]:
     return result
 
 
+def _detail_key(w: Any) -> str:
+    """Уникальный ключ узла для per-node деталей отчёта.
+
+    Раньше детали ключевались по ``node.title()`` (имя узла): одноимённые ноды
+    (юниксовые подписки с одинаковыми фрагментами-именами, а после переименования
+    «prefix+страна» — ВСЕ финальные ноды) перезаписывали друг друга. Инцидент
+    2026-09-17: initial nodes 331/352, resilience 111/117, recheck speeds 7/54
+    записи; «FAST NODE» из лога (300ms PASS) отображался в отчёте как
+    connection_failed — это был его одноимённый тёзка. Ключ host:port/digest
+    уникален после дедупа и не зависит от имени.
+    """
+    node = getattr(w, "node", None)
+    if node is None:
+        return str(id(w))
+    key = node.key  # (protocol, host, port, digest16)
+    return f"{key[1]}:{key[2]}/{key[3][:8]}"
+
+
+def _bump_reason(counter: dict[str, int], reason: str) -> None:
+    """Инкремент счётчика причин отвала без KeyError на новом ключе.
+
+    Инцидент 2026-09-18 (краш конвейера): ``counter[reason] += 1`` на пустом
+    dict сначала ЧИТАЕТ ключ и только потом пишет — для отсутствующего ключа
+    это ``KeyError: 'route_unstable'`` на ПЕРВОМ же отвале resilience. Конвейер
+    умирал уже в РАЗБОРЕ результатов (не при проверке): 16 PASS-строк в логе,
+    потом мгновенная смерть процесса — без сводной вехи этапа, без спидтеста,
+    без итогового файла; выглядело как «фильтр съел все ноды». Ключи причин
+    динамические (route_unstable/high_loss/run_failed/completely_dead/...),
+    предзаполнить их нельзя — поэтому .get(). Остальные счётчики конвейера
+    (pool_stats/tg_pool_stats/dpi counts) предзаполнены нулями и безопасны.
+    """
+    counter[reason] = counter.get(reason, 0) + 1
+
+
+def _make_batch_pool(
+    nodes: list[Any],
+    *,
+    engine: str,
+    batch_id: int,
+    log_sink: Callable[[str], None],
+):
+    """Фабрика батч-пулов группового теста (v17).
+
+    engine="xray" — XrayBatchPool: одно ядро xray с N SOCKS-портами, по
+    одному на узел (запрос юзера: тест через ТО ЖЕ ядро, что и клиенты
+    Happ/v2rayN; поддержка xhttp/kcp/quic; никаких переключений selector'а).
+
+    engine="singbox" — прежний SingBoxBatchPool с selector'ом через Clash
+    API (xhttp/splithttp/kcp/quic/hysteria2 → per-node fallback).
+
+    Оба пула имеют ОДИНАКОВЫЙ интерфейс (start/stop/select/endpoint/
+    supported_count/unsupported_keys) — вызывающий код не различает движки.
+    """
+    if engine == "xray":
+        from runtime.xray_pool import XrayBatchPool
+
+        return XrayBatchPool(
+            nodes,
+            root_dir=ROOT,
+            batch_id=batch_id,
+            log_sink=log_sink,
+        )
+    from runtime.singbox_pool import SingBoxBatchPool
+
+    return SingBoxBatchPool(
+        nodes,
+        root_dir=ROOT,
+        batch_id=batch_id,
+        log_sink=log_sink,
+    )
+
+
+def _pool_engine_choice(args: Any, log_sink: Callable[[str], None]) -> str:
+    """Движок группового теста с учётом форса «только sing-box».
+
+    В режиме sing_box_only xray-пул смысла не имеет (гипотеза юзера —
+    xray.exe прибивает антивирус): тестируем sing-box'ом.
+    """
+    engine = str(getattr(args, "pool_engine", "xray") or "xray").lower()
+    if engine not in ("xray", "singbox"):
+        engine = "xray"
+    from xray_runtime import get_forced_runtime
+
+    if engine == "xray" and get_forced_runtime() == "sing-box":
+        log_sink("[sub] групповой тест: форс «только sing-box» — движок singbox")
+        return "singbox"
+    return engine
+
+
+def _node_source_url(w: Any) -> str:
+    """Источник узла (подписка, из которой он получен) для отчёта по источникам.
+
+    v15 (баг «источников всего 109, из них пустых/мёртвых 87»): работает и с
+    обёртками-результатами (.node.source_url), и с голыми XrayNode из списка
+    discovered (у них source_url лежит прямо на узле). Раньше discovered-узлы
+    всегда давали "(источник неизвестен)" — счётчик discovered у всех источников
+    был 0, а рабочие подписки с не дожившими до финала узлами помечались
+    empty=True как «мёртвые».
+    """
+    node = getattr(w, "node", None)
+    if node is None and hasattr(w, "source_url"):
+        node = w
+    src = str(getattr(node, "source_url", "") or "").strip() if node is not None else ""
+    return src or "(источник неизвестен)"
+
+
+def _build_sources_report(
+    sources: list[str],
+    discovered: list[Any],
+    working: list[Any],
+) -> dict[str, Any]:
+    """Отчёт «из каких подписок собрана итоговая подписка».
+
+    Для каждого источника: сколько узлов из него обнаружено (discovered) и
+    сколько дошло до итоговой подписки (exported + доля). Источники без
+    итоговых узлов помечаются пустыми; дубликаты при дедупе приписываются
+    первому источнику узла. Работает и в режиме перепроверки (discovered
+    пуст — тогда считаются только exported по кешу).
+    """
+    discovered_by: dict[str, int] = {}
+    for w in discovered or []:
+        src = _node_source_url(w)
+        discovered_by[src] = discovered_by.get(src, 0) + 1
+    exported_by: dict[str, int] = {}
+    for w in working or []:
+        src = _node_source_url(w)
+        exported_by[src] = exported_by.get(src, 0) + 1
+
+    # Порядок: сначала источники из sources.txt (в их порядке), затем
+    # источники, появившиеся «сбоку» (saved_subs, кеш, прямые конфиги).
+    ordered: list[str] = []
+    for src in sources or []:
+        src = str(src).strip()
+        if src and src not in ordered:
+            ordered.append(src)
+    for src in list(discovered_by) + list(exported_by):
+        if src not in ordered:
+            ordered.append(src)
+
+    total_exported = sum(exported_by.values())
+    entries: list[dict[str, Any]] = []
+    for src in ordered:
+        exported = exported_by.get(src, 0)
+        found = discovered_by.get(src, 0)
+        entries.append(
+            {
+                "source": src,
+                "discovered": found,
+                "exported": exported,
+                "share_pct": round(100.0 * exported / total_exported, 1) if total_exported else 0.0,
+                "empty": exported == 0 and found == 0,
+            }
+        )
+    # Сортировка для читабельности: сначала давшие узлы (по вкладу), потом
+    # проверенные-но-отвалившиеся (по discovered), потом пустые.
+    entries.sort(key=lambda e: (e["exported"], e["discovered"]), reverse=True)
+
+    contributed = sum(1 for e in entries if e["exported"] > 0)
+    checked_only = sum(1 for e in entries if e["exported"] == 0 and e["discovered"] > 0)
+    dead = sum(1 for e in entries if e["empty"])
+    report: dict[str, Any] = {
+        "enabled": True,
+        "sources_total": len(ordered),
+        "contributed": contributed,
+        "checked_no_result": checked_only,
+        "dead": dead,
+        "nodes_total": total_exported,
+        "note": "дубликаты узлов (один бэкенд в нескольких подписках) "
+                "приписаны первому источнику — дедуп отбрасывает повторы",
+        "top": [
+            {"source": e["source"], "exported": e["exported"], "share_pct": e["share_pct"]}
+            for e in entries[:5]
+            if e["exported"] > 0
+        ],
+        "nodes": entries,
+    }
+    if not discovered:
+        report["note"] = "перепроверка с этапа: discovered неизвестны (кеш прошлого прогона), " \
+                         "exported посчитаны по финальному набору"
+    return report
+
+
+def _log_sources_report(report: dict[str, Any], log=print) -> None:
+    """Человекочитаемая веха отчёта по источникам в лог (видна в UI «Лог»)."""
+    if not isinstance(report, dict) or not report.get("enabled"):
+        return
+    total = report.get("sources_total", 0)
+    contributed = report.get("contributed", 0)
+    dead = report.get("dead", 0)
+    nodes = report.get("nodes_total", 0)
+    log(
+        f"[sub] sources: итоговая подписка собрана из {contributed} подписок "
+        f"({nodes} узлов; источников всего {total}, из них пустых/мёртвых {dead})"
+    )
+    for i, top in enumerate(report.get("top") or [], 1):
+        log(
+            f"[sub] sources #{i}: {top.get('source', '?')} — "
+            f"{top.get('exported', 0)} узлов ({top.get('share_pct', 0.0):.1f}%)"
+        )
+
+
 def _median_initial_latency(details: dict) -> float:
     """Медиана (p50) латентности initial_check по прошедшим узлам, мс.
 
@@ -528,6 +763,30 @@ def run(
     working_path = _resolve_path(args.working)
     report_path = _resolve_path(args.report)
     geo_cache_path = _resolve_path(args.geo_cache)
+
+    # БАГФИКС (2026-09-16, «результат прогона пустым генерится»): отчёт
+    # писался ТОЛЬКО в самом конце прогона. Краш на середине (или убийство
+    # процесса) оставлял после себя НИЧЕГО — GUI показывал пустые цифры в
+    # окне «Результаты» либо цифры позапрошлого прогона. Теперь в начале
+    # пишется pending-отчёт с честными нулями и маркером «прогон не
+    # завершён»; по успешному окончанию он перезаписывается полным.
+    write_report(
+        report_path,
+        {
+            "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "sources": sources,
+            "dedup_mode": getattr(args, "dedup_mode", "normal"),
+            "discovered": 0,
+            "working": 0,
+            "rejected": 0,
+            "exported": 0,
+            "pending": True,
+            "note": "Прогон запущен, но не завершился (краш/остановка). "
+                    "Числа — нули: экспорта не было.",
+            "sources_report": {"enabled": False},
+            "nodes": [],
+        },
+    )
 
     geo_cache = load_geo_cache(geo_cache_path)
 
@@ -726,6 +985,20 @@ def run(
             pause_event=pause_event,
         )
 
+        # v15: сквозная трассировка «какие конфиги за какими подписками и где
+        # отвалились» (запрос юзера по логу от 2026-09-19: «половина хороших
+        # подписок теряется хрен пойми где»). Регистрируем ВСЕ discovered-узлы
+        # с их источниками, дальше — чекпойнты по стадиям.
+        tracker = FunnelTracker()
+        tracker.register(discovered)
+        quick_drop_reasons = {
+            trace_key(r): str(getattr(r, "reason", "") or "—") for r in rejected
+        }
+        tracker.checkpoint("quick", working, quick_drop_reasons)
+        trace_log_path = DATA_DIR / "trace.log"
+        tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+        log(tracker.summary_line("quick"))
+
         load_idx = progress.stage_index("load")
         if load_idx >= 0:
             progress.finish_stage(load_idx, f"[load] собрано {len(discovered)} узлов")
@@ -738,11 +1011,24 @@ def run(
         # Фильтр по пингу.
         if args.max_ping > 0:
             original_working_count = len(working)
+            dropped_here = {
+                trace_key(w): f"пинг {w.latency_ms:.0f}мс > {args.max_ping}мс"
+                for w in working
+                if w.latency_ms is not None and w.latency_ms > args.max_ping
+            }
             working = [w for w in working if w.latency_ms is None or w.latency_ms <= args.max_ping]
             if len(working) < original_working_count:
-                log(f"[sub] filtered out {original_working_count - len(working)} nodes with ping > {args.max_ping}ms")
+                log(
+                    f"[sub] filtered out {original_working_count - len(working)} nodes with ping > {args.max_ping}ms "
+                    f"(пинг — сквозная латентность HTTPS через туннель, ≈3-5 RTT: на мобильных/высоколнатентных "
+                    f"каналах базовая сквозная латентность уже 1-2с; если срез велик — поднимите max_ping до 2500-3000)"
+                )
+            tracker.checkpoint("max_ping", working, dropped_here)
+            tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+            log(tracker.summary_line("max_ping"))
         else:
             log("[sub] no ping filter (--max-ping=0)")
+            tracker.checkpoint("max_ping", working)
 
         # Фильтр по скорости УДАЛЁН из середины конвейера: скорость измеряется
         # финальным ИНФОРМАТИВНЫМ спидтестом ПОСЛЕ переименования и НЕ
@@ -757,6 +1043,11 @@ def run(
         working = _load_cached_working()
         rejected: list[Any] = []
         discovered: list[Any] = []
+        # v15: трекер в режиме перепроверки регистрирует только загруженные
+        # рабочие узлы (discovered неизвестны — их нет в кеше).
+        tracker = FunnelTracker()
+        tracker.register(working)
+        trace_log_path = DATA_DIR / "trace.log"
         # При перепроверке baseline не измеряем: пороги из UI/прошлого прогона.
         baseline_report: dict[str, Any] = {"enabled": False}
         effective_min_speed_kbps: float = float(args.min_speed)
@@ -804,6 +1095,67 @@ def run(
                 progress.finish_stage(resilience_idx, f"[resilience] пропущен (перепроверка с {start_stage})")
 
     # ---------------------------------------------------------------------
+    # ФИЛЬТР ПО ПАРАМЕТРАМ КОНФИГОВ (vless reality xhttp и т.п.).
+    # Применяется ДО распинговки/initial-check: белый список по измерениям
+    # (protocol/security/transport/flow) — зачем TCP-пинг по 17к vmess-нод,
+    # если юзеру нужны только vless+reality+xhttp. Работает и при перепроверке
+    # с этапа (кеш прогоняется через тот же матчер).
+    # ---------------------------------------------------------------------
+    params_filter_report: dict[str, Any] = {
+        "enabled": False,
+        "protocols": [],
+        "security": [],
+        "transports": [],
+        "flows": [],
+        "filtered_out": 0,
+        "dropped_by": {},
+    }
+    _proto_set = parse_csv_spec(getattr(args, "proto_filter", ""))
+    _security_set = parse_csv_spec(getattr(args, "security_filter", ""))
+    _transport_set = parse_csv_spec(getattr(args, "transport_filter", ""))
+    _flow_set = parse_csv_spec(getattr(args, "flow_filter", ""))
+    if _proto_set or _security_set or _transport_set or _flow_set:
+        params_matcher = build_matcher(
+            protocols=_proto_set,
+            security=_security_set,
+            transports=_transport_set,
+            flows=_flow_set,
+        )
+        params_orig_count = len(working)
+        working, params_dropped = apply_params_filter(working, params_matcher, log=log)
+        parts = []
+        if _proto_set:
+            parts.append("протоколы=" + ",".join(sorted(_proto_set)))
+        if _security_set:
+            parts.append("шифрование=" + ",".join(sorted(_security_set)))
+        if _transport_set:
+            parts.append("транспорт=" + ",".join(sorted(_transport_set)))
+        if _flow_set:
+            parts.append("flow=" + ",".join(sorted(_flow_set)))
+        dropped_parts = ", ".join(f"{name}={count}" for name, count in sorted(params_dropped.items()))
+        log(
+            f"[sub] фильтр параметров: {'; '.join(parts)} — "
+            f"отсеяно {params_orig_count - len(working)} из {params_orig_count} "
+            f"(осталось {len(working)})"
+            + (f", по причинам: {dropped_parts}" if dropped_parts else "")
+        )
+        if not working:
+            log(
+                "[sub] ERROR: фильтр параметров отсеял ВСЕ узлы. "
+                "Проверьте галочки на вкладке «Фильтры» (или CSV в CLI) — "
+                "пустой результат означает слишком узкий набор значений."
+            )
+        params_filter_report = {
+            "enabled": True,
+            "protocols": sorted(_proto_set or []),
+            "security": sorted(_security_set or []),
+            "transports": sorted(_transport_set or []),
+            "flows": sorted(_flow_set or []),
+            "filtered_out": params_orig_count - len(working),
+            "dropped_by": dict(params_dropped),
+        }
+
+    # ---------------------------------------------------------------------
     # Initial Check: быстрая проверка доступности (TCP + HTTP HEAD).
     # Обязательный системный этап первичного отсева (Fail Fast): отсеивает
     # мёртвые узлы за 2-3 сек ДО дорогих проверок. Выполняется при полном
@@ -846,8 +1198,28 @@ def run(
                         "latency_ms": None, "error": f"pool_probe_failed: {exc}"}
 
         def _check_one_via_fallback(w: Any) -> dict[str, Any]:
-            """Проверка ноды через старый путь (старт-стоп xray/sing-box)."""
-            return run_initial_check({}, w.node.raw_url, timeout=args.initial_check_timeout)
+            """Проверка ноды через старый путь (старт-стоп xray/sing-box).
+
+            БАГФИКС (2026-09-16): исключение из ОДНОГО узла (сбой спавна
+            ядра, битый URL и т.п.) раньше пробрасывалось наверх и прерывало
+            ВЕСЬ этап на середине. Теперь сбой узла = rejected-результат;
+            наверх пробрасывается только refresh_cancelled (протокол отмены).
+            """
+            try:
+                return run_initial_check({}, w.node.raw_url, timeout=args.initial_check_timeout)
+            except RuntimeError as exc:
+                if "refresh_cancelled" in str(exc):
+                    raise
+                return {
+                    "passed": False, "tcp_ok": False, "http_ok": False,
+                    "latency_ms": None, "error": f"fallback_error: {exc}",
+                }
+            except Exception as exc:
+                return {
+                    "passed": False, "tcp_ok": False, "http_ok": False,
+                    "latency_ms": None,
+                    "error": f"fallback_error: {type(exc).__name__}: {exc}",
+                }
 
         # Локальный прогресс-каунтер для батчей.
         initial_done_counter = [0]
@@ -866,10 +1238,11 @@ def run(
         _pair_idx_by_id: dict[int, int] = {id(w): i for i, w in enumerate(working)}
 
         if use_pool:
-            from runtime.singbox_pool import SingBoxBatchPool, iter_batches
+            from runtime.singbox_pool import iter_batches
+            pool_engine = _pool_engine_choice(args, log)
             log(
-                f"[sub] initial check: sing-box pool (батчи по {pool_batch_size} узлов), "
-                f"{min(args.workers, max(1, initial_orig_count))} потоков в батче"
+                f"[sub] initial check: групповой тест через {pool_engine} "
+                f"(батчи по {pool_batch_size} узлов)"
             )
 
             # Батчим узлы. Внутри батча — последовательный select, но между
@@ -895,15 +1268,15 @@ def run(
                 # но подстраховка), берём первый.
                 batch_result_by_node_id: dict[int, Any] = {id(w.node): w for w in batch_results}
 
-                pool = SingBoxBatchPool(
+                pool = _make_batch_pool(
                     batch_nodes,
-                    root_dir=ROOT,
+                    engine=pool_engine,
                     batch_id=batch_id,
                     log_sink=log,
                 )
                 supported = pool.supported_count
                 pool_stats["batches"] += 1
-                log(f"[initial] pool#{batch_id}: {len(batch_nodes)} узлов, {supported} поддерживается sing-box")
+                log(f"[initial] pool#{batch_id}: {len(batch_nodes)} узлов, {supported} поддерживается")
 
                 try:
                     if not pool.start():
@@ -966,7 +1339,7 @@ def run(
         found_fast_node = False
         fast_node_title = ""
         for idx, (w, res) in enumerate(pairs, 1):
-            initial_node_details[w.node.title()] = res
+            initial_node_details[_detail_key(w)] = res
             if res and res["passed"]:
                 latency = float(res.get("latency_ms") or 0)
                 if not found_fast_node and 0 < latency < FAST_NODE_LATENCY_MS:
@@ -997,7 +1370,7 @@ def run(
         # в финальную подписку первыми, что улучшает UX в клиентах с автоматическим
         # выбором (v2rayNG urltest, Clash urltest, sing-box urltest).
         checked_initial.sort(
-            key=lambda w: float(initial_node_details.get(w.node.title(), {}).get("latency_ms") or float("inf"))
+            key=lambda w: float(initial_node_details.get(_detail_key(w), {}).get("latency_ms") or float("inf"))
         )
         if found_fast_node:
             log(
@@ -1021,6 +1394,23 @@ def run(
         if failed_initial + slow_ping_filtered > 0:
             log(f"[sub] filtered out {failed_initial + slow_ping_filtered} nodes that failed initial check")
 
+        # v15: чекпойнт трассировки — кто пережил initial check (с причинами
+        # отвала из деталей стадии). pairs покрывает ВСЕ узлы стадии, включая
+        # отвалившиеся (working уже содержит только выживших).
+        _initial_drop_reasons: dict[str, str] = {}
+        for _w, _res in pairs:
+            if _res and _res.get("passed"):
+                continue
+            _tcp_ok = bool((_res or {}).get("tcp_ok"))
+            _lat = (_res or {}).get("latency_ms") or 0
+            if _tcp_ok and args.max_ping > 0 and _lat > args.max_ping:
+                _initial_drop_reasons[_detail_key(_w)] = f"latency>{args.max_ping}ms"
+            else:
+                _initial_drop_reasons[_detail_key(_w)] = str((_res or {}).get("error") or "node_start_failed")
+        tracker.checkpoint("initial", working, _initial_drop_reasons)
+        tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+        log(tracker.summary_line("initial"))
+
         initial_check_report = {
             "enabled": True,
             "checked": initial_orig_count,
@@ -1030,6 +1420,7 @@ def run(
             "nodes": initial_node_details,
             "singbox_pool": {
                 "enabled": bool(use_pool),
+                "engine": str(getattr(args, "pool_engine", "xray")) if use_pool else "",
                 "batch_size": int(pool_batch_size) if use_pool else 0,
                 "batches": int(pool_stats["batches"]),
                 "unsupported_via_xray": int(pool_stats["unsupported"]),
@@ -1118,8 +1509,24 @@ def run(
                 return TelegramProResult(accepted=False, reason=f"pool_probe_failed: {exc}")
 
         def _check_tg_via_fallback(w: Any) -> TelegramProResult:
-            """Проверка через старый путь (старт-стоп xray/sing-box)."""
-            return check_node_telegram_pro_detailed(w.node.raw_url, timeout=tg_timeout)
+            """Проверка через старый путь (старт-стоп xray/sing-box).
+
+            БАГФИКС (2026-09-16): исключение из ОДНОГО узла раньше
+            пробрасывалось наверх и прерывало весь telegram-этап (краш
+            прогона «на середине теста»). Теперь сбой узла = rejected;
+            наверх пробрасывается только refresh_cancelled (отмена).
+            """
+            try:
+                return check_node_telegram_pro_detailed(w.node.raw_url, timeout=tg_timeout)
+            except RuntimeError as exc:
+                if "refresh_cancelled" in str(exc):
+                    raise
+                return TelegramProResult(accepted=False, reason=f"fallback_error: {exc}")
+            except Exception as exc:
+                return TelegramProResult(
+                    accepted=False,
+                    reason=f"fallback_error: {type(exc).__name__}: {exc}",
+                )
 
         # Локальный прогресс-каунтер для батчей.
         tg_done_counter = [0]
@@ -1136,8 +1543,9 @@ def run(
         _tg_pair_idx_by_id: dict[int, int] = {id(w): i for i, w in enumerate(working)}
 
         if use_pool:
-            from runtime.singbox_pool import SingBoxBatchPool, iter_batches
-            log(f"[sub] telegram-pro: sing-box pool (батчи по {pool_batch_size} узлов)")
+            from runtime.singbox_pool import iter_batches
+            pool_engine = _pool_engine_choice(args, log)
+            log(f"[sub] telegram-pro: групповой тест через {pool_engine} (батчи по {pool_batch_size} узлов)")
 
             batches = iter_batches(working, batch_size=pool_batch_size)
             for batch_id, batch_results in batches:
@@ -1146,9 +1554,9 @@ def run(
                     raise RuntimeError("refresh_cancelled")
 
                 batch_nodes = [w.node for w in batch_results]
-                pool = SingBoxBatchPool(
+                pool = _make_batch_pool(
                     batch_nodes,
-                    root_dir=ROOT,
+                    engine=pool_engine,
                     batch_id=batch_id,
                     log_sink=log,
                 )
@@ -1207,10 +1615,23 @@ def run(
         checked_telegram_pro: list[Any] = []
         failed_telegram_pro = 0
         telegram_pro_node_details: dict[str, Any] = {}
+        # v15: причины отвала для трассировки.
+        _tg_drop_reasons: dict[str, str] = {}
         for idx, (w, res) in enumerate(pairs, 1):
-            telegram_pro_node_details[w.node.title()] = res.row() if res else None
+            telegram_pro_node_details[_detail_key(w)] = res.row() if res else None
             if res and res.accepted:
                 checked_telegram_pro.append(w)
+                # v15 (баг «upload_kbps=null, tg_media_kbps=null при выгрузке»):
+                # метрики, измеренные на этом этапе (upload до Telegram-DC +
+                # скорость тг-медиа), теперь ПРОПАГИРУЮТСЯ в сам узел — раньше
+                # они оставались только в логе строки PASS, а экспорт
+                # (serialize_working → report.json/working.txt) читал пустые
+                # поля и выдавал null. Замеры при этом РЕАЛЬНО происходили:
+                # 399/399 PASS-узлов юзера имели up=…KB/s tg_media=…KB/s.
+                if getattr(res, "upload_kbps", None) is not None:
+                    w.upload_kbps = float(res.upload_kbps)
+                if getattr(res, "tg_media_kbps", None) is not None:
+                    w.tg_media_kbps = float(res.tg_media_kbps)
                 log(
                     f"[telegram-pro] PASS {idx}/{telegram_pro_orig_count}: {w.node.title()} "
                     f"(score={res.telegram_score} connect={res.connect}({res.connect_ms}ms) "
@@ -1219,6 +1640,7 @@ def run(
             else:
                 failed_telegram_pro += 1
                 reason = res.reason if res else "node_start_failed"
+                _tg_drop_reasons[_detail_key(w)] = str(reason)
                 log(
                     f"[telegram-pro] FAIL {idx}/{telegram_pro_orig_count}: {w.node.title()} "
                     f"(score={res.telegram_score if res else 0} connect={res.connect if res else False} "
@@ -1235,6 +1657,11 @@ def run(
         if failed_telegram_pro > 0:
             log(f"[sub] filtered out {failed_telegram_pro} nodes that failed Telegram-PRO check")
 
+        # v15: чекпойнт трассировки telegram-этапа.
+        tracker.checkpoint("telegram", working, _tg_drop_reasons)
+        tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+        log(tracker.summary_line("telegram"))
+
         telegram_pro_report = {
             "enabled": True,
             "checked": telegram_pro_orig_count,
@@ -1243,6 +1670,7 @@ def run(
             "timeout_sec": tg_timeout,
             "singbox_pool": {
                 "enabled": bool(use_pool),
+                "engine": str(getattr(args, "pool_engine", "xray")) if use_pool else "",
                 "batch_size": int(pool_batch_size) if use_pool else 0,
                 "batches": int(tg_pool_stats["batches"]),
                 "unsupported_via_xray": int(tg_pool_stats["unsupported"]),
@@ -1295,8 +1723,9 @@ def run(
         checked_services: list[Any] = []
         failed_services = 0
         services_node_details: dict[str, Any] = {}
+        _services_drop_reasons: dict[str, str] = {}
         for idx, (w, res) in enumerate(pairs, 1):
-            services_node_details[w.node.title()] = res.row() if res else None
+            services_node_details[_detail_key(w)] = res.row() if res else None
             if res and res.accepted:
                 checked_services.append(w)
                 log(
@@ -1306,6 +1735,7 @@ def run(
             else:
                 failed_services += 1
                 reason = res.reason if res else "node_start_failed"
+                _services_drop_reasons[_detail_key(w)] = str(reason)
                 log(
                     f"[services] FAIL {idx}/{services_orig_count}: {w.node.title()} "
                     f"(reason={reason}; {format_services_result(res) if res else ''})"
@@ -1319,6 +1749,11 @@ def run(
         working = checked_services
         if failed_services > 0:
             log(f"[sub] filtered out {failed_services} nodes that failed blocked-services check")
+
+        # v15: чекпойнт трассировки сервис-этапа.
+        tracker.checkpoint("services", working, _services_drop_reasons)
+        tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+        log(tracker.summary_line("services"))
 
         services_report = {
             "enabled": True,
@@ -1477,13 +1912,22 @@ def run(
         # (инцидент 2026-09-04, лог4: p50 RTT 2076 мс, а подтесты батареи
         # остались с таймаутом 6с — живые узлы, прошедшие DPI, отвалились
         # на resilience с вердиктом completely_dead).
+        # v15 (инцидент 2026-09-19, лог юзера: p50=804мс, 157/349 узлов
+        # забракованы route_unstable): rtt_hint теперь передаётся ВСЕГДА,
+        # а не только на «медленных» каналах (>=1200мс). Пороги route-серии
+        # (avg/p95/jitter) масштабируются от p50 канала — на канале с
+        # сквозной латентностью 800мс базовые пороги avg<=500/jitter<=80
+        # математически недостижимы: route-замер — это ПОЛНЫЙ TLS-хендшейк
+        # через туннель (3-5 сквозных RTT). При p50 804мс пороги становятся
+        # avg<=804/p95<=1206/jitter<=201 — реалистичные.
         resilience_rtt_hint: float | None = None
-        if network_rtt_ms and network_rtt_ms >= SLOW_NETWORK_RTT_MS:
+        if network_rtt_ms and network_rtt_ms > 0:
             resilience_rtt_hint = network_rtt_ms
-            resilience_timeout = max(
-                resilience_timeout,
-                min(15.0, network_rtt_ms / 1000.0 * 4.0),
-            )
+            if network_rtt_ms >= SLOW_NETWORK_RTT_MS:
+                resilience_timeout = max(
+                    resilience_timeout,
+                    min(15.0, network_rtt_ms / 1000.0 * 4.0),
+                )
 
         log(
             f"[sub] Resilience check enabled, timeout={resilience_timeout}s"
@@ -1501,6 +1945,8 @@ def run(
         checked_resilience: list[Any] = []
         failed_resilience = 0
         resilience_node_details: dict[str, Any] = {}
+        resilience_fail_reasons: dict[str, int] = {}
+        _resilience_drop_reasons: dict[str, str] = {}
         log(f"[sub] resilience: параллельно, {min(args.workers, max(1, resilience_orig_count))} потоков")
 
         def _check_resilience_node(w: Any):
@@ -1522,7 +1968,7 @@ def run(
         )
 
         for idx, (w, res) in enumerate(pairs, 1):
-            resilience_node_details[w.node.title()] = res.to_dict() if res else None
+            resilience_node_details[_detail_key(w)] = res.to_dict() if res else None
             # Route-стабильность (RTT/jitter/loss) — часть стресс-теста v12:
             # живой, но нестабильный маршрут (loss>5%, p95>800мс, джиттер>80мс)
             # бракуется с явной причиной; «not_measured» (батарея съела бюджет)
@@ -1550,11 +1996,20 @@ def run(
                 # Честная причина отвала: ошибка запуска ядра/бюджета — это НЕ
                 # «узел мёртв», раньше оба случая писались как completely_dead.
                 if res and res.alive and route_failed:
-                    fail_reason = f"route_unstable ({route_row.get('reason')})"
+                    # Нарушенные пороги — из details.violations (какой именно
+                    # порог пробит: avg/p95/jitter/loss) — вместо тавтологии
+                    # «route_unstable (route_unstable)» из-за старого формата.
+                    violations = (route_row.get("details") or {}).get("violations") or []
+                    reason = route_row.get("reason") or "route_unstable"
+                    fail_reason = f"{reason} ({'; '.join(violations)})" if violations else reason
+                    _bump_reason(resilience_fail_reasons, reason)
                 elif res and res.recommended_mode == "error":
                     fail_reason = "run_failed (ядро узла не поднялось/бюджет)"
+                    _bump_reason(resilience_fail_reasons, "run_failed")
                 else:
                     fail_reason = "completely_dead"
+                    _bump_reason(resilience_fail_reasons, "completely_dead")
+                _resilience_drop_reasons[_detail_key(w)] = str(fail_reason)
                 log(
                     f"[resilience] FAIL {idx}/{resilience_orig_count}: {w.node.title()} "
                     f"({fail_reason})"
@@ -1563,7 +2018,24 @@ def run(
         if resilience_idx >= 0:
             progress.finish_stage(resilience_idx, f"[resilience] done: {len(checked_resilience)} passed, {failed_resilience} failed")
 
+        # Сводная веха этапа (как у initial/tg-pro/services): без неё срез
+        # 117→54 был виден только как разница соседних строк, а 63 отвала —
+        # только в per-node FAIL-строках (инцидент 2026-09-17: пользователь
+        # не понял, куда делись больше половины живых нод).
+        if failed_resilience > 0:
+            reason_parts = ", ".join(f"{name}={count}" for name, count in sorted(resilience_fail_reasons.items()))
+            log(
+                f"[sub] filtered out {failed_resilience} nodes that failed resilience check"
+                + (f" ({reason_parts})" if reason_parts else "")
+            )
+
         working = checked_resilience
+
+        # v15: чекпойнт трассировки resilience-этапа.
+        tracker.checkpoint("resilience", working, _resilience_drop_reasons)
+        tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+        log(tracker.summary_line("resilience"))
+
         resilience_report = {
             "enabled": True,
             "checked": resilience_orig_count,
@@ -1603,6 +2075,9 @@ def run(
         checked_dpi_active: list[Any] = []
         failed_dpi_active = 0
         dpi_active_node_details: dict[str, Any] = {}
+        # v16: причины отвала для трассировки (раньше эти узлы приписывались
+        # ai_geo с «—»: контрольная проба падала — а юзер не видел ГДЕ).
+        _dpi_active_drop_reasons: dict[str, str] = {}
         log(f"[sub] dpi-active: параллельно, {min(args.workers, max(1, dpi_active_orig_count))} потоков")
 
         def _check_dpi_active_node(w: Any) -> DpiActiveResult:
@@ -1623,7 +2098,7 @@ def run(
         )
 
         for idx, (w, res) in enumerate(pairs, 1):
-            dpi_active_node_details[w.node.title()] = res.row() if res else None
+            dpi_active_node_details[_detail_key(w)] = res.row() if res else None
             if res and res.accepted:
                 checked_dpi_active.append(w)
                 log(
@@ -1632,6 +2107,9 @@ def run(
                 )
             else:
                 failed_dpi_active += 1
+                _dpi_active_drop_reasons[_detail_key(w)] = (
+                    f"dpi-active: {res.reason}" if res else "dpi-active: node_start_failed"
+                )
                 log(
                     f"[dpi-active] FAIL {idx}/{dpi_active_orig_count}: {w.node.title()} "
                     f"(score={res.score if res else 0} reason={res.reason if res else 'node_start_failed'})"
@@ -1643,6 +2121,10 @@ def run(
             )
 
         working = checked_dpi_active
+        # v16: чекпойнт трассировки dpi-актива — с причинами отвалов.
+        tracker.checkpoint("dpi_active", working, _dpi_active_drop_reasons)
+        tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+        log(tracker.summary_line("dpi_active"))
         if failed_dpi_active > 0:
             log(f"[sub] filtered out {failed_dpi_active} nodes that failed active DPI check")
 
@@ -1678,14 +2160,40 @@ def run(
     # ---------------------------------------------------------------------
     ai_geo_report: dict[str, Any] = {}
     if getattr(args, "ai_check", False) and _stage_enabled_from(start_stage, "ai_geo"):
-        from checkers.ai_geo import AI_GEO_TIMEOUT, AiGeoResult, check_node_ai_geo_detailed
+        from checkers.ai_geo import (
+            AI_GEO_TIMEOUT,
+            AiGeoResult,
+            check_node_ai_geo_detailed,
+            fetch_real_ip,
+        )
 
         ai_geo_orig_count = len(working)
         ai_strict = bool(getattr(args, "ai_strict", False))
         ai_timeout = max(3.0, float(getattr(args, "ai_timeout", AI_GEO_TIMEOUT)))
+
+        # v14: ваш IP прямым соединением (без прокси) — эталон для жёсткого
+        # отбора «прозрачных» узлов (exit-IP узла == ваш IP). Запрос ОДИН на
+        # прогон, до параллельного обхода узлов. Сравнение — только SOCKS-путь
+        # узла (как и все проверки приложения): это не системный leak-тест.
+        real_ip = ""
+        real_ip_source = ""
+        try:
+            real_ip, real_ip_source = fetch_real_ip(timeout=ai_timeout)
+        except Exception as exc:
+            log(f"[ai-geo] не удалось определить ваш IP: {exc}")
+        if real_ip:
+            log(
+                f"[ai-geo] ваш IP (прямое соединение, {real_ip_source}): {real_ip} — "
+                f"узлы с таким же exit-IP будут отброшены (прозрачные: трафик "
+                f"не туннелируется, ваш IP видят все сервисы)"
+            )
+        else:
+            log("[ai-geo] ваш IP не определён — проверка утечек exit-IP пропущена")
+
         log(
             f"[sub] AI-geo (v11: консенсус CF+ipinfo+ip-api, флаг страны), "
             f"strict={'on (слепок РФ -> FAIL)' if ai_strict else 'off'}, "
+            f"leak-check={'on (exit-IP == ваш IP -> FAIL)' if real_ip else 'off'}, "
             f"timeout={ai_timeout}s, checking {ai_geo_orig_count} nodes..."
         )
         if ai_geo_idx >= 0:
@@ -1694,7 +2202,9 @@ def run(
 
         checked_ai: list[Any] = []
         failed_ai = 0
+        failed_leak = 0
         ai_geo_node_details: dict[str, Any] = {}
+        _ai_drop_reasons: dict[str, str] = {}
         log(f"[sub] ai-geo: параллельно, {min(args.workers, max(1, ai_geo_orig_count))} потоков")
 
         def _check_ai_node(w: Any) -> AiGeoResult:
@@ -1715,7 +2225,7 @@ def run(
         )
 
         for idx, (w, res) in enumerate(pairs, 1):
-            ai_geo_node_details[w.node.title()] = res.row() if res else None
+            ai_geo_node_details[_detail_key(w)] = res.row() if res else None
             if res is None:
                 # ядро узла не поднялось — узел НЕ отсеивается (как раньше:
                 # слепок недоступен не виноват узел, но имя не обновится)
@@ -1728,34 +2238,69 @@ def run(
             # приоритет — consensus_country (заполняется в checkers/ai_geo.py).
             consensus = getattr(res, "consensus_country", None) or (res.cf_loc or "").strip().upper()
             w.ai_geo_country = consensus
-            # Фильтрация только в strict-режиме и только при ДОСТУПНОМ
-            # слепке: ai_unblocked=False (слепок РФ). None (сигналы не
-            # получены) и node_start_failed — узел НЕ отсеивается.
-            node_rejected = bool(ai_strict and res.ai_unblocked is False)
+            # v14: exit-IP узла (из тел ipinfo/ip-api) и проверка утечки.
+            # Утечка = exit-IP узла РАВЕН вашему IP (прямое соединение): узел
+            # прозрачный — подключение есть, а трафик не туннелируется.
+            # Жёсткий отбор НЕЗАВИСИМО от ai_strict (просьба юзера): нулевая
+            # анонимность — это не предпочтение, а сломанный узел. Отсекаем
+            # только при ПОЛОЖИТЕЛЬНОМ совпадении: любой из IP не определён —
+            # узел НЕ отсеивается (нет доказательства — нет вердикта).
+            exit_ip = (getattr(res, "exit_ip", "") or "").strip()
+            leaked = bool(
+                real_ip
+                and exit_ip
+                and exit_ip.lower() == real_ip.strip().lower()
+            )
+            # Фильтрация по РФ-слепку — только в strict-режиме и только при
+            # ДОСТУПНОМ слепке: ai_unblocked=False (слепок РФ). None (сигналы
+            # не получены) и node_start_failed — узел НЕ отсеивается.
+            node_rejected = leaked or bool(ai_strict and res.ai_unblocked is False)
             if not node_rejected:
                 checked_ai.append(w)
                 log(
                     f"[ai-geo] {idx}/{ai_geo_orig_count}: {w.node.title()} "
-                    f"(consensus={consensus or '-'} cf={res.cf_loc or '-'} "
+                    f"(consensus={consensus or '-'} exit={exit_ip or '-'} "
+                    f"cf={res.cf_loc or '-'} "
                     f"google={res.google_country or '-'} gemini={res.gemini_reachable} "
                     f"verdict={res.ai_unblocked} reason={res.reason})"
                 )
             else:
                 failed_ai += 1
-                log(
-                    f"[ai-geo] FAIL {idx}/{ai_geo_orig_count}: {w.node.title()} "
-                    f"(слепок РФ: consensus={consensus or '-'} cf={res.cf_loc or '-'} "
-                    f"google={res.google_country or '-'} reason={res.reason})"
-                )
+                if leaked:
+                    failed_leak += 1
+                    _ai_drop_reasons[_detail_key(w)] = f"exit-IP утечка ({exit_ip} == ваш IP)"
+                    log(
+                        f"[ai-geo] LEAK {idx}/{ai_geo_orig_count}: {w.node.title()} "
+                        f"(exit-IP {exit_ip} == ваш IP {real_ip}: узел прозрачный, "
+                        f"трафик НЕ идёт через узел — жёсткий отбор)"
+                    )
+                else:
+                    _ai_drop_reasons[_detail_key(w)] = f"слепок РФ (consensus={consensus or '-'})"
+                    log(
+                        f"[ai-geo] FAIL {idx}/{ai_geo_orig_count}: {w.node.title()} "
+                        f"(слепок РФ: consensus={consensus or '-'} cf={res.cf_loc or '-'} "
+                        f"google={res.google_country or '-'} reason={res.reason})"
+                    )
         if ai_geo_idx >= 0:
             progress.finish_stage(
                 ai_geo_idx,
-                f"[ai-geo] done: {len(checked_ai)} passed, {failed_ai} failed",
+                f"[ai-geo] done: {len(checked_ai)} passed, {failed_ai} failed "
+                f"(утечки exit-IP: {failed_leak})",
             )
 
         working = checked_ai
-        if failed_ai > 0:
-            log(f"[sub] filtered out {failed_ai} nodes with RU AI-geo snapshot")
+
+        # v15: чекпойнт трассировки ИИ-гео-этапа.
+        tracker.checkpoint("ai_geo", working, _ai_drop_reasons)
+        tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+        log(tracker.summary_line("ai_geo"))
+        if failed_leak > 0:
+            log(
+                f"[sub] filtered out {failed_leak} transparent nodes "
+                f"(exit-IP == ваш IP, утечка SOCKS-пути)"
+            )
+        if failed_ai - failed_leak > 0:
+            log(f"[sub] filtered out {failed_ai - failed_leak} nodes with RU AI-geo snapshot")
 
         ai_geo_report = {
             "enabled": True,
@@ -1765,6 +2310,20 @@ def run(
             "strict": ai_strict,
             "timeout_sec": ai_timeout,
             "method": "v11: consensus CF+ipinfo+ip-api",
+            # v14: жёсткий отбор прозрачных узлов (exit-IP == ваш IP).
+            # enabled = ваш IP определён; rejected — сколько узлов совпало.
+            # Узел без exit-IP (пробы недоступны) НЕ считается утечкой.
+            "leak_check": {
+                "enabled": bool(real_ip),
+                "real_ip": real_ip,
+                "real_ip_source": real_ip_source,
+                "rejected": failed_leak,
+                "note": (
+                    "exit-IP узла == ваш IP (прямое соединение) -> узел прозрачный, "
+                    "трафик не туннелируется. Сравнение — только SOCKS-путь узла, "
+                    "не системные утечки (DNS/WebRTC/IPv6)."
+                ),
+            },
             "nodes": ai_geo_node_details,
         }
     else:
@@ -1968,12 +2527,14 @@ def run(
         skip_recheck = 0        # SKIP — speed=None, но alive=True (тоже отбракован,
                                 #   но причина — «не измерилось», а не «мёртв»)
         recheck_speeds: dict[str, dict[str, Any]] = {}
+        _recheck_drop_reasons: dict[str, str] = {}
         for idx, ((w, outcome), row) in enumerate(zip(pairs, rows), 1):
             speed_kbps, alive = outcome if outcome else (None, None)
             if speed_kbps is not None:
                 w.download_kbps = speed_kbps
                 row["download_kbps"] = round(float(speed_kbps), 1)
-            recheck_speeds[row.get("name") or w.node.title()] = {
+            recheck_speeds[_detail_key(w)] = {
+                "name": row.get("name") or w.node.title(),
                 "speed_kbps": None if speed_kbps is None else round(float(speed_kbps), 1),
                 "alive": alive,
                 "passed": bool(speed_kbps is not None and speed_kbps >= recheck_min_speed),
@@ -1986,12 +2547,14 @@ def run(
                 # пользователь видит в финальной подписке. Теперь отбраковываем.
                 if alive is True:
                     skip_recheck += 1
+                    _recheck_drop_reasons[_detail_key(w)] = "skip (скорость не измерилась, жив)"
                     log(
                         f"[recheck] SKIP→FAIL {idx}/{recheck_orig_count}: {row.get('name') or w.node.title()} "
                         f"(скорость не измерилась, узел отвечает HEAD, но не тянет трафик — отбракован)"
                     )
                 else:
                     failed_recheck += 1
+                    _recheck_drop_reasons[_detail_key(w)] = "dead (не отвечает)"
                     log(f"[recheck] DEAD {idx}/{recheck_orig_count}: {row.get('name') or w.node.title()} (скорость не измерилась, узел не отвечает)")
             elif speed_kbps >= recheck_min_speed:
                 kept_working.append(w)
@@ -2000,6 +2563,7 @@ def run(
             else:
                 # SLOW — узел медленный, ниже порога. Отбраковываем.
                 slow_recheck += 1
+                _recheck_drop_reasons[_detail_key(w)] = f"slow ({speed_kbps:.0f} < {recheck_min_speed:.0f} Kbps)"
                 log(
                     f"[recheck] SLOW→FAIL {idx}/{recheck_orig_count}: {row.get('name') or w.node.title()} "
                     f"({speed_kbps:.1f} Kbps < {recheck_min_speed:.0f} — отбракован как полудохлый)"
@@ -2020,6 +2584,12 @@ def run(
                 f"[sub] filtered out {total_dropped} nodes (final speed re-check): "
                 f"{failed_recheck} dead, {skip_recheck} skip (no-speed-but-alive), {slow_recheck} slow (<{recheck_min_speed:.0f} Kbps)"
             )
+
+        # v15: чекпойнт финального спидтеста (внутри if-блока — переменные
+        # определены только здесь).
+        tracker.checkpoint("recheck", working, _recheck_drop_reasons)
+        tracker.write_log(trace_log_path, header=f"источников: {len(sources)}")
+        log(tracker.summary_line("recheck"))
 
         recheck_report = {
             "enabled": True,
@@ -2059,8 +2629,28 @@ def run(
         plain=False,
     )
 
-    # WARP генерация удалена — обычные warp:// URL блокируются на
-    # мобильных сетях РФ и бесполезны.
+    # Отчёт «из каких подписок собрана итоговая подписка»: по каждому источнику —
+    # сколько узлов из него дошло до экспорта (доля) и сколько отвалилось по пути.
+    sources_report = _build_sources_report(sources, discovered, working)
+    _log_sources_report(sources_report, log=log)
+
+    # v15: финальный чекпойнт трассировки — экспорт (после всех фильтров);
+    # полное описание воронки по каждой подписке (запрос юзера 2026-09-19:
+    # «вести лог от самого начала, какие конфиги за какими подписками —
+    # чтобы точно понимать где отвалились»).
+    tracker.checkpoint("exported", working)
+    tracker.write_log(trace_log_path, header=f"источников: {len(sources)}; ЭКСПОРТ ЗАВЕРШЁН")
+    log(tracker.summary_line("exported"))
+    log("[trace] полная воронка по каждой подписке: data/trace.log (секция trace в report.json)")
+    trace_report = tracker.report()
+    # Воронку вливаем в отчёт по источникам — окно «Из каких подписок»
+    # показывает её без отдельной кнопки.
+    _funnel_by_source = {e.get("source"): e.get("funnel") for e in trace_report.get("sources", [])}
+    _lost_by_source = {e.get("source"): e.get("lost_at") for e in trace_report.get("sources", [])}
+    for entry in sources_report.get("nodes", []):
+        src = entry.get("source")
+        entry["funnel"] = _funnel_by_source.get(src) or {}
+        entry["lost_at"] = _lost_by_source.get(src) or {}
 
     # Отчёт.
     report: dict[str, Any] = {
@@ -2088,6 +2678,15 @@ def run(
         "zapret": dpi_report.get("suite", {"enabled": False}) if dpi_report else {"enabled": False},
         "resilience": resilience_report,
         "recheck": recheck_report,
+        # v12: фильтр по параметрам конфигов (какие измерения включены,
+        # сколько отсеяно и по каким причинам).
+        "params_filter": params_filter_report,
+        # v13: из каких подписок собрана итоговая подписка (по источникам).
+        "sources_report": sources_report,
+        # v15: сквозная трассировка — воронка потерь по каждой подписке
+        # (discovered → quick → max_ping → initial → telegram → services →
+        # resilience → ai_geo → recheck → exported) + судьба узлов.
+        "trace": trace_report,
         "nodes": rows,
     }
 

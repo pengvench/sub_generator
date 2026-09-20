@@ -403,6 +403,9 @@ def serialize_working(
                 "upload_kbps": item.upload_kbps,
                 "tg_media_kbps": getattr(item, "tg_media_kbps", None),
                 "ai_geo_country": ai_country if len(ai_country) == 2 else "",
+                # v13: подписка-источник узла — для отчёта «из чего собрана
+                # итоговая подписка» (сверка глазами и диагностика дубликатов).
+                "source": str(node.source_url or ""),
             }
         )
     return rows

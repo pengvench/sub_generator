@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +15,24 @@ import customtkinter as ctk
 from .. import paths, theme
 
 NODE_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://", "hysteria://")
+
+# Ссылки на подписки, которые можно вставить в поле «Вставка конфигов»:
+# зашифрованные happ:// и обычные http(s):// — они качаются через общий
+# конвейер загрузки (_fetch_text), а не ищутся как готовые конфиги.
+_SUB_LINK_RE = re.compile(r"\b(?:happ://|https?://)\S+", re.IGNORECASE)
+
+
+def _extract_sub_links(text: str) -> list[str]:
+    """Ссылки на подписки (happ://, https://) из вставленного текста."""
+    links: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        for m in _SUB_LINK_RE.finditer(line):
+            link = m.group(0).rstrip(".,;)")
+            if link and link.lower() not in seen:
+                seen.add(link.lower())
+                links.append(link)
+    return links
 
 
 def _extract_configs(text: str) -> list[str]:
@@ -115,9 +133,21 @@ class ImportPage(ctk.CTkFrame):
             command=lambda: self.txt_input.delete("1.0", "end"))
         self.btn_clear.grid(row=0, column=2, padx=(6, 0))
 
-        # Ctrl+V — работает на любой раскладке
-        self.txt_input.bind("<Control-v>", lambda e: self._paste_from_clipboard())
-        self.txt_input.bind("<Control-V>", lambda e: self._paste_from_clipboard())
+        # Статус вставки (в этой же карточке — не в карточке URL).
+        self.lbl_paste_status = ctk.CTkLabel(card_paste, text="", text_color=theme.MUTED,
+                                             font=ctk.CTkFont(size=11))
+        self.lbl_paste_status.grid(row=3, column=0, padx=10, pady=(0, 8), sticky="w")
+
+        # Ctrl+V в поле вставки — вставка С ЗАМЕНОЙ всего содержимого.
+        # Биндинг вешается на ВНУТРЕННИЙ tk.Text (CTkTextbox — это фрейм,
+        # фокус клавиатуры получает внутренний текстовый виджет, биндинг
+        # на самом CTkTextbox никогда не срабатывал). Виртуальное событие
+        # <<Paste>> генерируется и в английской раскладке (штатно), и в
+        # русской (наш глобальный перехватчик по keycode, см. ui/hotkeys.py)
+        # — поведение одинаковое в любой раскладке. 'break' не даёт
+        # классовому биндингу вставить текст второй раз.
+        self.txt_input._textbox.bind(
+            "<<Paste>>", lambda e: (self._paste_from_clipboard(), "break")[1])
 
         # --- URL ---
         card_url = ctk.CTkFrame(self.scroll, fg_color=theme.CARD, corner_radius=10,
@@ -215,43 +245,74 @@ class ImportPage(ctk.CTkFrame):
     def _save_paste(self):
         text = self.txt_input.get("1.0", "end").strip()
         configs = _extract_configs(text)
-        if not configs:
-            self.lbl_url_status.configure(text="Конфиги не найдены", text_color=theme.DANGER)
+        if configs:
+            count = self._save_configs(configs, "paste")
+            self.lbl_paste_status.configure(text=f"Сохранено {count} конфигов", text_color=theme.SUCCESS)
+            self._refresh_saved_list()
             return
-        count = self._save_configs(configs, "paste")
-        self.lbl_url_status.configure(text=f"Сохранено {count} конфигов", text_color=theme.SUCCESS)
-        self._refresh_saved_list()
+        # Готовых конфигов нет — но текст может быть ссылкой на подписку
+        # (happ:// или https://): качаем её через общий конвейер.
+        links = _extract_sub_links(text)
+        if links:
+            self._import_links(links, self.lbl_paste_status)
+            return
+        self.lbl_paste_status.configure(text="Конфиги не найдены", text_color=theme.DANGER)
+
+    def _import_links(self, links: list[str], status) -> None:
+        """Скачать подписки по ссылкам (happ:// расшифровка + зеркала + транспорт).
+
+        Единый конвейер из runtime.fetch — тот же, что и в основном тесте:
+        happ://cryptN/ расшифровывается здесь же, и причина неудачи
+        (например, нестандартный формат ссылки) попадает в статус.
+        """
+        links = list(links)
+        status.configure(text=f"Скачивание ({len(links)} ссылок)...", text_color=theme.WARNING)
+        self.btn_save_paste.configure(state="disabled")
+        self.btn_import_url.configure(state="disabled")
+
+        def worker():
+            all_configs: list[str] = []
+            seen: set[str] = set()
+            errors: list[str] = []
+            try:
+                from xray_runtime import _fetch_text
+
+                for index, url in enumerate(links, 1):
+                    self.after(0, lambda i=index, t=len(links): status.configure(
+                        text=f"Скачивание {i}/{t}...", text_color=theme.WARNING))
+                    try:
+                        data = _fetch_text(url, timeout=20.0, log_sink=_logger.warning)
+                        found = _extract_configs(data)
+                        for cfg in found:
+                            if cfg not in seen:
+                                seen.add(cfg)
+                                all_configs.append(cfg)
+                    except Exception as e:
+                        msg = str(e)
+                        if len(msg) > 220:
+                            msg = msg[:220] + "…"
+                        errors.append(msg)
+            finally:
+                def finish(configs=all_configs, errs=errors):
+                    self.btn_save_paste.configure(state="normal")
+                    self.btn_import_url.configure(state="normal")
+                    if configs:
+                        count = self._save_configs(configs, "url")
+                        status.configure(text=f"Сохранено {count} конфигов", text_color=theme.SUCCESS)
+                        self._refresh_saved_list()
+                    elif errs:
+                        status.configure(text=f"Ошибка: {errs[0]}", text_color=theme.DANGER)
+                    else:
+                        status.configure(text="Конфиги не найдены", text_color=theme.DANGER)
+                self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _import_from_url(self):
         url = self.entry_url.get().strip()
         if not url:
             return
-        self.lbl_url_status.configure(text="Скачивание...", text_color=theme.WARNING)
-        self.btn_import_url.configure(state="disabled")
-
-        def worker():
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": "v2rayN/6.23"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = resp.read().decode("utf-8", errors="replace")
-                configs = _extract_configs(data)
-                if not configs:
-                    self.after(0, lambda: self.lbl_url_status.configure(
-                        text="Конфиги не найдены", text_color=theme.DANGER))
-                    return
-                count = self._save_configs(configs, "url")
-                self.after(0, lambda: self.lbl_url_status.configure(
-                    text=f"Сохранено {count} конфигов", text_color=theme.SUCCESS))
-                self.after(0, self._refresh_saved_list)
-            except Exception as e:
-                # Багфикс: e удаляется Python-ом при выходе из except-блока,
-                # а lambda вызывается отложенно (self.after) — привязываем сейчас.
-                self.after(0, lambda e=e: self.lbl_url_status.configure(
-                    text=f"Ошибка: {e}", text_color=theme.DANGER))
-            finally:
-                self.after(0, lambda: self.btn_import_url.configure(state="normal"))
-
-        threading.Thread(target=worker, daemon=True).start()
+        self._import_links([url], self.lbl_url_status)
 
     def _import_from_file(self):
         from tkinter import filedialog
@@ -265,12 +326,18 @@ class ImportPage(ctk.CTkFrame):
             self.lbl_url_status.configure(text=f"Ошибка: {e}", text_color=theme.DANGER)
             return
         configs = _extract_configs(text)
-        if not configs:
-            self.lbl_url_status.configure(text="Конфиги не найдены", text_color=theme.DANGER)
+        if configs:
+            count = self._save_configs(configs, f"file_{Path(path).stem[:20]}")
+            self.lbl_url_status.configure(text=f"Сохранено {count} из {Path(path).name}", text_color=theme.SUCCESS)
+            self._refresh_saved_list()
             return
-        count = self._save_configs(configs, f"file_{Path(path).stem[:20]}")
-        self.lbl_url_status.configure(text=f"Сохранено {count} из {Path(path).name}", text_color=theme.SUCCESS)
-        self._refresh_saved_list()
+        # В файле не готовые конфиги — а ссылки на подписки (happ://, https://)?:
+        # качаем их тем же конвейером, как из вставки/URL-поля.
+        links = _extract_sub_links(text)
+        if links:
+            self._import_links(links, self.lbl_url_status)
+            return
+        self.lbl_url_status.configure(text="Конфиги не найдены", text_color=theme.DANGER)
 
     def _refresh_saved_list(self):
         for w in self.saved_frame.winfo_children():

@@ -42,14 +42,24 @@ class PipelineOptions:
 
     # v11: новые опции.
     # dedup_mode — режим дедупликации узлов (strict/normal/aggressive).
-    # use_singbox_pool — один sing-box процесс с N outbounds + Clash API
-    # для массовых этапов (initial_check). По умолчанию включён.
+    # use_singbox_pool — групповой тест (один процесс ядра на батч узлов)
+    # для массовых этапов (initial_check, telegram_pro). По умолчанию включён.
     # singbox_pool_batch — размер батча (200 узлов на один процесс).
+    # pool_engine — ядро группового теста: xray (как в клиентах юзера,
+    # поддержка xhttp/kcp/quic) или singbox (прежний selector-пул).
     # resilience_check — проверка живучести в блокировках (включена по умолчанию).
     dedup_mode: str = "normal"
     use_singbox_pool: bool = True
     singbox_pool_batch: int = 200
+    pool_engine: str = "xray"
     resilience_check: bool = True
+    # v12: фильтр по параметрам конфигов (вкладка «Фильтры»). CSV-белые списки
+    # (пустая строка — измерение не фильтруется); строки собирает FiltersPage
+    # из галочек и передаёт в build_pipeline_args как --proto-filter и т.д.
+    proto_filter: str = ""
+    security_filter: str = ""
+    transport_filter: str = ""
+    flow_filter: str = ""
 
     start_stage: str = "ping"
     custom_file: str = ""
@@ -163,8 +173,24 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
         args.append("--no-singbox-pool")
     if options.singbox_pool_batch != 200:
         args += ["--singbox-pool-batch", str(options.singbox_pool_batch)]
+    # v17: ядро группового теста (xray по умолчанию — как в клиентах юзера).
+    engine = str(getattr(options, "pool_engine", "xray") or "xray").lower()
+    if engine not in ("xray", "singbox"):
+        engine = "xray"
+    if engine != "xray":
+        args += ["--pool-engine", engine]
     if not options.resilience_check:
         args.append("--no-resilience-check")
+    # v12: фильтр по параметрам конфигов — передаём только непустые
+    # (пустые = измерение не фильтруется, аргумент опускаем).
+    if options.proto_filter.strip():
+        args += ["--proto-filter", options.proto_filter.strip()]
+    if options.security_filter.strip():
+        args += ["--security-filter", options.security_filter.strip()]
+    if options.transport_filter.strip():
+        args += ["--transport-filter", options.transport_filter.strip()]
+    if options.flow_filter.strip():
+        args += ["--flow-filter", options.flow_filter.strip()]
     if options.start_stage != "ping":
         args += ["--start-stage", options.start_stage]
     if options.custom_file:

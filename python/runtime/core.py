@@ -109,12 +109,30 @@ class XrayCoreRuntime(
         out_dir: Path,
         log_sink: Callable[[str], None] | None = None,
         event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+        lightweight: bool = False,
     ) -> None:
+        """``lightweight=True`` — одноразовый runtime для проверки ОДНОГО узла
+        (base.run_with_node и все чекеры).
+
+        БАГФИКС (P0, инцидент 2026-09-16 «краш на середине теста»): полный
+        __init__ на каждый узел делал ТРИ разрушительные вещи:
+          1) ``atexit.register(self.stop)`` — экземпляр жил ВЕЧНО (реестр
+             atexit держит ссылку): 246 узлов × (873 working + 16650
+             rejected из кешей) ≈ 5-6 ГБ удержанной памяти → нативный
+             краш без traceback на ~247-м узле;
+          2) ``_load_cached_results()`` — 20-30 МБ парсинга кешей НА УЗЕЛ;
+          3) ``_cleanup_stale_processes()`` — spawn PowerShell НА УЗЕЛ
+             (~1-2 с) + чтение ОБЩЕГО pid-файла с терминацией чужого PID
+             (при реюзе PID убивает невинный процесс, в т.ч. наш).
+        Lightweight-режим ничего из этого не делает; stop() не трогает
+        ОБЩИЕ файлы состояния (pid-файл долгоживущего runtime'а).
+        """
         self.config = config
         self.root_dir = root_dir
         self.out_dir = out_dir
         self.log_sink = log_sink
         self.event_sink = event_sink
+        self._lightweight = bool(lightweight)
         self._lock = threading.RLock()
         self._process: subprocess.Popen | None = None
         self._running_node: XrayNode | None = None
@@ -122,8 +140,11 @@ class XrayCoreRuntime(
         self._pid_path = self.out_dir / "xray_runtime.pid"
         self._shutdown_requested = False
         self._job_handle: int | None = _create_kill_on_close_job()
-        self._cleanup_stale_processes()
-        atexit.register(self.stop)
+        if not self._lightweight:
+            # Долгоживущий runtime: чистим stale-ядра и регистрируем
+            # корректную остановку atexit (один-два экземпляра на процесс).
+            self._cleanup_stale_processes()
+            atexit.register(self.stop)
         self.active_result: XrayProbeResult | None = None
         self.last_working: list[XrayProbeResult] = []
         self.last_rejected: list[XrayProbeResult] = []
@@ -146,7 +167,8 @@ class XrayCoreRuntime(
         # мёртвых подписок (источник не опрашивается в cooldown).
         self._source_failures: dict[str, int] = {}
         self._source_dead_until: dict[str, float] = {}
-        self._load_cached_results()
+        if not self._lightweight:
+            self._load_cached_results()
 
     def refresh(
         self,

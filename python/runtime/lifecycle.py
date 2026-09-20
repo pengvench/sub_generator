@@ -87,13 +87,21 @@ class LifecycleMixin:
             proc = self._process
             if proc is not None and proc.poll() is None:
                 _terminate_process_tree(proc, timeout=timeout)
-            elif proc is None:
+            elif proc is None and not self._lightweight:
+                # pid-файл и xray_runtime.pid — ОБЩЕЕ состояние долгоживущих
+                # runtime'ов (один out_dir). Одноразовый (lightweight) runtime
+                # НЕ имеет права убивать чужой активный узел: при реюзе PID
+                # _terminate_pid_tree убивает невинный процесс (в худшем
+                # случае — наш собственный, инцидент 2026-09-16).
                 stale_pid = self._read_pid_file()
                 if stale_pid:
                     _terminate_pid_tree(stale_pid, timeout=timeout)
             self._process = None
             self._running_node = None
-            self._unlink_pid_file()
+            if not self._lightweight:
+                # Общий pid-файл принадлежит долгоживущему runtime —
+                # одноразовый его не трогает (иначе удалит живой PID-маркер).
+                self._unlink_pid_file()
             self._reset_process_job()
             if self._config_path:
                 with contextlib.suppress(Exception):
@@ -152,7 +160,12 @@ class LifecycleMixin:
     def _reset_process_job(self) -> None:
         if self._job_handle is not None:
             _close_windows_handle(self._job_handle)
-        self._job_handle = _create_kill_on_close_job()
+        # Одноразовый (lightweight) runtime после stop() больше не нужен:
+        # новый Job Object не создаём — объект умрёт без atexit-ссылки, и
+        # закрывать этот хендл будет некому (утечка kernel-handle).
+        self._job_handle = (
+            None if self._lightweight else _create_kill_on_close_job()
+        )
 
     def restart(self) -> bool:
         self.stop()

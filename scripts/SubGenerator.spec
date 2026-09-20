@@ -40,11 +40,11 @@ hiddenimports = [
     # Слои движка после модуляризации core.py (примеси XrayCoreRuntime).
     'runtime.lifecycle', 'runtime.probing', 'runtime.sorting',
     'runtime.stress', 'runtime.collect', 'runtime.results',
-    'runtime.happ_decrypt', 'singbox_convert',
+    'runtime.happ_decrypt', 'runtime.happ_keys', 'singbox_convert',
     'ui.app', 'ui.runner', 'ui.paths', 'ui.tooltip', 'ui.theme', 'ui.main',
     'ui.pages.start_page', 'ui.pages.sources_page', 'ui.pages.log_page',
     'ui.pages.settings_page', 'ui.pages.recheck_page',
-    'ui.pages.diag_page', 'ui.pages.import_page',
+    'ui.pages.diag_page', 'ui.pages.import_page', 'ui.pages.filters_page',
 ]
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

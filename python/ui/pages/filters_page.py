@@ -67,6 +67,33 @@ HELP = {
         "выполняется всегда и попадает в отчёт (openai_ok/gemini_ok)."
     ),
     "ai_timeout": "Таймаут одного ИИ-гео запроса, сек.",
+    # v22: SNI-категоризация для ограниченных сетей РФ (мобильные операторы).
+    "sort_by_sni": (
+        "Отсортировать итоговый список так, что БС-узлы (SNI в белом списке: "
+        "sberbank.ru, vk.com, gosuslugi.ru, github.com, cloudflare.com ...) "
+        "идут ПЕРВЫМИ в подписке. Полезно клиентам, которые подключаются к "
+        "узлу по порядку из списка — на мобильной сети РФ первый БС-узел "
+        "пройдёт DPI-блок. Без фильтрации, только переупорядочивание."
+    ),
+    "bs_only": (
+        "Оставить в финальной подписке только БС-узлы (SNI в белом списке). "
+        "Для ограниченных сетей РФ (МТС/МегаФон/Билайн/Tele2), где ЧС-узлы "
+        "(instagram.com, chatgpt.com, twitter.com ...) блокируются DPI. "
+        "Белый список: community-curated 2026 (~910 доменов из "
+        "hxehex/russia-mobile-internet-whitelist) + встроенный (~80). "
+        "Синк скриптом scripts/sync_sni_whitelist.py."
+    ),
+    "bs_allow_grey": (
+        "(с «Только БС») Включать «серые» SNI — реальные домены не из списков "
+        "(realhost.com, sub.domain.ru ...). Часто проходят DPI как обычный TLS. "
+        "По умолчанию ON. Если у вас жёсткая сеть (мобильный оператор с полным "
+        "SNI-whitelist'ом) — выключите для строгого режима."
+    ),
+    "bs_allow_fake": (
+        "(с «Только БС») Включать «фейк» SNI — короткие строки без точки "
+        "(abc12345). НЕ рекомендуется: ТСПУ быстро учится их блокировать. "
+        "По умолчанию OFF."
+    ),
 }
 
 # Заголовки групп измерений (порядок = порядок на странице).
@@ -99,9 +126,11 @@ class FiltersPage(ctk.CTkFrame):
 
         self.card_params = self._make_card(self.scroll, 0, "Параметры конфигов")
         self.card_geo = self._make_card(self.scroll, 1, "Гео и нейросети")
+        self.card_sni = self._make_card(self.scroll, 2, "SNI категории (БС/ЧС)")
 
         self._build_params_card(self.card_params.inner)
         self._build_geo_card(self.card_geo.inner)
+        self._build_sni_card(self.card_sni.inner)
 
         # Восстановить сохранённые настройки (мастер-тумблер, галочки, ai_*).
         self._restore_settings()
@@ -312,6 +341,117 @@ class FiltersPage(ctk.CTkFrame):
             CTkToolTip(entry, help)
         return entry
 
+    # ------------------------------------------------------------ SNI категории
+    def _build_sni_card(self, inner: ctk.CTkFrame) -> None:
+        """v22: тумблеры SNI-категоризации для ограниченных сетей РФ.
+
+        Кейс юзера 2026-09-29: на мобильных операторах РФ (МТС/МегаФон/Билайн/
+        Tele2) проходят только узлы с SNI из БЕЛОГО списка (sberbank.ru, vk.com,
+        gosuslugi.ru, github.com ...). ЧС-узлы (instagram.com, chatgpt.com ...)
+        блокируются DPI. Эти тумблеры:
+          - «Сортировать по SNI» — БС-узлы идут первыми в финальной подписке;
+          - «Только БС-узлы» — строгий фильтр для ограниченных сетей;
+          - «Включать серые» — реальные домены не из списков (по умолчанию ON);
+          - «Включать фейки» — короткие строки (по умолчанию OFF, нестабильно).
+        """
+        inner.grid_columnconfigure(0, weight=1)
+
+        # 1) Сортировка БС-первым (мягкая опция, не фильтрует, только порядок).
+        row = 0
+        sort_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        sort_frame.grid(row=row, column=0, padx=6, pady=4, sticky="ew")
+        sort_frame.grid_columnconfigure(0, weight=1)
+        sort_label = ctk.CTkLabel(
+            sort_frame, text="Сортировать по SNI (БС первым)",
+            anchor="w", text_color=theme.TEXT,
+        )
+        sort_label.grid(row=0, column=0, sticky="w")
+        info = info_label(sort_frame, HELP["sort_by_sni"])
+        info.grid(row=0, column=1, padx=(4, 0), sticky="w")
+        self.toggle_sort_by_sni = ctk.CTkSwitch(sort_frame, text="", width=42)
+        self.toggle_sort_by_sni.grid(row=0, column=2, padx=(10, 0), sticky="e")
+        CTkToolTip(self.toggle_sort_by_sni, HELP["sort_by_sni"])
+
+        # 2) Только БС-узлы (жёсткий фильтр для ограниченных сетей).
+        row = 1
+        bs_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        bs_frame.grid(row=row, column=0, padx=6, pady=4, sticky="ew")
+        bs_frame.grid_columnconfigure(0, weight=1)
+        bs_label = ctk.CTkLabel(
+            bs_frame, text="Только БС-узлы (для ограниченной сети РФ)",
+            anchor="w", text_color=theme.TEXT,
+        )
+        bs_label.grid(row=0, column=0, sticky="w")
+        info2 = info_label(bs_frame, HELP["bs_only"])
+        info2.grid(row=0, column=1, padx=(4, 0), sticky="w")
+        self.toggle_bs_only = ctk.CTkSwitch(bs_frame, text="", width=42)
+        self.toggle_bs_only.grid(row=0, column=2, padx=(10, 0), sticky="e")
+        CTkToolTip(self.toggle_bs_only, HELP["bs_only"])
+        # При включении bs_only — опциональные тумблеры (grey/fake) активны;
+        # при выключении — disabled.
+        self.toggle_bs_only.configure(command=self._sync_sni_subtoggles)
+
+        # 3) Включать серые SNI (подопция bs_only).
+        row = 2
+        grey_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        grey_frame.grid(row=row, column=0, padx=(20, 6), pady=2, sticky="ew")
+        grey_frame.grid_columnconfigure(0, weight=1)
+        grey_label = ctk.CTkLabel(
+            grey_frame, text="Включать серые SNI (realhost.com и т.п.)",
+            anchor="w", text_color=theme.MUTED,
+            font=ctk.CTkFont(size=12),
+        )
+        grey_label.grid(row=0, column=0, sticky="w")
+        info3 = info_label(grey_frame, HELP["bs_allow_grey"])
+        info3.grid(row=0, column=1, padx=(4, 0), sticky="w")
+        self.toggle_bs_allow_grey = ctk.CTkSwitch(grey_frame, text="", width=42)
+        self.toggle_bs_allow_grey.grid(row=0, column=2, padx=(10, 0), sticky="e")
+        CTkToolTip(self.toggle_bs_allow_grey, HELP["bs_allow_grey"])
+        # По умолчанию ON — серые часто проходят.
+        self.toggle_bs_allow_grey.select()
+
+        # 4) Включать фейки SNI (подопция bs_only, нестабильно).
+        row = 3
+        fake_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        fake_frame.grid(row=row, column=0, padx=(20, 6), pady=2, sticky="ew")
+        fake_frame.grid_columnconfigure(0, weight=1)
+        fake_label = ctk.CTkLabel(
+            fake_frame, text="Включать фейки (abc12345, нестабильно)",
+            anchor="w", text_color=theme.MUTED,
+            font=ctk.CTkFont(size=12),
+        )
+        fake_label.grid(row=0, column=0, sticky="w")
+        info4 = info_label(fake_frame, HELP["bs_allow_fake"])
+        info4.grid(row=0, column=1, padx=(4, 0), sticky="w")
+        self.toggle_bs_allow_fake = ctk.CTkSwitch(fake_frame, text="", width=42)
+        self.toggle_bs_allow_fake.grid(row=0, column=2, padx=(10, 0), sticky="e")
+        CTkToolTip(self.toggle_bs_allow_fake, HELP["bs_allow_fake"])
+
+        # Приписка про источники whitelist'а (community-curated + builtin).
+        note = ctk.CTkLabel(
+            inner,
+            text=(
+                "Белый список SNI: community-curated 2026 (~910 доменов из "
+                "hxehex/russia-mobile-internet-whitelist) + встроенный (~80). "
+                "Чёрный список: ~30 запрещённых в РФ доменов (instagram.com, "
+                "chatgpt.com, twitter.com ...). Синк community list'а — скриптом "
+                "scripts/sync_sni_whitelist.py. Суффиксное сравнение защищает "
+                "от подделки: «sberbank.ru.evil.com» НЕ считается белым."
+            ),
+            font=ctk.CTkFont(size=11), text_color=theme.MUTED,
+            justify="left", wraplength=560,
+        )
+        note.grid(row=4, column=0, padx=10, pady=(8, 2), sticky="ew")
+
+        self._sync_sni_subtoggles()
+
+    def _sync_sni_subtoggles(self) -> None:
+        """Подопции bs_only (grey/fake) активны только при включённом bs_only."""
+        enabled = bool(self.toggle_bs_only.get())
+        state = "normal" if enabled else "disabled"
+        for tgl in (self.toggle_bs_allow_grey, self.toggle_bs_allow_fake):
+            tgl.configure(state=state)
+
     # ------------------------------------------------------------ сохранение
     def _restore_settings(self) -> None:
         opts = get_test_options()
@@ -342,6 +482,12 @@ class FiltersPage(ctk.CTkFrame):
         self._set_toggle(self.toggle_ai_strict, bool(opts.get("ai_strict", False)))
         self.ai_timeout.delete(0, "end")
         self.ai_timeout.insert(0, str(opts.get("ai_timeout", 6.0)))
+        # v22: восстановить SNI-тумблеры (sort_by_sni, bs_only, bs_allow_*).
+        self._set_toggle(self.toggle_sort_by_sni, bool(opts.get("sort_by_sni", False)))
+        self._set_toggle(self.toggle_bs_only, bool(opts.get("bs_only", False)))
+        self._set_toggle(self.toggle_bs_allow_grey, bool(opts.get("bs_allow_grey", True)))
+        self._set_toggle(self.toggle_bs_allow_fake, bool(opts.get("bs_allow_fake", False)))
+        self._sync_sni_subtoggles()
         self._sync_master_state()
 
     @staticmethod
@@ -370,6 +516,11 @@ class FiltersPage(ctk.CTkFrame):
             "flow_filter": self._group_csv("flow") if enabled else "",
             "ai_strict": bool(self.toggle_ai_strict.get()),
             "ai_timeout": self._float_value(self.ai_timeout, 6.0),
+            # v22: SNI-категоризация (БС/ЧС/серый/фейк/none).
+            "sort_by_sni": bool(self.toggle_sort_by_sni.get()),
+            "bs_only": bool(self.toggle_bs_only.get()),
+            "bs_allow_grey": bool(self.toggle_bs_allow_grey.get()),
+            "bs_allow_fake": bool(self.toggle_bs_allow_fake.get()),
         }
 
     def save_current_settings(self) -> None:
@@ -383,6 +534,11 @@ class FiltersPage(ctk.CTkFrame):
             "params_flow": [v for v, c in self._checkboxes["flow"].items() if c.get()],
             "ai_strict": bool(self.toggle_ai_strict.get()),
             "ai_timeout": self._float_value(self.ai_timeout, 6.0),
+            # v22: SNI-категоризация (БС/ЧС/серый/фейк/none).
+            "sort_by_sni": bool(self.toggle_sort_by_sni.get()),
+            "bs_only": bool(self.toggle_bs_only.get()),
+            "bs_allow_grey": bool(self.toggle_bs_allow_grey.get()),
+            "bs_allow_fake": bool(self.toggle_bs_allow_fake.get()),
         }
         try:
             save_test_options(opts)

@@ -61,6 +61,20 @@ class PipelineOptions:
     transport_filter: str = ""
     flow_filter: str = ""
 
+    # v22: SNI-категоризация для ограниченных сетей РФ (мобильные операторы).
+    #   sort_by_sni  — отсортировать итоговый список так, что БС-узлы
+    #                  (sberbank.ru, vk.com, github.com, ...) идут первыми.
+    #   bs_only      — оставить только БС-узлы (+ опц. серые/фейки).
+    #   bs_allow_grey — (с bs_only) включать «серые» SNI (по умолчанию ON).
+    #   bs_allow_fake — (с bs_only) включать «фейк» SNI (по умолчанию OFF).
+    # Списки доменов см. в checkers/sni_category.py (WHITE_SNI_DOMAINS,
+    # data/sni_whitelist.txt — community-curated 2026, синкается скриптом
+    # scripts/sync_sni_whitelist.py из hxehex/russia-mobile-internet-whitelist).
+    sort_by_sni: bool = False
+    bs_only: bool = False
+    bs_allow_grey: bool = True
+    bs_allow_fake: bool = False
+
     start_stage: str = "ping"
     custom_file: str = ""
 
@@ -195,6 +209,17 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
         args += ["--start-stage", options.start_stage]
     if options.custom_file:
         args += ["--custom-file", options.custom_file]
+    # v22: SNI-категоризация (БС/ЧС/серый/фейк/none) для ограниченных сетей РФ.
+    if getattr(options, "sort_by_sni", False):
+        args.append("--sort-by-sni")
+    if getattr(options, "bs_only", False):
+        args.append("--bs-only")
+        # --bs-allow-grey: argparse default=True. Если пользователь отключил
+        # серые SNI (bs_allow_grey=False), передаём --no-bs-allow-grey.
+        if not getattr(options, "bs_allow_grey", True):
+            args.append("--no-bs-allow-grey")
+        if getattr(options, "bs_allow_fake", False):
+            args.append("--bs-allow-fake")
     if sources:
         args += ["--sources"] + sources
     return args

@@ -1,0 +1,14 @@
+# Зависимости для GitHub Actions workflow refresh-subs.yml.
+#
+# На Linux GHA нам нужны только:
+#   cryptography — расшифровка happ://cryptN/ (RSA-4096 + ChaCha20-Poly1305,
+#                 ключи вшиты в data/happ_keys/ и runtime/happ_keys.py).
+#
+# Всё остальное (urllib для HTTP, socket для TCP-ping, threading для
+# параллелизма) — уже в stdlib Python 3.12.
+#
+# xray.exe / sing-box.exe на GHA НЕ нужны: scripts/refresh_subs.py
+# использует ТОЛЬКО fetch + parse + dedup + TCP-ping. Реальная проверка
+# работы узла (старт xray-ядра, спид-тест, обход блокировок) — это Windows-
+# only пайплайн sub_generator'а, в GHA-скрипте он не запускается.
+cryptography>=43.0.0

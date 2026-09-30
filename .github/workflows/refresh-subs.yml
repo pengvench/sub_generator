@@ -1,0 +1,183 @@
+# GitHub Actions: авто-обновление списков подписок на cron'е.
+#
+# Что делает:
+#   1. Загружает источники из data/sources.txt (URL'ы подписок,
+#      happ://cryptN/, прямые vless://, и т.д.).
+#   2. Скачивает каждый через runtime.fetch._fetch_text (urllib → curl →
+#      PowerShell-транспорт = no-op на Linux; happ:// расшифровывается).
+#   3. Разбирает тела подписок через runtime.parse._subscription_lines
+#      (plain / base64 / JSON-объекты Xray/Hiddify / Clash-YAML).
+#   4. Дедуплицирует узлы по node.key.
+#   5. Классифицирует SNI каждого узла: БС (sberbank.ru, vk.com, gosuslugi.ru,
+#      github.com, cloudflare.com ...) / ЧС (instagram.com, chatgpt.com ...) /
+#      серый / фейк / none (см. checkers/sni_category.py).
+#      С опциональным --bs-only оставляет только БС (+серые по умолчанию) —
+#      для ограниченных сетей РФ (мобильные операторы), где ЧС не проходит.
+#   6. (Опционально) TCP-ping socket'ом — дешёвый фильтр мёртвых узлов.
+#      Полная проверка через xray/sing-box доступна в --full-test режиме
+#      (см. ниже) — Linux binaries качаются из апстрима.
+#   7. Пишет итоговый список в data/preload.txt и data/preload_report.json.
+#   8. Коммитит изменения в main и пушит.
+#
+# Когда запускать: см. on.schedule cron. По умолчанию — каждые 6 часов
+# (00:00, 06:00, 12:00, 18:00 UTC). Можно вызвать вручную через
+# Actions → Refresh subs → Run workflow.
+name: Refresh subs
+
+on:
+  schedule:
+    # Каждые 6 часов (UTC). Подстройте под свою нагрузку.
+    # Минимум 5 минут между запусками (ограничение GHA cron).
+    - cron: "0 0,6,12,18 * * *"
+  workflow_dispatch:
+    # Ручной запуск из вкладки Actions — удобно для отладки.
+    inputs:
+      with_ping:
+        description: "TCP-ping фильтр (медленнее, чистит мёртвые)"
+        type: boolean
+        default: true
+      bs_only:
+        description: "Только БС-узлы (белый список SNI для ограниченных сетей РФ)"
+        type: boolean
+        default: true
+      sort_by_sni:
+        description: "Сортировать БС-узлы первыми в финальном списке"
+        type: boolean
+        default: true
+      full_test:
+        description: "Полная проверка через xray/sing-box (медленно, ~30+ мин)"
+        type: boolean
+        default: false
+      max_servers:
+        description: "Лимит итоговых узлов (0 = без лимита)"
+        type: string
+        default: "0"
+
+# Чтобы не было параллельных запусков (старый коммит затрёт новый).
+concurrency:
+  group: refresh-subs
+  cancel-in-progress: true
+
+permissions:
+  contents: write  # нужен для пуша коммита в main
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # увеличили: full_test режим требует 30-60 мин
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # мелкий клон — коммитим только preload.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-gha.txt
+            scripts/refresh_subs.py
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          # cryptography — для расшифровки happ://cryptN/ (RSA-4096 + ChaCha20-Poly1305).
+          pip install -r requirements-gha.txt
+
+      - name: Sync community SNI whitelist
+        # Качаем ~910 доменов из hxehex/russia-mobile-internet-whitelist
+        # (community-curated 2026 RU mobile whitelist). Без этого скрипта
+        # checkers/sni_category.py использует только встроенный ~80-доменный
+        # WHITE_SNI_DOMAINS. С синком --bs-only даст существенно больше узлов.
+        run: |
+          python scripts/sync_sni_whitelist.py \
+            --output data/sni_whitelist.txt
+
+      - name: Download xray + sing-box Linux binaries (full-test mode only)
+        if: ${{ inputs.full_test == true }}
+        run: |
+          mkdir -p bin
+          echo "=== Downloading xray-linux-64 ==="
+          XRAY_VERSION=v26.3.27
+          curl -sSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/xray-linux-64.zip"
+          unzip -o /tmp/xray.zip -d /tmp/xray
+          cp /tmp/xray/xray bin/xray
+          chmod +x bin/xray
+          bin/xray version
+          echo "=== Downloading sing-box-linux-64 ==="
+          SB_VERSION=v1.13.16
+          curl -sSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          cp /tmp/sing-box-*/sing-box bin/sing-box
+          chmod +x bin/sing-box
+          bin/sing-box version
+
+      - name: Refresh subs (fetch + parse + dedup + SNI-sort + TCP-ping)
+        env:
+          SUBGEN_DEBUG: "1"  # DEBUG-логи runtime в stdout (видно в Actions)
+        run: |
+          python scripts/refresh_subs.py \
+            --sources-file data/sources.txt \
+            --output data/preload.txt \
+            --report data/preload_report.json \
+            --with-ping \
+            --ping-timeout 3.0 \
+            --ping-workers 16 \
+            --fetch-timeout 25.0 \
+            --sort-by-sni \
+            ${{ inputs.bs_only == true && '--bs-only' || '' }} \
+            --max-servers ${{ inputs.max_servers || '0' }}
+
+      - name: Full check via xray (alive + blocked_services + tg_media + siberian)
+        # Опционально: запускает существующий CLI на БС-узлах из preload.txt.
+        # cli_main.py = subgen.pipeline.run() — тот же движок, что в GUI.
+        # Нужны Linux binaries xray/sing-box (см. предыдущий step).
+        # Проверяет: alive (TLS-handshake), siberian, tcp 16-20, blocked_services
+        # (Instagram/ChatGPT/Discord/YouTube доступ через прокси), tg_media
+        # (загрузка видео из публичной t.me/s/<канал> веб-предпросмотра — БЕЗ токена).
+        # НЕ проверяет: DPI-suite zapret (нужен zapret-дистрибутив), ИИ-гео
+        # (нужен OpenAI токен).
+        if: ${{ inputs.full_test == true }}
+        env:
+          SUBGEN_DEBUG: "1"
+        run: |
+          # Тест только первых 20 БС-узлов (sorted BS-first в preload.txt),
+          # иначе 80 узлов × 30с = ~40 минут GHA-минут.
+          head -n 21 data/preload.txt > data/preload_top20.txt
+          python -m ui.cli_main \
+            --sources data/preload_top20.txt \
+            --working data/preload_working.txt \
+            --report data/preload_report_full.json \
+            --max-ping 1500 \
+            --no-stress \
+            --initial-check-timeout 5.0
+          # Перезаписываем preload.txt только рабочими узлами (если они есть).
+          if [ -s data/preload_working.txt ]; then
+            cp data/preload_working.txt data/preload.txt
+            echo "[gha] full test: kept $(wc -l < data/preload.txt) working nodes"
+          else
+            echo "[gha] full test: 0 working nodes — keeping original preload.txt"
+          fi
+
+      - name: Show stats
+        if: always()
+        run: |
+          echo "=== preload.txt head ==="
+          head -n 5 data/preload.txt 2>/dev/null || true
+          echo
+          echo "=== preload_report.json ==="
+          cat data/preload_report.json 2>/dev/null || true
+
+      - name: Commit & push if changed
+        # git-auto-commit-action — популярное action для безопасного пуша.
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "auto: refresh subs (preload.txt + sni_whitelist + report)"
+          # Включаем sni_whitelist.txt — он обновляется sync_sni_whitelist.py.
+          # Если upstream не менялся — git-auto-commit-action заметит отсутствие diff.
+          file_pattern: "data/preload.txt data/preload_report.json data/sni_whitelist.txt data/preload_report_full.json data/preload_working.txt"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"

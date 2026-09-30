@@ -63,6 +63,15 @@ DEFAULT_TEST_OPTIONS: dict[str, object] = {
     "params_security": [],
     "params_transport": [],
     "params_flow": [],
+    # v22: SNI-категоризация для ограниченных сетей РФ (мобильные операторы).
+    #   sort_by_sni  — БС-узлы идут первыми в финальной подписке.
+    #   bs_only      — оставить только БС-узлы (+ опц. серые/фейки).
+    #   bs_allow_grey — (с bs_only) включать «серые» SNI (по умолчанию ON).
+    #   bs_allow_fake — (с bs_only) включать «фейк» SNI (по умолчанию OFF).
+    "sort_by_sni": False,
+    "bs_only": False,
+    "bs_allow_grey": True,
+    "bs_allow_fake": False,
 }
 
 

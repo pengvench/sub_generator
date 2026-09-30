@@ -132,6 +132,60 @@ check(
 cands = F._subscription_candidate_urls("https://plain.example/sub/list.txt")
 check("A4 обычный URL -> 1 кандидат, фантомов нет", cands == ["https://plain.example/sub/list.txt"], str(cands))
 
+# A6: URL-encoded inner URL в QUERY-параметре (паттерн «proxy.tld/exec?url=<encoded>»).
+# Реальные кейсы:
+#   https://tetragidropiranilciklopentiltetragidropiridopiridinovye.ru/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2F...%2Fauto
+#   https://yax.nenadoblokirowatgnidda.ru/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2F...
+# Прокси-просмотрщик и внутренний адрес живут на разных IP: когда обёртка
+# блокируется (DPI/RemoteDisconnected), внутренний часто доступен напрямую —
+# и должен стать запасным кандидатом загрузки. До фикса разворачивались
+# только обёртки с plain :// в path и URL-encoded path; query-обёртки
+# молча возвращали один кандидат (только саму обёртку).
+USER_URL = (
+    "https://tetragidropiranilciklopentiltetragidropiridopiridinovye.ru/exec"
+    "?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2FUDlZaTRhLDE3OTA2NTQ5NTkMdxnAhWG3b%2Fauto"
+)
+USER_INNER = "http://77.110.104.181:5002/sub/UDlZaTRhLDE3OTA2NTQ5NTkMdxnAhWG3b/auto"
+cands = F._subscription_candidate_urls(USER_URL)
+check(
+    "A6a query-encoded обёртка -> 2 кандидата (обёртка + внутренний)",
+    len(cands) == 2 and cands[0] == USER_URL and cands[1] == USER_INNER,
+    str(cands),
+)
+check(
+    "A6b _embedded_url_in вытаскивает inner URL из query-параметра",
+    F._embedded_url_in(USER_URL) == USER_INNER,
+    repr(F._embedded_url_in(USER_URL)),
+)
+
+# A7: тот же паттерн, но вместе с другими query-параметрами — берём
+# ТОЛЬКО значение, которое является URL; чужие параметры не цепляются.
+cands = F._subscription_candidate_urls(
+    "https://wrapper.tld/exec?url=https%3A%2F%2Frealhost.com%2Fpath&token=abc&format=auto"
+)
+check(
+    "A7 mixed-query обёртка -> внутренний URL без мусорных параметров",
+    len(cands) == 2 and cands[1] == "https://realhost.com/path",
+    str(cands),
+)
+
+# A8: query-параметры без URL внутри — фантомов не плодим.
+cands = F._subscription_candidate_urls("https://example.com/path?session=abc123&page=2&lang=en")
+check(
+    "A8 обычный URL с не-URL query-параметрами -> 1 кандидат, фантомов нет",
+    cands == ["https://example.com/path?session=abc123&page=2&lang=en"],
+    str(cands),
+)
+
+# A9: degenerate query-параметр «url=http://» (нет хоста) — не валидный URL,
+# фантомного кандидата не создаём (по «. в netloc» отсекается).
+cands = F._subscription_candidate_urls("https://example.com/exec?url=http%3A%2F%2F")
+check(
+    "A9 degenerate url=http:// — фантома нет (нет хоста с точкой)",
+    cands == ["https://example.com/exec?url=http%3A%2F%2F"],
+    str(cands),
+)
+
 GH = "https://raw.githubusercontent.com/owner/repo/refs/heads/main/sub.txt"
 cands = F._subscription_candidate_urls(GH)
 check(

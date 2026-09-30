@@ -1,7 +1,6 @@
 """Вкладка «Импорт» — сохранение конфигов в data/saved_subs/."""
 from __future__ import annotations
 
-import json
 import logging
 import re
 import threading
@@ -36,9 +35,75 @@ def _extract_sub_links(text: str) -> list[str]:
 
 
 def _extract_configs(text: str) -> list[str]:
+    """Извлечь node-ссылки из вставленного/скачанного/файлового тела.
+
+    Делегирует разбор в ``runtime.parse._subscription_lines`` — единый
+    конвейер для импорта и основного тестирования. Поддерживаются:
+      * plain-текст (vless:// / vmess:// / ss:// ... построчно);
+      * base64-тела (одно- и многоуровневый, URL-encoded);
+      * JSON-массивы строк-ссылок;
+      * JSON-массивы объектов-конфигов Xray/Hiddify — кейс happ://crypt5
+        от tetragidropiranilciklopentiltetragidropiridopiridinovye.ru:
+        ``[{"remarks":..., "outbounds":[{"protocol":"vless",
+        "settings":{"vnext":[...]}}]}]``;
+      * Clash-YAML подписки.
+
+    До этого фикса здесь был отдельный упрощённый парсер (plain + base64 +
+    JSON-массив строк). Он промахивался на JSON-массивах объектов-конфигов
+    Hiddify/Xray (живая подписка давала «Конфиги не найдены»), потому что
+    _node_links_from_json умеет ходить вглубь по дереву и собирать
+    node-ссылки из outbounds[].settings.vnext[].users[].id, а старая
+    ветка — нет. Теперь обе дороги (импорт + основной тест) используют
+    ОДНУ функцию разбора, и регрессии по форматам исключены.
+    """
+    text = str(text or "")
+    if not text:
+        return []
+    try:
+        # Ленивый импорт: UI-модуль не должен тянуть runtime на старте.
+        # Если runtime почему-то недоступен — откат к локальному fallback
+        # (минимальный plain-text парсер, без base64/JSON).
+        from xray_runtime import _subscription_lines
+    except ImportError:
+        return _extract_configs_fallback(text)
     configs: list[str] = []
     seen: set[str] = set()
-    for line in text.splitlines():
+    try:
+        for line in _subscription_lines(text):
+            # _subscription_lines на последнем fallthrough-шаге возвращает
+            # ВСЕ непустые строки (даже мусор): её потребитель parse_node_link
+            # сам отбраковывает неконсистентные. Но _extract_configs пишет
+            # строки прямо в saved_subs/*.txt как «готовые конфиги» —
+            # пропускаем строки, не начинающиеся с известной схемы, иначе
+            # в saved_subs попадёт «просто текст» (регрессия v18 test #4).
+            if not line:
+                continue
+            lowered = line.lower()
+            if not any(lowered.startswith(s) for s in NODE_SCHEMES):
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            configs.append(line)
+    except Exception as exc:
+        # Сюда попадаем, только если сам runtime.parse._subscription_lines
+        # упал (например, на кривом многоуровневом base64 с регэкспом).
+        # Причина — в debug, юзер видит «Конфиги не найдены».
+        _logger.debug("subscription_lines parse failed: %s", exc)
+    return configs
+
+
+def _extract_configs_fallback(text: str) -> list[str]:
+    """Минимальный plain-text парсер — запасной путь, когда runtime недоступен.
+
+    Сохраняет прежнее поведение импорта для окружений, где xray_runtime
+    не импортируется (например, отдельные юнит-тесты UI без зависимости
+    от runtime). В реальной работе приложение всегда имеет runtime в
+    ``sys.path``, и основная ветка (_subscription_lines) используется.
+    """
+    configs: list[str] = []
+    seen: set[str] = set()
+    for line in str(text or "").splitlines():
         line = line.strip()
         for scheme in NODE_SCHEMES:
             idx = line.lower().find(scheme)
@@ -48,40 +113,6 @@ def _extract_configs(text: str) -> list[str]:
                     seen.add(config)
                     configs.append(config)
                 break
-    if not configs:
-        import base64 as _b64
-        compact = "".join(text.split())
-        if compact:
-            try:
-                padded = compact + "=" * (-len(compact) % 4)
-                decoded = _b64.b64decode(padded).decode("utf-8", errors="replace")
-                if decoded and any(s in decoded.lower() for s in NODE_SCHEMES):
-                    for line in decoded.splitlines():
-                        line = line.strip()
-                        for scheme in NODE_SCHEMES:
-                            idx = line.lower().find(scheme)
-                            if idx >= 0:
-                                config = line[idx:].split()[0]
-                                if config and config not in seen:
-                                    seen.add(config)
-                                    configs.append(config)
-                                break
-            except Exception as exc:
-                # Горячий цикл разбора вставленного текста: битые строки
-                # пропускаем, причину — в debug (SUBGEN_DEBUG=1).
-                _logger.debug("строка импорта пропущена: %s", exc)
-    if not configs:
-        try:
-            data = json.loads(text)
-            items = data if isinstance(data, list) else data.get("configs", data.get("nodes", []))
-            for item in items:
-                if isinstance(item, str) and any(item.lower().startswith(s) for s in NODE_SCHEMES):
-                    if item not in seen:
-                        seen.add(item)
-                        configs.append(item)
-        except Exception as exc:
-            # Файл сохранённых конфигов побит/нестандартен — берём что дали.
-            _logger.debug("файл сохранённых конфигов разобран частично: %s", exc)
     return configs
 
 

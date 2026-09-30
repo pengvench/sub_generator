@@ -828,6 +828,12 @@ class StartPage(ctk.CTkFrame):
                 security_filter=str(filter_opts.get("security_filter", "")),
                 transport_filter=str(filter_opts.get("transport_filter", "")),
                 flow_filter=str(filter_opts.get("flow_filter", "")),
+                # v22: SNI-категоризация для ограниченных сетей РФ (тумблеры
+                # на вкладке «Фильтры» — _build_sni_card в FiltersPage).
+                sort_by_sni=bool(filter_opts.get("sort_by_sni", False)),
+                bs_only=bool(filter_opts.get("bs_only", False)),
+                bs_allow_grey=bool(filter_opts.get("bs_allow_grey", True)),
+                bs_allow_fake=bool(filter_opts.get("bs_allow_fake", False)),
             )
         dpi_check = bool(self.toggle_dpi.get())
         # v8: suite — часть DPI-проверки (безусловна); ИИ-гео слепок —
@@ -869,6 +875,11 @@ class StartPage(ctk.CTkFrame):
             security_filter=str(filter_opts.get("security_filter", "")),
             transport_filter=str(filter_opts.get("transport_filter", "")),
             flow_filter=str(filter_opts.get("flow_filter", "")),
+            # v22: SNI-категоризация для ограниченных сетей РФ.
+            sort_by_sni=bool(filter_opts.get("sort_by_sni", False)),
+            bs_only=bool(filter_opts.get("bs_only", False)),
+            bs_allow_grey=bool(filter_opts.get("bs_allow_grey", True)),
+            bs_allow_fake=bool(filter_opts.get("bs_allow_fake", False)),
         )
 
 

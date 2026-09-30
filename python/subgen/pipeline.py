@@ -125,6 +125,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resilience-check", action="store_true", default=True, help="Включить проверку живучести узлов в условиях блокировок (multi-target ping, WHITE-SNI, альтернативные цели). Включено по умолчанию для работы на заблокированных мобильных сетях.")
     parser.add_argument("--no-resilience-check", action="store_false", dest="resilience_check", help="Отключить проверку живучести (не рекомендуется для мобильных сетей РФ).")
     parser.add_argument("--resilience-timeout", type=float, default=4.0, help="Таймаут одного теста resilience-проверки, сек (по умолчанию 4).")
+    # v22: SNI-категоризация (БС/ЧС/серый/фейк/none) для ограниченных сетей РФ.
+    #   --sort-by-sni — отсортировать итоговый список так, что БС-узлы
+    #                   (sberbank.ru, vk.com, gosuslugi.ru, github.com, ...)
+    #                   идут первыми. Полезно, когда клиент подключается к
+    #                   узлу по порядку из подписки — первый БС-узел работает
+    #                   на мобильной сети РФ.
+    #   --bs-only     — оставить в финальной подписке только БС-узлы
+    #                   (sni в whitelist'е). Для мобильных операторов РФ,
+    #                   где ЧС-узлы (instagram.com, chatgpt.com ...) блокируются.
+    #   --bs-allow-grey — (с --bs-only) включать «серые» SNI (реальные домены
+    #                     не из списков) — часто проходят DPI как обычный TLS.
+    #   --bs-allow-fake — (с --bs-only) включать «фейк» SNI (abc12345) — НЕ
+    #                     рекомендуется: ТСПУ быстро учится их блокировать.
+    parser.add_argument("--sort-by-sni", action="store_true",
+                        help="Сортировать итоговый список по SNI-категории (БС → серый → фейк → none → ЧС). "
+                             "БС-узлы (sberbank.ru, vk.com, github.com, ...) идут первыми в подписке.")
+    parser.add_argument("--bs-only", action="store_true",
+                        help="Оставить в подписке только БС-узлы (SNI в whitelist). "
+                             "Для ограниченных сетей РФ (мобильные операторы).")
+    parser.add_argument("--bs-allow-grey", action="store_true", default=True,
+                        help="(с --bs-only) Включать «серые» SNI (по умолчанию ON).")
+    parser.add_argument("--no-bs-allow-grey", action="store_false", dest="bs_allow_grey",
+                        help="(с --bs-only) Отключить «серые» SNI — только БС и (если разрешено) фейки. "
+                             "Строгий режим для самых ограниченных сетей РФ.")
+    parser.add_argument("--bs-allow-fake", action="store_true", default=False,
+                        help="(с --bs-only) Включать «фейк» SNI (по умолчанию OFF — нестабильно).")
 
     parser.add_argument(
         "--zapret-out",
@@ -2343,6 +2369,55 @@ def run(
 
     if args.limit > 0:
         working = working[: args.limit]
+
+    # ---------------------------------------------------------------------
+    # v22: SNI-категоризация (БС/ЧС/серый/фейк/none) для ограниченных сетей РФ.
+    # Применяется ПОСЛЕ всех проверок (узлы уже TCP-ping + alive + services +
+    # tg_media прошли), но ДО geo-тегов: сортировка по SNI не зависит от
+    # страны, а фильтр может выкинуть ЧС-узлы до того, как мы потратим время
+    # на их переименование.
+    #
+    # --bs-only: оставить только узлы с SNI из whitelist (sberbank.ru, vk.com,
+    #   gosuslugi.ru, github.com, cloudflare.com ...). Опц. --bs-allow-grey
+    #   добавляет «серые» (реальные домены не из списков), --bs-allow-fake —
+    #   «фейк» (короткие строки без точки).
+    # --sort-by-sni: отсортировать по приоритету категории — БС идут первыми
+    #   в финальной подписке. Полезно клиентам, которые подключаются к узлу
+    #   по порядку из списка.
+    # ---------------------------------------------------------------------
+    if getattr(args, "bs_only", False) or getattr(args, "sort_by_sni", False):
+        # Ленивый импорт: чекер тянет runtime.types только при включённом
+        # флаге. Без флага импорта нет — конвейер работает как раньше.
+        from checkers.sni_category import (
+            category_summary,
+            passes_filter as _bs_passes,
+            sni_category as _sni_cat,
+            SNI_CATEGORY_PRIORITY,
+        )
+        summary = category_summary([w.node for w in working])
+        log(f"[sub] SNI breakdown: БС={summary.get('white', 0)} "
+            f"серый={summary.get('grey', 0)} фейк={summary.get('fake', 0)} "
+            f"none={summary.get('none', 0)} ЧС={summary.get('black', 0)}")
+        if getattr(args, "bs_only", False):
+            before = len(working)
+            allow_grey = bool(getattr(args, "bs_allow_grey", True))
+            allow_fake = bool(getattr(args, "bs_allow_fake", False))
+            working = [w for w in working if _bs_passes(
+                w.node, allow_grey=allow_grey, allow_fake=allow_fake)]
+            log(f"[sub] --bs-only filter: {before} → {len(working)} "
+                f"(allow_grey={allow_grey}, allow_fake={allow_fake})")
+            if not working:
+                log("[sub] WARNING: 0 BS-nodes after filter — финальная подписка будет пустой")
+        if getattr(args, "sort_by_sni", False) and working:
+            # Стабильная сортировка по приоритету SNI-категории (БС=0, серый=1,
+            # фейк=2, none=3, ЧС=4). Сохраняет относительный порядок внутри
+            # одной категории (раньше: по скорости/латентности).
+            working = sorted(
+                working,
+                key=lambda w: SNI_CATEGORY_PRIORITY.get(_sni_cat(w.node), 99),
+            )
+            cats = [_sni_cat(w.node) for w in working[:3]]
+            log(f"[sub] --sort-by-sni: first 3 categories = {cats}")
 
     # ---------------------------------------------------------------------
     # GEO-СТАДИЯ: переименование узлов (флаг страны + префикс, БЕЗ скорости

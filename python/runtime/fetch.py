@@ -23,7 +23,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlparse, urlunsplit
 from urllib.request import Request, urlopen
 
 from .procs import _subprocess_no_window
@@ -273,17 +273,51 @@ def _append_unwrapped_proxy_urls(urls: list[str], target: str) -> None:
 
 
 def _embedded_url_in(url: str) -> str:
-    """Второй (встроенный) абсолютный URL внутри строки обёртки, если он есть."""
+    """Второй (встроенный) абсолютный URL внутри строки обёртки, если он есть.
+
+    Поддерживаемые формы обёрток:
+      (1) plain в path:        «https://wrapper/https://inner» — :// прямо в path;
+      (2) url-encoded в path:  «https://wrapper/https%3A%2F%2Finner» — :// в path,
+                                но percent-encoded (см. _append_unwrapped_proxy_urls,
+                                где путь декодируется и рекурсия вызывает эту функцию
+                                снова);
+      (3) url-encoded в query: «https://wrapper/exec?url=https%3A%2F%2Finner» —
+                                :// в ЗНАЧЕНИИ query-параметра, percent-encoded.
+                                Типовой паттерн «proxy.tld/exec?url=<encoded URL>»
+                                (например, tetragidropiranilciklopentiltetragidropiridopiridinovye.ru,
+                                yax.nenadoblokirowatgnidda.ru): прокси-просмотрщик
+                                ходит за внутренним адресом сам; если он блокируется
+                                на транспортном уровне, внутренний адрес часто
+                                доступен напрямую — и должен стать запасным
+                                кандидатом загрузки.
+    """
+    # Форма 1: plain — ищем второе :// в исходной строке.
     positions = [match.start() for match in _EMBEDDED_URL_RE.finditer(url)]
-    if len(positions) < 2:
-        return ""
-    inner = url[positions[1]:].strip()
-    if not inner or inner == url:
-        return ""
+    if len(positions) >= 2:
+        inner = url[positions[1]:].strip()
+        if inner and inner != url:
+            with contextlib.suppress(Exception):
+                netloc = urlparse(inner).netloc
+                if netloc and "." in netloc:
+                    return inner
+
+    # Форма 3: URL-encoded в query — перебираем значения параметров,
+    # parse_qsl сам percent-декодирует их; каждое проверяем как URL.
+    # Форма 2 обрабатывается в _append_unwrapped_proxy_urls декодированием
+    # path и рекурсивным вызовом unwrap, сюда она не доходит.
     with contextlib.suppress(Exception):
-        netloc = urlparse(inner).netloc
-        if netloc and "." in netloc:
-            return inner
+        parsed = urlparse(url)
+        if parsed.query:
+            for _key, value in parse_qsl(parsed.query, keep_blank_values=True):
+                value = str(value or "").strip()
+                if not value or not _EMBEDDED_URL_RE.match(value):
+                    continue
+                if value == url:
+                    continue
+                with contextlib.suppress(Exception):
+                    netloc = urlparse(value).netloc
+                    if netloc and "." in netloc:
+                        return value
     return ""
 
 

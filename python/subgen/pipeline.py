@@ -2445,10 +2445,11 @@ def run(
             load_known_good_nodes,
             reset_cache as _ps_reset,
         )
-        from pathlib import Path as _Path
-        from subgen.config import DATA_DIR
-
-        kg_path = _Path(DATA_DIR) / (args.known_good or "known_good.txt")
+        # v38b: НЕ делаем локальный import DATA_DIR — Python воспринимает его
+        # как локальную переменную для всей функции run(), что ломает
+        # обращение к DATA_DIR на ранних строках (trace_log_path = DATA_DIR / ...).
+        # DATA_DIR уже импортирован в начале файла (строка 45).
+        kg_path = DATA_DIR / (args.known_good or "known_good.txt")
         if kg_path.is_file():
             _ps_reset()
             # Pattern scoring на списке узлов.

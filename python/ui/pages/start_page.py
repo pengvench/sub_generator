@@ -834,6 +834,10 @@ class StartPage(ctk.CTkFrame):
                 bs_only=bool(filter_opts.get("bs_only", False)),
                 bs_allow_grey=bool(filter_opts.get("bs_allow_grey", True)),
                 bs_allow_fake=bool(filter_opts.get("bs_allow_fake", False)),
+                # v38: Pattern scoring + known-good.
+                pattern_score=bool(filter_opts.get("pattern_score", False)),
+                pattern_score_min=int(filter_opts.get("pattern_score_min", 40)),
+                known_good=str(filter_opts.get("known_good", "known_good.txt")),
             )
         dpi_check = bool(self.toggle_dpi.get())
         # v8: suite — часть DPI-проверки (безусловна); ИИ-гео слепок —
@@ -880,6 +884,10 @@ class StartPage(ctk.CTkFrame):
             bs_only=bool(filter_opts.get("bs_only", False)),
             bs_allow_grey=bool(filter_opts.get("bs_allow_grey", True)),
             bs_allow_fake=bool(filter_opts.get("bs_allow_fake", False)),
+            # v38: Pattern scoring + known-good.
+            pattern_score=bool(filter_opts.get("pattern_score", False)),
+            pattern_score_min=int(filter_opts.get("pattern_score_min", 40)),
+            known_good=str(filter_opts.get("known_good", "known_good.txt")),
         )
 
 

@@ -53,45 +53,53 @@ from runtime.types import XrayNode
 
 # -------------------------------------------------------------------- списки
 
-# Путь к dynamic-whitelist файлу — кладётся scripts/sync_sni_whitelist.py
-# (зеркало hxehex/russia-mobile-internet-whitelist/main/whitelist.txt,
-# ~910 доменов). Файл ищется относительно:
-#   1. переменной окружения SNI_WHITELIST_FILE (для GHA/CI);
-#   2. data/sni_whitelist.txt относительно корня репо;
-#   3. data/sni_whitelist.txt относительно cwd.
+# Пути к dynamic-whitelist файлам. Читаем ВСЕ существующие файлы и MERGE'им
+# их в один set — позволяет юзеру держать отдельно:
+#   1. env var SNI_WHITELIST_FILE (для GHA/CI override).
+#   2. data/sni_whitelist.txt — community list (перезаливается sync'ом GHA
+#      из hxehex upstream, ~910 доменов).
+#   3. data/sni_whitelist_custom.txt — ПОЛЬЗОВАТЕЛЬСКИЙ список (sync НЕ трогает!).
+#      Сюда юзер кладёт свои проверенные SNI — они переживут каждый sync.
+#   4. data/sni_whitelist.txt относительно cwd (для запуска из другого cwd).
+#   5. data/sni_whitelist_custom.txt относительно cwd.
 # ВНИМАНИЕ: не кешируем список путей на уровне модуля — env var должна
-# перечитываться при каждом вызове (иначе тесты, меняющие os.environ,
-# не увидят изменений).
+# перечитываться при каждом вызове.
 def _extra_whitelist_paths() -> list[Path]:
     return [
         Path(os.environ.get("SNI_WHITELIST_FILE", "")),
         Path(__file__).resolve().parent.parent.parent / "data" / "sni_whitelist.txt",
+        Path(__file__).resolve().parent.parent.parent / "data" / "sni_whitelist_custom.txt",
         Path.cwd() / "data" / "sni_whitelist.txt",
+        Path.cwd() / "data" / "sni_whitelist_custom.txt",
     ]
 
 
 def _load_extra_whitelist() -> set[str]:
-    """Динамический whitelist из data/sni_whitelist.txt (если есть).
+    """Динамический whitelist из всех существующих файлов (community + custom).
 
-    Файл — простые строки (по одной на домен), пустые/# игнорируются.
-    Зеркалит hxehex/russia-mobile-internet-whitelist/main/whitelist.txt
-    (community-curated RU mobile whitelist, ~910 доменов). Если файла нет
-    (например, запустили без sync_sni_whitelist.py) — берём только
-    встроенный WHITE_SNI_DOMAINS.
+    Файлы — простые строки (по одной на домен), пустые/# игнорируются.
+    Читаются ВСЕ существующие файлы из _extra_whitelist_paths() и MERGE'ятся
+    в один set. Это позволяет юзеру держать отдельно:
+      - data/sni_whitelist.txt — community (перезаливается sync'ом GHA)
+      - data/sni_whitelist_custom.txt — пользовательский (sync НЕ трогает)
+
+    Если ни одного файла нет — берём только встроенный WHITE_SNI_DOMAINS.
     """
+    combined: set[str] = set()
     for path in _extra_whitelist_paths():
         try:
             if not path or not path.is_file():
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
-            return {
+            file_domains = {
                 line.strip().lower().rstrip(".")
                 for line in text.splitlines()
                 if line.strip() and not line.lstrip().startswith("#")
             }
+            combined |= file_domains
         except Exception:
             continue
-    return set()
+    return combined
 
 
 # РАЗРЕШЁННЫЕ (БЕЛЫЕ) SNI — проходят на ограниченных сетях РФ.
@@ -163,8 +171,130 @@ WHITE_SNI_DOMAINS: frozenset[str] = frozenset({
     "ubuntu.com", "www.ubuntu.com",
     "nodejs.org", "www.nodejs.org",
     "github.com", "www.github.com", "raw.githubusercontent.com",
-    "codeload.github.com", "objects.githubusercontent.com",
-    "www.max.ru", "max.ru",  # VK Music
+
+    # v34: Расширение по анализу tetta-prod.ru/test.txt (верифицировано на
+    # мобильной сети РФ — promokod, lovikod, zolla, gloria-jeans ...).
+    # Это российский e-commerce + глобальные CDN/финансы — НЕ в hxehex
+    # community whitelist (тот для полного blackout'а), но РЕАЛЬНО работают
+    # на мобильных сетях РФ в обычном режиме (когда блокируется только
+    # instagram/chatgpt, но не всё подряд).
+    #
+    # РФ: купоны/магазины/ритейл (НЕ в hxehex, но проверены на мобиле):
+    "promokod.com", "www.promokod.com",          # купоны РФ
+    "lovikod.com", "www.lovikod.com",            # купоны РФ
+    "zolla.com", "www.zolla.com",                # одежда РФ
+    "gloria-jeans.com", "www.gloria-jeans.com",  # одежда РФ
+    "kari.com", "www.kari.com",                  # обувь РФ
+    "ads.x5.ru", "www.ads.x5.ru",                # X5 retail group (Перекрёсток/Пятёрочка)
+    "gazeta-business.ru", "www.gazeta-business.ru",  # бизнес-газета РФ
+    "reksoft.com", "www.reksoft.com",            # российский IT-аутсорс
+    "aeroflot.com", "www.aeroflot.com",           # Аэрофлот (международная TLD)
+    # + стандартный aeroflot.ru уже в списке выше.
+
+    # Глобальные CDN/финансы/медиа (НЕ блокируются в РФ):
+    "keycdn.com", "www.keycdn.com",              # CDN
+    "tr.eu-ffast.com",                            # Fastly transit
+    "tradingview.com", "www.tradingview.com",    # графики (финансы)
+    "eu-ffast.com", "www.eu-ffast.com",          # Fastly EU
+    "ffast.com", "www.ffast.com",                # Fastly общий
+
+    # v34: дополнительные российские бизнес-домены, которые ТСПУ НЕ блокирует
+    # (по выборке из паблик-подписок и сообществ РФ-обхода 2026-Q3):
+    "mvideo.ru", "www.mvideo.ru",                # М.Видео
+    "citilink.ru", "www.citilink.ru",            # Citilink
+    "dns-shop.ru", "www.dns-shop.ru",            # DNS Shop
+    "svyaznoy.ru", "www.svyaznoy.ru",            # Связной
+    "eldorado.ru", "www.eldorado.ru",            # Эльдорадо
+    "technopark.ru", "www.technopark.ru",        # Технопарк
+    "sportmaster.ru", "www.sportmaster.ru",      # Спортмастер
+    "leroymerlin.ru", "www.leroymerlin.ru",      # Leroy Merlin РФ
+    "rendez-vous.ru", "www.rendez-vous.ru",      # Rendez-Vous обувь
+    "lamoda.ru", "www.lamoda.ru",                # Lamoda
+    "kvshok.ru", "www.kvshok.ru",                # Кувшинка
+    "letuelle.ru", "www.letuelle.ru",            # La Tuile
+    "sportivnoe.ru", "www.sportivnoe.ru",         # спортивное
+    "cashback.ru", "www.cashback.ru",            # cashback
+    "megafon.ru", "www.megafon.ru",              # МегаФон (оператор)
+    "mts.ru", "www.mts.ru",                      # МТС (оператор)
+    "beeline.ru", "www.beeline.ru",              # Билайн (оператор)
+    "tele2.ru", "www.tele2.ru",                  # Tele2 (оператор)
+
+    # + доп. CDN/глобальные (не блокируются в РФ):
+    "fastly.com", "www.fastly.com",
+    "fastcdn.org", "www.fastcdn.org",
+    "jsdelivr.net", "www.jsdelivr.net",          # jsdelivr CDN
+    "cdnjs.cloudflare.com",                       # cdnjs
+    "unpkg.com", "www.unpkg.com",                # unpkg CDN
+    "npmjs.com", "www.npmjs.com",                 # npm registry
+    "pypi.org", "www.pypi.org", "files.pythonhosted.org",  # Python package registry
+    "registry.npmjs.org",                         # npm
+    "nodejs.org", "www.nodejs.org",
+    "go.dev", "www.go.dev",                       # Go registry
+    "crates.io", "www.crates.io",                 # Rust crates
+    "static.crates.io",                           # crates CDN
+    "rustup.rs", "www.rustup.rs",                 # Rust toolchain
+    "rubygems.org", "www.rubygems.org",          # Ruby gems
+    "packagist.org", "www.packagist.org",        # PHP composer
+    "repo1.maven.org",                            # Maven central
+    "plugins.gradle.org",                         # Gradle plugins
+    "services.gradle.org",                        # Gradle services
+    "hub.docker.com", "www.docker.com",          # Docker hub
+    "registry-1.docker.io",                       # Docker registry
+    "auth.docker.io",                             # Docker auth
+    "k6.io", "www.k6.io",                         # k6 load testing
+    "grafana.com", "www.grafana.com",            # Grafana
+    "prometheus.io", "www.prometheus.io",        # Prometheus
+    "jetbrains.com", "www.jetbrains.com",        # JetBrains
+    "download.jetbrains.com",                     # JetBrains downloads
+    "plugins.jetbrains.com",                      # JetBrains plugins
+    "intellij.net", "www.intellij.net",
+    "data.jetbrains.com",                         # JetBrains data
+    "maven.apache.org",                           # Apache Maven
+    "archive.apache.org",                         # Apache archive
+    "dlcdn.apache.org",                           # Apache downloads
+    "cdn.jsdelivr.net",                           # jsdelivr CDN (alias)
+    "gcore.jsdelivr.net", "fastly.jsdelivr.net", # jsdelivr mirrors
+
+    # v34: банковские TLD-варианты (был только .ru — добавляем .com):
+    "sberbank.com", "www.sberbank.com",          # Sberbank international
+    "tinkoff.com", "www.tinkoff.com",
+    "vtb.com", "www.vtb.com",
+    "alfabank.com", "www.alfabank.com",
+    "raiffeisen.com", "www.raiffeisen.com",
+    "gazprombank.com", "www.gazprombank.com",
+
+    # РФ: маркетплейсы + бонусы/кассы:
+    "megamarket.ru", "www.megamarket.ru",         # МегаМаркет
+    "beru.ru", "www.beru.ru",                     # Беру (Яндекс)
+    "cashback.otu.gov",                           # noqa
+    "peredelka.ru", "www.peredelka.ru",           # Переделка
+    "kassy.ru", "www.kassy.ru",                   # кассы
+    "biglion.ru", "www.biglion.ru",               # Biglion
+    "kupivip.ru", "www.kupivip.ru",               # KupiVIP
+
+    # v34: медиа/новости РФ (НЕ в blacklist — лояльные или иностранные):
+    "rg.ru", "www.rg.ru",                         # Российская газета
+    "tass.ru", "www.tass.ru",                     # ТАСС
+    "rbc.ru", "www.rbc.ru",                       # РБК
+    "forbes.ru", "www.forbes.ru",                 # Forbes РФ
+    "lenta.ru", "www.lenta.ru",                   # Lenta.ru
+    "ria.ru", "www.ria.ru",                       # РИА Новости
+    "rt.com", "www.rt.com",                       # Russia Today
+    "sputniknews.com", "www.sputniknews.com",     # Sputnik
+    "kp.ru", "www.kp.ru",                         # Комсомольская правда
+    "aif.ru", "www.aif.ru",                       # Аргументы и факты
+
+    # + IT/DevOps infrastructure (международные, не блокируются):
+    "githubusercontent.com", "www.githubusercontent.com",
+    "githubassets.com", "www.githubassets.com",
+    "npmjs.com", "registry.npmjs.org",
+    "yarnpkg.com", "www.yarnpkg.com",
+    "deno.land", "www.deno.land",
+    "deno.com", "www.deno.com",
+    "bun.sh", "www.bun.sh",
+    "elixir-lang.org", "www.elixir-lang.org",
+    "hex.pm", "www.hex.pm",
+    "hexpm.io", "www.hexpm.io",
 })
 
 # ЗАПРЕЩЁННЫЕ (ЧЁРНЫЕ) SNI — блокируются DPI в РФ. Источник:

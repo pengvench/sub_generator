@@ -74,6 +74,10 @@ class PipelineOptions:
     bs_only: bool = False
     bs_allow_grey: bool = True
     bs_allow_fake: bool = False
+    # v38: Pattern scoring + known-good (портировано из GHA).
+    pattern_score: bool = False
+    pattern_score_min: int = 40
+    known_good: str = "known_good.txt"
 
     start_stage: str = "ping"
     custom_file: str = ""
@@ -214,12 +218,17 @@ def build_pipeline_args(options: PipelineOptions, sources: list[str]) -> list[st
         args.append("--sort-by-sni")
     if getattr(options, "bs_only", False):
         args.append("--bs-only")
-        # --bs-allow-grey: argparse default=True. Если пользователь отключил
-        # серые SNI (bs_allow_grey=False), передаём --no-bs-allow-grey.
         if not getattr(options, "bs_allow_grey", True):
             args.append("--no-bs-allow-grey")
         if getattr(options, "bs_allow_fake", False):
             args.append("--bs-allow-fake")
+    # v38: Pattern scoring + known-good.
+    if getattr(options, "pattern_score", False):
+        args.append("--pattern-score")
+        if getattr(options, "pattern_score_min", 40) != 40:
+            args += ["--pattern-score-min", str(options.pattern_score_min)]
+    if getattr(options, "known_good", "known_good.txt") != "known_good.txt":
+        args += ["--known-good", str(options.known_good)]
     if sources:
         args += ["--sources"] + sources
     return args

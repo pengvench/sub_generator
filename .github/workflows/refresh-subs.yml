@@ -8,16 +8,16 @@
 #   3. Разбирает тела подписок через runtime.parse._subscription_lines
 #      (plain / base64 / JSON-объекты Xray/Hiddify / Clash-YAML).
 #   4. Дедуплицирует узлы по node.key.
-#   5. Классифицирует SNI каждого узла: БС (sberbank.ru, vk.com, gosuslugi.ru,
-#      github.com, cloudflare.com ...) / ЧС (instagram.com, chatgpt.com ...) /
-#      серый / фейк / none (см. checkers/sni_category.py).
-#      С опциональным --bs-only оставляет только БС (+серые по умолчанию) —
-#      для ограниченных сетей РФ (мобильные операторы), где ЧС не проходит.
-#   6. (Опционально) TCP-ping socket'ом — дешёвый фильтр мёртвых узлов.
-#      Полная проверка через xray/sing-box доступна в --full-test режиме
-#      (см. ниже) — Linux binaries качаются из апстрима.
-#   7. Пишет итоговый список в data/preload.txt и data/preload_report.json.
-#   8. Коммитит изменения в main и пушит.
+#   5. Классифицирует SNI каждого узла: БС / ЧС / серый / фейк / none
+#      (см. checkers/sni_category.py). С --tspu-sim оставляет только
+#      SNI в BS AND IP в BS-CIDR — для мобильных сетей РФ.
+#   6. TCP-ping socket'ом — дешёвый фильтр мёртвых узлов.
+#   7. Geo-rename: «<флаг> <ISO> peppo» через api.ip.sb/geoip.
+#   8. (full_test) Полный тест ВСЕХ узлов из preload.txt через xray/sing-box:
+#      alive + siberian + tcp16-20 + blocked_services + tg_media + resilience.
+#      Результат: subs.txt (base64, корень репо) + data/preload_working.txt
+#      (только рабочие узлы, перезаписывает preload.txt).
+#   9. Коммитит все изменения (preload + subs + report + whitelists).
 #
 # Когда запускать: см. on.schedule cron. По умолчанию — каждые 6 часов
 # (00:00, 06:00, 12:00, 18:00 UTC). Можно вызвать вручную через
@@ -36,8 +36,8 @@ on:
         description: "TCP-ping фильтр (медленнее, чистит мёртвые)"
         type: boolean
         default: true
-      bs_only:
-        description: "Только БС-узлы (белый список SNI для ограниченных сетей РФ)"
+      tspu_sim:
+        description: "TSPU-эмулятор (SNI в BS AND IP в BS-CIDR) — для мобильных сетей РФ"
         type: boolean
         default: true
       sort_by_sni:
@@ -45,11 +45,11 @@ on:
         type: boolean
         default: true
       full_test:
-        description: "Полная проверка через xray/sing-box (медленно, ~30+ мин)"
+        description: "Полная проверка ВСЕХ узлов через xray/sing-box (медленно: 50 узлов ≈ 30 мин, 500 узлов ≈ 4-5 часов)"
         type: boolean
         default: false
       max_servers:
-        description: "Лимит итоговых узлов (0 = без лимита)"
+        description: "Лимит итоговых узлов в финальной подписке (0 = без лимита)"
         type: string
         default: "0"
 
@@ -63,17 +63,23 @@ permissions:
 
 jobs:
   refresh:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60  # увеличили: full_test режим требует 30-60 мин
+    # Пиним к ubuntu-24.04 явно: 19 октября 2026 ubuntu-latest переключится
+    # на Ubuntu 26 (см. github.com/actions/runner-images/issues/14748).
+    # Пин = контролируем момент апгрейда сами.
+    runs-on: ubuntu-24.04
+    # 240 минут (4 часа) — на случай full_test=true с большим числом узлов.
+    # 100 узлов × ~30с (alive+tg+services+resilience+geo) = ~50 минут.
+    # 500 узлов = ~4-5 часов. Без full_test — отработает за 2-5 минут.
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
-          fetch-depth: 1  # мелкий клон — коммитим только preload.txt
+          fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -84,17 +90,14 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          # cryptography — для расшифровки happ://cryptN/ (RSA-4096 + ChaCha20-Poly1305).
           pip install -r requirements-gha.txt
 
-      - name: Sync community SNI whitelist
-        # Качаем ~910 доменов из hxehex/russia-mobile-internet-whitelist
-        # (community-curated 2026 RU mobile whitelist). Без этого скрипта
-        # checkers/sni_category.py использует только встроенный ~80-доменный
-        # WHITE_SNI_DOMAINS. С синком --bs-only даст существенно больше узлов.
+      - name: Sync community SNI + CIDR whitelist
+        # Качаем ~910 SNI доменов + ~30k CIDR-подсетей из hxehex upstream.
+        # Обновляется каждый раз (community-curated, обновляется людьми).
+        # Коммитим его ниже — для аудита upstream-изменений.
         run: |
-          python scripts/sync_sni_whitelist.py \
-            --output data/sni_whitelist.txt
+          python scripts/sync_sni_whitelist.py --with-cidr
 
       - name: Download xray + sing-box Linux binaries (full-test mode only)
         if: ${{ inputs.full_test == true }}
@@ -108,16 +111,28 @@ jobs:
           chmod +x bin/xray
           bin/xray version
           echo "=== Downloading sing-box-linux-64 ==="
+          # ВАЖНО: в URL filename НЕТ префикса 'v' — sing-box-1.13.16-linux-amd64.tar.gz
+          # (а в пути релиза 'v' есть: .../download/v1.13.16/sing-box-1.13.16-...).
           SB_VERSION=v1.13.16
-          curl -sSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
+          SB_VERSION_NO_V=${SB_VERSION#v}   # strip leading 'v' → 1.13.16
+          curl -sSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VERSION_NO_V}-linux-amd64.tar.gz"
+          if ! file /tmp/sb.tar.gz | grep -q "gzip compressed"; then
+            echo "FATAL: sing-box download is not gzip (likely 404). URL was wrong?"
+            head -c 200 /tmp/sb.tar.gz
+            exit 1
+          fi
           tar -xzf /tmp/sb.tar.gz -C /tmp
           cp /tmp/sing-box-*/sing-box bin/sing-box
           chmod +x bin/sing-box
           bin/sing-box version
 
-      - name: Refresh subs (fetch + parse + dedup + SNI-sort + TCP-ping)
+      - name: Refresh subs (fetch + parse + dedup + TSPU-sim + pattern-score + geo-rename)
+        # v37: Pattern-based scoring ЗАМЕНЯЕТ xray-ping.
+        # Каждый узел оценивается по сходству с known_good.txt (SNI, IP, proto).
+        # Быстро (30 сек на 25k), НЕ нужен xray, НЕ нужны GHA-минуты.
+        # subs.txt генерируется напрямую из preload.txt (base64 encode).
         env:
-          SUBGEN_DEBUG: "1"  # DEBUG-логи runtime в stdout (видно в Actions)
+          SUBGEN_DEBUG: "1"
         run: |
           python scripts/refresh_subs.py \
             --sources-file data/sources.txt \
@@ -125,59 +140,141 @@ jobs:
             --report data/preload_report.json \
             --with-ping \
             --ping-timeout 3.0 \
-            --ping-workers 16 \
+            --ping-workers 32 \
+            --max-ping-nodes 500 \
+            --max-ping-ms 1000 \
             --fetch-timeout 25.0 \
             --sort-by-sni \
-            ${{ inputs.bs_only == true && '--bs-only' || '' }} \
-            --max-servers ${{ inputs.max_servers || '0' }}
+            --geo-rename \
+            --geo-rename-workers 8 \
+            --geo-rename-timeout 8.0 \
+            --known-good data/known_good.txt \
+            --known-good-mode none \
+            --pattern-score \
+            --pattern-score-min 40 \
+            ${{ inputs.tspu_sim == true && '--tspu-sim' || '' }} \
+            --max-servers ${{ inputs.max_servers || '100' }}
+          # v37: Генерируем subs.txt напрямую из preload.txt (base64 encode).
+          # БЕЗ cli_main / xray-ping — pattern-score уже отфильтровал.
+          echo "[gha] generating subs.txt from preload.txt (base64)..."
+          cat data/preload.txt | base64 -w 0 > subs.txt
+          echo "[gha] subs.txt: $(wc -c < subs.txt) bytes ($(wc -l < data/preload.txt) configs)"
 
       - name: Full check via xray (alive + blocked_services + tg_media + siberian)
-        # Опционально: запускает существующий CLI на БС-узлах из preload.txt.
+        # Опционально: запускает существующий CLI на ВСЕХ узлах из preload.txt.
         # cli_main.py = subgen.pipeline.run() — тот же движок, что в GUI.
         # Нужны Linux binaries xray/sing-box (см. предыдущий step).
         # Проверяет: alive (TLS-handshake), siberian, tcp 16-20, blocked_services
         # (Instagram/ChatGPT/Discord/YouTube доступ через прокси), tg_media
         # (загрузка видео из публичной t.me/s/<канал> веб-предпросмотра — БЕЗ токена).
-        # НЕ проверяет: DPI-suite zapret (нужен zapret-дистрибутив), ИИ-гео
-        # (нужен OpenAI токен).
+        # Результат: subs.txt (base64, в корне репо — финальная подписка для
+        # импорта в v2rayN/Happ/Karing) + data/preload_working.txt
+        # (только рабочие узлы, перезаписывает preload.txt).
         if: ${{ inputs.full_test == true }}
         env:
           SUBGEN_DEBUG: "1"
+          # ui.cli_main лежит в python/ui/cli_main.py. Из корня репо
+          # `python -m ui.cli_main` не найдёт пакет ui (он в python/ui/).
+          # PYTHONPATH=python добавляет python/ в sys.path.
+          PYTHONPATH: python
         run: |
-          # Тест только первых 20 БС-узлов (sorted BS-first в preload.txt),
-          # иначе 80 узлов × 30с = ~40 минут GHA-минут.
-          head -n 21 data/preload.txt > data/preload_top20.txt
+          # Тестируем ВСЕ узлы из preload.txt (БЕЗ лимита — было 20 в v30).
+          # Если узлов много (>100) — это займёт долго (до 4 часов, в рамках
+          # timeout-minutes: 240). Если хотите быстро — выключите full_test
+          # и оставьте только Refresh subs (TCP-ping filter).
+          NODES_COUNT=$(($(wc -l < data/preload.txt) - 1))  # -1 для header-комментария
+          echo "[gha] full test: testing ALL $NODES_COUNT nodes from preload.txt"
+          # ВАЖНО: --working и --report принимают ОТНОСИТЕЛЬНЫЕ имена,
+          # cli_main сам подставляет DATA_DIR (data/). Если написать
+          # --working data/preload_working.txt → получится data/data/...
+          # (удвоение). Поэтому передаём ПРОСТО ИМЯ ФАЙЛА.
+          # --sources, наоборот, читается как путь относительно CWD.
+          # --out = имя base64-подписки. "subs.txt" (default) → пишется
+          # В КОРЕНЬ репо (это и есть ваша финальная подписка для клиентов).
           python -m ui.cli_main \
-            --sources data/preload_top20.txt \
-            --working data/preload_working.txt \
-            --report data/preload_report_full.json \
+            --sources data/preload.txt \
+            --working preload_working.txt \
+            --report preload_report_full.json \
+            --out subs.txt \
             --max-ping 1500 \
             --no-stress \
             --initial-check-timeout 5.0
           # Перезаписываем preload.txt только рабочими узлами (если они есть).
+          # cli_main пишет в data/preload_working.txt (относительно DATA_DIR).
           if [ -s data/preload_working.txt ]; then
             cp data/preload_working.txt data/preload.txt
             echo "[gha] full test: kept $(wc -l < data/preload.txt) working nodes"
           else
             echo "[gha] full test: 0 working nodes — keeping original preload.txt"
           fi
+          # v36: APPEND known_good.txt configs to subs.txt — ЭТО КРИТИЧНО.
+          # Причина: GHA на Azure US/EU, некоторые VPN-серверы гео-ограничены
+          # (отклоняют TLS handshake с US IP, но работают с RU мобильного).
+          # cli_main's xray-ping FAIL для таких серверов → они не в subs.txt.
+          # Но known_good.txt — это ПРОВЕРЕННЫЕ НА МОБИЛКЕ конфиги.
+          # Добавляем их в subs.txt ПОСЛЕ cli_main, в обход xray-ping.
+          if [ -f data/known_good.txt ]; then
+            echo "[gha] appending known_good.txt to subs.txt (verified mobile configs)..."
+            # Декодируем subs.txt (base64) → plain text
+            base64 -d subs.txt > /tmp/subs_plain.txt 2>/dev/null || true
+            # Добавляем known_good (без дублей).
+            # v38b: НЕ срезаем # (это fragment имени узла, не комментарий!).
+            # Раньше было line="${line%%#*}" → убивало имена «🇩🇪 Германия».
+            while IFS= read -r line; do
+                # Пропускаем пустые строки и комментарии (начинаются с #).
+                [ -z "$line" ] && continue
+                [[ "$line" =~ ^[[:space:]]*# ]] && continue
+                # Проверяем нет ли уже в subs (по началу строки до &pbk=).
+                config_base="${line%%#*}"  # берём часть до # (URL без имени)
+                if ! grep -qF "${config_base%%&pbk=*}" /tmp/subs_plain.txt 2>/dev/null; then
+                    echo "$line" >> /tmp/subs_plain.txt
+                fi
+            done < data/known_good.txt
+            # Переупаковываем в base64
+            base64 -w 0 /tmp/subs_plain.txt > subs.txt
+            echo "[gha] subs.txt updated with known_good: $(wc -l < /tmp/subs_plain.txt) total configs"
+          else
+            echo "[gha] known_good.txt NOT FOUND — create it with your verified mobile configs!"
+          fi
+          # Показать, где лежит base64-подписка.
+          echo "[gha] final base64 subscription: subs.txt ($(wc -c < subs.txt) bytes)"
+          echo "[gha] plain text preload: data/preload.txt ($(wc -l < data/preload.txt) nodes)"
 
       - name: Show stats
         if: always()
         run: |
-          echo "=== preload.txt head ==="
+          echo "=== preload.txt (first 5 nodes, plain text URLs) ==="
           head -n 5 data/preload.txt 2>/dev/null || true
+          echo
+          echo "=== subs.txt (base64 subscription — import into v2rayN/Happ/Karing) ==="
+          if [ -f subs.txt ]; then
+            head -c 200 subs.txt
+            echo "..."
+            echo "subs.txt size: $(wc -c < subs.txt) bytes"
+          else
+            echo "subs.txt NOT generated (full_test was false — subs.txt создаётся только в full_test режиме)"
+            echo "Для получения subs.txt: Actions → Refresh subs → Run workflow → full_test: true"
+          fi
           echo
           echo "=== preload_report.json ==="
           cat data/preload_report.json 2>/dev/null || true
+          echo
+          echo "=== preload_report_full.json (full_test report) ==="
+          cat data/preload_report_full.json 2>/dev/null || true
 
       - name: Commit & push if changed
         # git-auto-commit-action — популярное action для безопасного пуша.
+        # Коммитит ВСЕ изменения в data/ + subs.txt в корне репо.
+        # Включая sni_whitelist.txt + cidr_whitelist.txt (обновляются каждый
+        # раз из hxehex upstream — для аудита изменений community list'а).
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "auto: refresh subs (preload.txt + sni_whitelist + report)"
-          # Включаем sni_whitelist.txt — он обновляется sync_sni_whitelist.py.
-          # Если upstream не менялся — git-auto-commit-action заметит отсутствие diff.
-          file_pattern: "data/preload.txt data/preload_report.json data/sni_whitelist.txt data/preload_report_full.json data/preload_working.txt"
+          commit_message: "auto: refresh subs (preload.txt + subs.txt + SNI/CIDR whitelist + report)"
+          # "data/" добавляет все изменения в data/ (preload.txt, reports,
+          # sni_whitelist.txt, cidr_whitelist.txt, preload_working.txt).
+          # "subs.txt" добавляет base64-подписку в корне репо.
+          # Используем паттерн (а не явный список файлов) — git add не падает
+          # на missing files (если full_test=false, subs.txt не создаётся).
+          file_pattern: "data/ subs.txt"
           commit_user_name: "github-actions[bot]"
           commit_user_email: "github-actions[bot]@users.noreply.github.com"

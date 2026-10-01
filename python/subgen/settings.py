@@ -72,6 +72,10 @@ DEFAULT_TEST_OPTIONS: dict[str, object] = {
     "bs_only": False,
     "bs_allow_grey": True,
     "bs_allow_fake": False,
+    # v38: Pattern scoring + known-good (портировано из GHA).
+    "pattern_score": False,
+    "pattern_score_min": 40,
+    "known_good": "known_good.txt",
 }
 
 

@@ -151,6 +151,20 @@ def build_parser() -> argparse.ArgumentParser:
                              "Строгий режим для самых ограниченных сетей РФ.")
     parser.add_argument("--bs-allow-fake", action="store_true", default=False,
                         help="(с --bs-only) Включать «фейк» SNI (по умолчанию OFF — нестабильно).")
+    # v38: Pattern scoring + known-good — портировано из GHA refresh_subs.py.
+    parser.add_argument("--known-good", default="known_good.txt",
+                        help="Файл с проверенными на мобилке конфигами. Если существует — "
+                             "извлекает SNI/IP/protocol patterns и фильтрует по сходству. "
+                             "Узлы из known_good ВСЕГДА append'ятся в финал.")
+    parser.add_argument("--pattern-score", action="store_true", default=False,
+                        help="Включить pattern-based scoring (v38). Оценивает каждый узел "
+                             "по сходству с known_good (SNI +40, host +25, стек +45). "
+                             "Узлы с score < --pattern-score-min отбраковываются. "
+                             "ЗАМЕНА xray-ping для сред где xray бесполезен.")
+    parser.add_argument("--pattern-score-min", type=int, default=40,
+                        help="Минимальный pattern score (default: 40). "
+                             "40 = стек протокола проходит (45). 25 = TLD+1 проходит. "
+                             "0 = без фильтра.")
 
     parser.add_argument(
         "--zapret-out",
@@ -2418,6 +2432,55 @@ def run(
             )
             cats = [_sni_cat(w.node) for w in working[:3]]
             log(f"[sub] --sort-by-sni: first 3 categories = {cats}")
+
+    # ---------------------------------------------------------------------
+    # v38: Pattern scoring + known-good — портировано из GHA refresh_subs.py.
+    # Оценивает узлы по сходству с known_good.txt (SNI, host, protocol).
+    # Если known_good.txt нет — пропускает. Если есть — фильтрует по score.
+    # Узлы из known_good ВСЕГДА добавляются в финал (verified baseline).
+    # ---------------------------------------------------------------------
+    if getattr(args, "pattern_score", False) or getattr(args, "known_good", ""):
+        from checkers.pattern_score import (
+            apply_pattern_scoring,
+            load_known_good_nodes,
+            reset_cache as _ps_reset,
+        )
+        from pathlib import Path as _Path
+        from subgen.config import DATA_DIR
+
+        kg_path = _Path(DATA_DIR) / (args.known_good or "known_good.txt")
+        if kg_path.is_file():
+            _ps_reset()
+            # Pattern scoring на списке узлов.
+            nodes_list = [w.node for w in working]
+            if getattr(args, "pattern_score", False):
+                scored_nodes = apply_pattern_scoring(
+                    nodes_list, kg_path,
+                    min_score=getattr(args, "pattern_score_min", 40),
+                    log_sink=log,
+                )
+                # Фильтруем working по тем узлам, что прошли scoring.
+                scored_keys = {n.key for n in scored_nodes}
+                working = [w for w in working if w.node.key in scored_keys]
+                log(f"[sub] --pattern-score: kept {len(working)} nodes after scoring")
+
+            # Append known_good узлы (verified baseline).
+            kg_nodes = load_known_good_nodes(kg_path)
+            if kg_nodes:
+                from runtime.types import XrayProbeResult
+                existing_keys = {w.node.key for w in working}
+                appended = 0
+                for kg_node in kg_nodes:
+                    if kg_node.key not in existing_keys:
+                        working.append(XrayProbeResult(
+                            kg_node, True, "known_good", None, 0, 1, kg_node.runtime
+                        ))
+                        existing_keys.add(kg_node.key)
+                        appended += 1
+                if appended:
+                    log(f"[sub] --known-good: appended {appended} verified configs (total: {len(working)})")
+        else:
+            log(f"[sub] --known-good: {kg_path} not found — skipping pattern scoring")
 
     # ---------------------------------------------------------------------
     # GEO-СТАДИЯ: переименование узлов (флаг страны + префикс, БЕЗ скорости

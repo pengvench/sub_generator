@@ -427,6 +427,26 @@ class FiltersPage(ctk.CTkFrame):
         self.toggle_bs_allow_fake.grid(row=0, column=2, padx=(10, 0), sticky="e")
         CTkToolTip(self.toggle_bs_allow_fake, HELP["bs_allow_fake"])
 
+        # v38: Pattern scoring toggle.
+        row = 4
+        ps_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        ps_frame.grid(row=row, column=0, padx=6, pady=4, sticky="ew")
+        ps_frame.grid_columnconfigure(0, weight=1)
+        ps_label = ctk.CTkLabel(
+            ps_frame, text="Pattern scoring (по known_good.txt)",
+            anchor="w", text_color=theme.TEXT,
+        )
+        ps_label.grid(row=0, column=0, sticky="w")
+        info_ps = info_label(ps_frame, "Оценивает конфиги по сходству с data/known_good.txt "
+                                  "(SNI, host, протокол). Узлы с score < порога отбраковываются. "
+                                  "known_good всегда добавляются в финал. "
+                                  "Файл: data/known_good.txt (положите туда проверенные на мобилке конфиги).")
+        info_ps.grid(row=0, column=1, padx=(4, 0), sticky="w")
+        self.toggle_pattern_score = ctk.CTkSwitch(ps_frame, text="", width=42)
+        self.toggle_pattern_score.grid(row=0, column=2, padx=(10, 0), sticky="e")
+        CTkToolTip(self.toggle_pattern_score, "Pattern scoring: оценивает каждый конфиг по "
+                   "сходству с known_good (SNI +40, host +25, стек +45). Порог: 40 по умолчанию.")
+
         # Приписка про источники whitelist'а (community-curated + builtin).
         note = ctk.CTkLabel(
             inner,
@@ -487,6 +507,7 @@ class FiltersPage(ctk.CTkFrame):
         self._set_toggle(self.toggle_bs_only, bool(opts.get("bs_only", False)))
         self._set_toggle(self.toggle_bs_allow_grey, bool(opts.get("bs_allow_grey", True)))
         self._set_toggle(self.toggle_bs_allow_fake, bool(opts.get("bs_allow_fake", False)))
+        self._set_toggle(self.toggle_pattern_score, bool(opts.get("pattern_score", False)))
         self._sync_sni_subtoggles()
         self._sync_master_state()
 
@@ -521,6 +542,10 @@ class FiltersPage(ctk.CTkFrame):
             "bs_only": bool(self.toggle_bs_only.get()),
             "bs_allow_grey": bool(self.toggle_bs_allow_grey.get()),
             "bs_allow_fake": bool(self.toggle_bs_allow_fake.get()),
+            # v38: Pattern scoring + known-good.
+            "pattern_score": bool(self.toggle_pattern_score.get()),
+            "pattern_score_min": 40,
+            "known_good": "known_good.txt",
         }
 
     def save_current_settings(self) -> None:
@@ -539,6 +564,10 @@ class FiltersPage(ctk.CTkFrame):
             "bs_only": bool(self.toggle_bs_only.get()),
             "bs_allow_grey": bool(self.toggle_bs_allow_grey.get()),
             "bs_allow_fake": bool(self.toggle_bs_allow_fake.get()),
+            # v38: Pattern scoring + known-good.
+            "pattern_score": bool(self.toggle_pattern_score.get()),
+            "pattern_score_min": 40,
+            "known_good": "known_good.txt",
         }
         try:
             save_test_options(opts)

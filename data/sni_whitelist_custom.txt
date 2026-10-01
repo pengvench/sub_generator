@@ -1,0 +1,26 @@
+# ПОЛЬЗОВАТЕЛЬСКИЙ SNI whitelist (sync НЕ трогает этот файл!).
+#
+# Сюда кладите SNI домены, которые ВЫ ПРОВЕРИЛИ на своей мобильной сети РФ
+# и которые РАБОТАЮТ. Они автоматически добавятся к community whitelist
+# (data/sni_whitelist.txt, который sync качает из hxehex upstream) + к
+# встроенному WHITE_SNI_DOMAINS в python/checkers/sni_category.py.
+#
+# ВАЖНО: этот файл НЕ перезаливается scripts/sync_sni_whitelist.py —
+# только data/sni_whitelist.txt (community) перезаливается.
+# Ваши дополнения здесь ПЕРЕЖИВУТ каждый sync.
+#
+# Формат: по одной строке на домен (можно с или без www.).
+# Строки, начинающиеся с '#', игнорируются. Пустые строки тоже.
+
+# Примеры (раскомментируйте или добавьте свои):
+# promokod.com
+# lovikod.com
+# zolla.com
+# gloria-jeans.com
+# keycdn.com
+# reksoft.com
+# tr.eu-ffast.com
+# kari.com
+# tradingview.com
+# ads.x5.ru
+# gazeta-business.ru

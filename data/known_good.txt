@@ -1,0 +1,33 @@
+# Шаблон файла known_good.txt.
+# Замените на РЕАЛЬНО проверенные на вашей мобильной сети конфиги.
+# Workflow извлечёт из этих строк SNI + IP паттерны, и финальный
+# preload.txt будет содержать ТОЛЬКО узлы, совпадающие с ними,
+# плюс сами эти строки (как verified baseline).
+#
+# Формат: по одной vless:// (или vmess/trojan/ss) ссылке на строку.
+# Строки с '#' — игнорируются.
+
+# vless://uuid@host:port?security=tls&sni=YOUR_WORKING_SNI#name
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.grey-lance.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=promokod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Германия 🇩🇪
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.vast-mesa.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=lovikod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Швеция 🇸🇪
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.wide-frost.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=zolla.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Финляндия 🇫🇮
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.fox-tower.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=gloria-jeans.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇪🇪 Эстония
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.red-river.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇵🇱 Польша
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.neat-cove.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Россия 🇷🇺
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.dawn-marsh.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=reksoft.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Литва 🇱🇹
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.warm-robin.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=aeroflot.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Латвия 🇱🇻
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@play.wide-frost.test-cdn-kkk.com:8443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=zolla.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 🎮 Игровой 1
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@play.fox-tower.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=gloria-jeans.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇪🇪 🎮 Игровой 2
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@play.vast-mesa.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=lovikod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇸🇪 🎮 Игровой 3
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.grey-lance.test-cdn-kkk.com:9443?encryption=none&type=xhttp&mode=auto&security=reality&sni=promokod.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇩🇪 Обход Резерв (только Wi-Fi)
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.red-blaze.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Нидерланды 🇳🇱
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.free-marsh.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=tr.eu-ffast.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Турция 🇹🇷
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.mint-lance.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=kari.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#США 🇺🇸
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.gold-pond.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Франция 🇫🇷
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.firm-tower.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=keycdn.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Великобритания 🇬🇧
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.soft-blade.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=tradingview.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#Казахстан 🇰🇿
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.rare-glen.test-cdn-kkk.com:443?encryption=none&flow=xtls-rprx-vision&type=tcp&security=reality&sni=ads.x5.ru&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE #1
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.iron-mine.test-cdn-kkk.com:443?encryption=none&type=grpc&serviceName=ads.x5.ru&mode=gun&security=reality&sni=gazeta-business.ru&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE #2
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test.bay-glep.test-cdn-kkk.com:443?encryption=none&type=grpc&serviceName=ads.x5.ru&mode=gun&security=reality&sni=gazeta-business.ru&fp=firefox&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE #3
+vless://e6910e16-0d75-4f74-89c6-2f9226d6b41e@test10.firm-dune.test-cdn-kkk.com:10443?encryption=none&type=grpc&serviceName=ads.x5.ru&mode=gun&security=reality&sni=www.google.com&fp=qq&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#🇫🇮 LTE Reserve
+vless://dd76e0a5-9079-423d-afc2-d372f8106160@telegram.private-networks-zk.com:443?flow=xtls-rprx-vision&type=tcp&headerType=none&security=reality&fp=chrome&sni=ads.x5.ru&pbk=-tePObR3oZwGAUOb5kqTYkNWl6rtUKl0RFuzuu06wgw&sid=50#[FREE] ТОЛЬКО TG БОТ + САЙТ

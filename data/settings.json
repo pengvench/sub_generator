@@ -1,0 +1,31 @@
+{
+  "description": "# ТГ канал автора: https://t.me/peppe_poppo\n# Сайт проекта: https://tetta-prod.ru\n",
+  "prefix": "peppo",
+  "test_options": {
+    "workers": 32,
+    "timeout": 15.0,
+    "max_ping": 1500,
+    "min_speed": 3000,
+    "limit": 0,
+    "no_stress": false,
+    "sing_box_only": false,
+    "telegram_check": true,
+    "services_check": true,
+    "dpi_check": false,
+    "dpi_siberian": false,
+    "dpi_cidr": false,
+    "dpi_active": false,
+    "ai_strict": false,
+    "ai_timeout": 6.0,
+    "dedup_mode": "normal",
+    "use_singbox_pool": true,
+    "singbox_pool_batch": 200,
+    "resilience_check": true,
+    "params_filter_enabled": false,
+    "params_protocols": [],
+    "params_security": [],
+    "params_transport": [],
+    "params_flow": [],
+    "ui_mode": "novice"
+  }
+}

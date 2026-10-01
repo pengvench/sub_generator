@@ -1,0 +1,8 @@
+{
+  "timestamp": 1790835579,
+  "total_sources": 109,
+  "failed_sources": [],
+  "nodes_collected": 187,
+  "ping_filter_applied": true,
+  "output": "data/preload.txt"
+}

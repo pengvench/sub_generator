@@ -1,15 +1,15 @@
 {
-  "timestamp": 1790930047,
+  "timestamp": 1790941103,
   "total_sources": 112,
   "failed_sources": [
     "https://gitverse.ru/api/repos/gidro/white/raw/branch/master/subscription.txt",
     "https://gitverse.ru/api/repos/soulcoil/Haven/raw/branch/master/Haven",
     "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all",
-    "https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/sub.txt",
     "https://gitverse.ru/api/repos/bikinitw22/apelsintel/raw/branch/main/alive_bs.txt",
+    "https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/sub.txt",
     "https://gitverse.ru/api/repos/FUKIFA/FUFIKA/raw/branch/master/FUKIFABLL"
   ],
-  "nodes_collected": 226,
+  "nodes_collected": 89,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

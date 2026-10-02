@@ -1,8 +1,10 @@
 {
-  "timestamp": 1790856367,
-  "total_sources": 109,
-  "failed_sources": [],
-  "nodes_collected": 79,
+  "timestamp": 1790910786,
+  "total_sources": 108,
+  "failed_sources": [
+    "https://gidroksi.fun/black-list"
+  ],
+  "nodes_collected": 64,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

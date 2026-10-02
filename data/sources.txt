@@ -1,6 +1,6 @@
 
 https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/PODVALMIX.txt
-https://mifa.world/niko
+https://mifa.world/gidra
 https://raw.githubusercontent.com/cbusifabcap/daily_free_vpn/refs/heads/main/Z.txt
 https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/APTEKAxWHITExLIST
 https://gist.githubusercontent.com/Diman331/8c868070c0b5a5ec0c7d94507717b67b/raw/subscription.txt
@@ -106,3 +106,4 @@ https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VP
 https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat-top-25
 https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat-top-50
 https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/PODVALMIX.txt
+https://raw.githubusercontent.com/opti4riponty-arch/VLESS-Co/refs/heads/main/VLESS%20%26%20Co

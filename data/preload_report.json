@@ -1,15 +1,14 @@
 {
-  "timestamp": 1790941103,
+  "timestamp": 1790960693,
   "total_sources": 112,
   "failed_sources": [
-    "https://gitverse.ru/api/repos/gidro/white/raw/branch/master/subscription.txt",
-    "https://gitverse.ru/api/repos/soulcoil/Haven/raw/branch/master/Haven",
-    "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all",
-    "https://gitverse.ru/api/repos/bikinitw22/apelsintel/raw/branch/main/alive_bs.txt",
-    "https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/sub.txt",
-    "https://gitverse.ru/api/repos/FUKIFA/FUFIKA/raw/branch/master/FUKIFABLL"
+    "https://etoneya.su/whitelist",
+    "https://etoneya.su/other",
+    "https://etoneya.su/gemini",
+    "https://etoneya.su/youtube",
+    "https://etoneya.su/ytm"
   ],
-  "nodes_collected": 89,
+  "nodes_collected": 70,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

@@ -1,14 +1,14 @@
 {
-  "timestamp": 1791041190,
-  "total_sources": 113,
+  "timestamp": 1791043440,
+  "total_sources": 114,
   "failed_sources": [
     "https://etoneya.su/whitelist",
     "https://etoneya.su/other",
-    "https://etoneya.su/youtube",
     "https://etoneya.su/gemini",
+    "https://etoneya.su/youtube",
     "https://etoneya.su/ytm"
   ],
-  "nodes_collected": 59,
+  "nodes_collected": 137,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

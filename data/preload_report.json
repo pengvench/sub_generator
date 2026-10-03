@@ -1,5 +1,5 @@
 {
-  "timestamp": 1791043440,
+  "timestamp": 1791058930,
   "total_sources": 114,
   "failed_sources": [
     "https://etoneya.su/whitelist",
@@ -8,7 +8,7 @@
     "https://etoneya.su/youtube",
     "https://etoneya.su/ytm"
   ],
-  "nodes_collected": 137,
+  "nodes_collected": 66,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

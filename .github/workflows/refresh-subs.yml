@@ -51,6 +51,10 @@ on:
         description: "Сортировать БС-узлы первыми в финальном списке"
         type: boolean
         default: true
+      with_speedtest:
+        description: "Speedtest: sing-box + Cloudflare 10MB download (медленнее ~5 мин, чистит медленные)"
+        type: boolean
+        default: true
       full_test:
         description: "Полная проверка ВСЕХ узлов через xray/sing-box (медленно: 50 узлов ≈ 30 мин, 500 узлов ≈ 4-5 часов)"
         type: boolean
@@ -128,17 +132,13 @@ jobs:
           echo "=== data/tg_subs.txt ==="
           cat data/tg_subs.txt 2>/dev/null || echo "(not generated — see logs above)"
 
-      - name: Download xray + sing-box Linux binaries (full-test mode only)
-        if: ${{ inputs.full_test == true }}
+      - name: Download sing-box Linux binary (for speedtest)
+        # v40: sing-box нужен для scripts/speedtest.py — тест пропускной
+        # способности через download 10MB с Cloudflare. Скачиваем ВСЕГДА
+        # (не только в full_test), чтобы speedtest был доступен в обычном режиме.
+        # xray качаем только в full_test (для alive/blocked_services проверок).
         run: |
           mkdir -p bin
-          echo "=== Downloading xray-linux-64 ==="
-          XRAY_VERSION=v26.3.27
-          curl -sSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/xray-linux-64.zip"
-          unzip -o /tmp/xray.zip -d /tmp/xray
-          cp /tmp/xray/xray bin/xray
-          chmod +x bin/xray
-          bin/xray version
           echo "=== Downloading sing-box-linux-64 ==="
           # ВАЖНО: в URL filename НЕТ префикса 'v' — sing-box-1.13.16-linux-amd64.tar.gz
           # (а в пути релиза 'v' есть: .../download/v1.13.16/sing-box-1.13.16-...).
@@ -155,6 +155,20 @@ jobs:
           chmod +x bin/sing-box
           bin/sing-box version
 
+      - name: Download xray Linux binary (full-test mode only)
+        # xray нужен только для full_test (alive + blocked_services + tg_media).
+        # sing-box качается на предыдущем шаге (нужен для speedtest в любом режиме).
+        if: ${{ inputs.full_test == true }}
+        run: |
+          mkdir -p bin
+          echo "=== Downloading xray-linux-64 ==="
+          XRAY_VERSION=v26.3.27
+          curl -sSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/xray-linux-64.zip"
+          unzip -o /tmp/xray.zip -d /tmp/xray
+          cp /tmp/xray/xray bin/xray
+          chmod +x bin/xray
+          bin/xray version
+
       - name: Refresh subs (fetch + parse + dedup + TSPU-sim + pattern-score + geo-rename)
         # v37: Pattern-based scoring ЗАМЕНЯЕТ xray-ping.
         # Каждый узел оценивается по сходству с known_good.txt (SNI, IP, proto).
@@ -162,6 +176,11 @@ jobs:
         # subs.txt генерируется напрямую из preload.txt (base64 encode).
         # v39: --extra-sources-file data/tg_subs.txt — мёрджит динамические
         # URL'ы из предыдущего шага (Telegram + mifa.world) к data/sources.txt.
+        # v40: --pattern-score-min 25 (было 40) + --allow-canonical-stack
+        # (default ON) — multi-track фильтр. Теперь проходит если:
+        # (score >= 25 known_good match) ИЛИ (стек канонический:
+        # vless+reality / vless+tls+ws / trojan+tls+ws / vmess+tls+ws / hy2).
+        # Это даёт AetrisVPN-конфиги (vless+tls+ws = 13% от 550) и Pizduk hy2.
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -183,11 +202,71 @@ jobs:
             --known-good data/known_good.txt \
             --known-good-mode none \
             --pattern-score \
-            --pattern-score-min 40 \
+            --pattern-score-min 25 \
+            --allow-canonical-stack \
             ${{ inputs.tspu_sim == true && '--tspu-sim' || '' }} \
             --max-servers ${{ inputs.max_servers || '100' }}
-          # v37: Генерируем subs.txt напрямую из preload.txt (base64 encode).
-          # БЕЗ cli_main / xray-ping — pattern-score уже отфильтровал.
+
+      - name: Speedtest (sing-box + Cloudflare 10MB download, RANKER mode)
+        # v40: Тест пропускной способности каждого узла через sing-box + SOCKS5
+        # + curl download 10MB с speed.cloudflare.com.
+        #
+        # v41: РЕЖИМ RANKER (default) — узлы НЕ отбрасываются, а просто
+        # сортируются (быстрые первыми, canonical-stack failed — в конце).
+        # Причина: на GHA Azure US многие узлы гео-блокированы (отклоняют
+        # US IP), но реально работают на РФ-мобиле. Их нельзя отбрасывать —
+        # просто пускаем в финал последними.
+        #
+        # Что отсекается ТОЛЬКО в ranker:
+        # - sb_config_failed / sb_start_failed — конфиг сломанный (не проходит sing-box).
+        # - canonical-stack=False И download_failed — мусорный стек (ss, vless+none).
+        #
+        # Что СОХРАНЯЕТСЯ в ranker:
+        # - fast (status=ok, mbps >= 1.0) — идут первыми.
+        # - slow (status=ok, mbps < 1.0) — после fast.
+        # - canonical-failed (vless+reality / vless+tls+ws / hy2 / ..., но
+        #   download_failed) — после slow. Это РАБОЧИЕ узлы, которые Azure не
+        #   может достучаться (гео-блок), но на мобиле РФ они работают.
+        #
+        # 30 узлов × ~10с download = ~5 мин (workers=4).
+        # Результат: data/preload_speed.txt (узлы в порядке скорости desc).
+        # Если в нём хотя бы 1 узел — заменяем preload.txt на preload_speed.txt.
+        if: ${{ inputs.with_speedtest != false }}
+        run: |
+          if [ ! -x bin/sing-box ]; then
+            echo "[gha] sing-box binary not found — skipping speedtest"
+            echo "[gha] (download step above should have produced it; check logs)"
+            exit 0
+          fi
+          python scripts/speedtest.py \
+            --input data/preload.txt \
+            --output data/preload_speed.txt \
+            --report data/speedtest_report.json \
+            --singbox-bin bin/sing-box \
+            --min-speed-mbs 1.0 \
+            --max-nodes 30 \
+            --workers 4 \
+            --download-timeout 15 \
+            --startup-timeout 5 \
+            --mode ranker \
+            --keep-canonical-failed
+          # Если speedtest нашёл хотя бы 1 узел (fast/slow/canonical-failed) —
+          # заменяем preload.txt на preload_speed.txt (узлы в порядке скорости).
+          if [ -s data/preload_speed.txt ]; then
+            SPEED_COUNT=$(($(wc -l < data/preload_speed.txt) - 1))
+            echo "[gha] speedtest: $SPEED_COUNT ranked nodes — replacing preload.txt"
+            cp data/preload_speed.txt data/preload.txt
+          else
+            echo "[gha] speedtest: 0 nodes in output — keeping original preload.txt"
+          fi
+
+      - name: Generate subs.txt (base64)
+        # v37: Генерируем subs.txt напрямую из preload.txt (base64 encode).
+        # БЕЗ cli_main / xray-ping — pattern-score (v37) + speedtest (v40)
+        # уже отфильтровали. Шаг идёт ПОСЛЕ speedtest — берёт финальный
+        # preload.txt (либо speedtest-отфильтрованный, либо оригинальный).
+        # Если speedtest был выключен — берёт оригинальный preload.txt.
+        run: |
           echo "[gha] generating subs.txt from preload.txt (base64)..."
           cat data/preload.txt | base64 -w 0 > subs.txt
           echo "[gha] subs.txt: $(wc -c < subs.txt) bytes ($(wc -l < data/preload.txt) configs)"

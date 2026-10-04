@@ -787,8 +787,59 @@ def _pattern_score(node: XrayNode, patterns: dict) -> int:
     return score
 
 
+# v40: Canonical stack — multi-track filter.
+# Конфиги с каноническим стеком протокола проходят ДАЖЕ БЕЗ known_good match.
+# Причина: known_good у каждого юзера свой (21 конфиг у Pizduk, 50 у нашего юзера),
+# но в полях есть ТЫСЯЧИ валидных конфигов (vless+tls+ws от AetrisVPN, trojan+tls+ws,
+# hy2). Если требовать score>=40 по known_good — мы отбрасываем 90% рабочего.
+# Multi-track: проходит если (score >= min_score) ИЛИ (stack canonical).
+def _matches_canonical_stack(node: XrayNode) -> bool:
+    """Проверить, что у узла «канонический» стек протокола.
+
+    Канонические стеки — это связки, которые РЕАЛЬНО работают на мобильных
+    сетях РФ (по статистике AetrisVPN / Pizduk / mifa.world):
+
+      vless + reality + tcp (+ vision flow)    — TSPU-resistance
+      vless + tls + ws                          — websocket over TLS (AetrisVPN main)
+      vless + tls + http (xhttp)                — новый транспорт (v2.10+)
+      trojan + tls + ws                         — классика
+      vmess + tls + ws                          — классика
+      hysteria2 / hy2                           — UDP, DPI не видит (Pizduk lite)
+
+    НЕ канонические (отсекаются):
+      ss (shadowsocks) — часто мёртвый, DPI режет
+      vless + tls + tcp (без ws/http) — редкий, обычно мусор
+      vless + none — незашифрованный, мгновенно режется
+      trojan + tls + tcp — обычно работает, но SNI часто фейк
+    """
+    proto = (node.protocol or "").lower()
+    security = (node.query.get("security") or "").lower()
+    transport = (node.query.get("type") or "").lower()
+
+    # vless + reality (transport не важен — reality работает с tcp/grpc/xhttp)
+    if proto == "vless" and security == "reality":
+        return True
+    # vless + tls + ws (доминирующий стек AetrisVPN main, ~13% от 550)
+    if proto == "vless" and security == "tls" and transport == "ws":
+        return True
+    # vless + tls + http (xhttp — новый транспорт, всё чаще встречается)
+    if proto == "vless" and security == "tls" and transport in ("http", "xhttp"):
+        return True
+    # trojan + tls + ws (классический websocket-over-TLS)
+    if proto == "trojan" and security == "tls" and transport == "ws":
+        return True
+    # vmess + tls + ws
+    if proto == "vmess" and security == "tls" and transport == "ws":
+        return True
+    # hysteria2 / hy2 — UDP-протокол, DPI не видит (Pizduk/Test включает 2 hy2)
+    if proto in ("hysteria2", "hy2"):
+        return True
+    return False
+
+
 def _apply_pattern_scoring(nodes: list[XrayNode], known_good_path: Path, *,
                            min_score: int = 25,
+                           allow_canonical_stack: bool = True,
                            log_sink) -> list[XrayNode]:
     """Оценить узлы по pattern score и отфильтровать по порогу.
 
@@ -798,14 +849,48 @@ def _apply_pattern_scoring(nodes: list[XrayNode], known_good_path: Path, *,
     v37b: порог 25 (было 40). С бонусом за полный стек протокола (+15),
     конфиг с vless+reality+tcp+vision+qq но другим SNI/host получает
     10+5+5+5+5+15=45 → проходит. Без бонуса было 30 → не прошло.
+
+    v40: Multi-track — если allow_canonical_stack=True (default),
+    конфиг проходит ДАЖЕ если score < min_score, но его стек протокола
+    «канонический» (vless+reality / vless+tls+ws / trojan+tls+ws /
+    vmess+tls+ws / hysteria2). Это пропускает AetrisVPN-конфиги
+    (vless+tls+ws = 13% от 550) БЕЗ требования совпадения с known_good.
+    Сортировка: сначала known_good-matched (по score desc), потом
+    canonical-stack (по protocol alphabetical).
+
+    v40b: ЕСЛИ known_good.txt пустой И allow_canonical_stack=True —
+    known_good-track полностью пропускается, но canonical-track ВСЁ
+    равно работает. Раньше возвращали nodes как есть (без фильтра),
+    теперь — применяем ТОЛЬКО canonical-stack фильтр. Это даёт
+    отсев мусора (ss без обфускации, vless+none) даже без known_good.
     """
     global _KG_PATTERNS
     _KG_PATTERNS = None  # force reload
     patterns = _load_known_good_patterns(known_good_path)
 
-    if not patterns.get("nodes"):
-        log_sink(f"[gha] --pattern-score: {known_good_path} empty/not found — skipping scoring")
-        return nodes
+    has_known_good = bool(patterns.get("nodes"))
+    if not has_known_good:
+        log_sink(f"[gha] --pattern-score: {known_good_path} empty/not found")
+        if not allow_canonical_stack:
+            log_sink("[gha] --pattern-score: known_good empty AND canonical-stack OFF "
+                     "— skipping all scoring (filter disabled)")
+            return nodes
+        # v40b: known_good пустой, но canonical-stack ON — фильтруем только по стеку.
+        log_sink("[gha] --pattern-score: known_good empty, applying canonical-stack ONLY filter")
+        canonical_pass: list[XrayNode] = []
+        rejected: list[XrayNode] = []
+        for n in nodes:
+            if _matches_canonical_stack(n):
+                canonical_pass.append(n)
+            else:
+                rejected.append(n)
+        log_sink(f"[gha] --pattern-score: {len(nodes)} nodes → "
+                 f"{len(canonical_pass)} canonical-stack pass, "
+                 f"{len(rejected)} rejected (non-canonical stack)")
+        if canonical_pass:
+            protos = sorted({(n.protocol or "?").lower() for n in canonical_pass})
+            log_sink(f"[gha] --pattern-score: passed protocols: {protos}")
+        return canonical_pass if canonical_pass else nodes  # не убиваем пайплайн
 
     log_sink(f"[gha] --pattern-score: loaded {len(patterns['nodes'])} verified configs")
     log_sink(f"[gha] --pattern-score: {len(patterns['sni_set'])} SNIs, "
@@ -818,18 +903,34 @@ def _apply_pattern_scoring(nodes: list[XrayNode], known_good_path: Path, *,
     scored = [(n, _pattern_score(n, patterns)) for n in nodes]
     scored.sort(key=lambda x: -x[1])  # sort by score descending
 
-    above = [(n, s) for n, s in scored if s >= min_score]
-    below = [(n, s) for n, s in scored if s < min_score]
+    # Multi-track: known_good-matched (score >= min_score) OR canonical stack.
+    above: list[tuple[XrayNode, int]] = []
+    canonical_pass: list[tuple[XrayNode, int]] = []
+    below: list[tuple[XrayNode, int]] = []
+    for n, s in scored:
+        if s >= min_score:
+            above.append((n, s))
+        elif allow_canonical_stack and _matches_canonical_stack(n):
+            canonical_pass.append((n, s))
+        else:
+            below.append((n, s))
 
     log_sink(f"[gha] --pattern-score: {len(nodes)} scored, "
-             f"{len(above)} above threshold ({min_score}), "
-             f"{len(below)} below")
+             f"{len(above)} known_good-match (≥{min_score}), "
+             f"{len(canonical_pass)} canonical-stack pass, "
+             f"{len(below)} below (filtered out)")
 
     if above:
         top_scores = [s for _, s in above[:5]]
-        log_sink(f"[gha] --pattern-score: top 5 scores: {top_scores}")
+        log_sink(f"[gha] --pattern-score: top 5 known_good scores: {top_scores}")
+    if canonical_pass:
+        # Покажем топ-5 протоколов среди canonical-pass (для аудита).
+        protos = sorted({(n.protocol or "?").lower() for n, _ in canonical_pass})
+        log_sink(f"[gha] --pattern-score: canonical-pass protocols: {protos}")
 
-    return [n for n, _ in above]
+    # Финальный список: known_good-matched first (по score desc), потом
+    # canonical (в порядке появления в scored — они уже отсортированы по score).
+    return [n for n, _ in above] + [n for n, _ in canonical_pass]
 
 
 # ---------------------------------------------------------------------- main
@@ -985,6 +1086,20 @@ def main(argv: list[str]) -> int:
                         "25 = SNI TLD+1 match ИЛИ полный стек протокола (vless+reality+tcp+vision+qq). "
                         "40 = нужно SNI match ИЛИ host+IP match. "
                         "0 = пропустить фильтр (все проходят).")
+    # v40: Multi-track canonical stack — конфиг проходит даже без known_good match,
+    # если его стек протокола «канонический» (vless+reality / vless+tls+ws /
+    # trojan+tls+ws / vmess+tls+ws / hysteria2). По умолчанию ON — это даёт
+    # AetrisVPN-конфиги (vless+tls+ws = 13% от 550) и Pizduk hy2 в финал.
+    p.add_argument("--allow-canonical-stack", action="store_true", default=True,
+                   help="Multi-track: пропускать конфиги с каноническим стеком "
+                        "(vless+reality / vless+tls+ws / trojan+tls+ws / "
+                        "vmess+tls+ws / hy2) ДАЖЕ БЕЗ known_good match. "
+                        "По умолчанию ON — это даёт AetrisVPN/Pizduk-конфиги в финал.")
+    p.add_argument("--no-canonical-stack", dest="allow_canonical_stack",
+                   action="store_false",
+                   help="Выключить multi-track. Только known_good match "
+                        "(score >= --pattern-score-min). Строго — отсечёт "
+                        "AetrisVPN WS+TLS конфиги.")
     # v23: saved_subs/ — авто-мёрдж (как в локальном GUI по умолчанию).
     # Юзер кладёт свои файлы в data/saved_subs/*.txt через git push,
     # GHA автоматически их подхватывает. --no-saved-subs чтобы выключить.
@@ -1210,6 +1325,7 @@ def main(argv: list[str]) -> int:
             nodes,
             args.known_good,
             min_score=args.pattern_score_min,
+            allow_canonical_stack=args.allow_canonical_stack,
             log_sink=log,
         )
         if not nodes:

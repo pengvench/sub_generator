@@ -279,6 +279,39 @@ _GEO_FALLBACK_CODE = "??"
 _GEO_FALLBACK_FLAG = "🏳"
 
 
+# v48b: Региональные indicator-символы для emoji-флагов.
+# U+1F1E6 = 'A' (regional indicator A), U+1F1FF = 'Z'.
+# Emoji-флаг = 2 таких символа → "🇩🇪" → "DE".
+_REGIONAL_INDICATOR_A = 0x1F1E6
+
+
+def _extract_flag_from_name(name: str) -> tuple[str, str] | None:
+    """Извлечь emoji-флаг из имени узла, вернуть (flag, iso_code) или None.
+
+    Emoji-флаг = 2 региональных indicator-символа (U+1F1E6..U+1F1FF).
+    Например "🇩🇪" = U+1F1E9 + U+1F1EA = 'D' + 'E' → "DE".
+
+    Используется когда api.ip.sb НЕ смог определить страну (DNS-resolve
+    fail для РФ-доменов на Azure US). Берём флаг из оригинального имени
+    (например "Литва 🇱🇹" → 🇱🇹 → "LT") → итоговое имя "🇱🇹 LT peppo".
+    """
+    if not name:
+        return None
+    # Ищем первый regional indicator символ в имени.
+    for i, ch in enumerate(name):
+        if _REGIONAL_INDICATOR_A <= ord(ch) <= _REGIONAL_INDICATOR_A + 25:
+            # Это 'A'-'Z' regional indicator.
+            # Проверим что следующий символ тоже regional indicator.
+            if i + 1 < len(name):
+                next_ch = name[i + 1]
+                if _REGIONAL_INDICATOR_A <= ord(next_ch) <= _REGIONAL_INDICATOR_A + 25:
+                    # Нашли emoji-флаг! Переводим в ISO код.
+                    iso = (chr(ord(ch) - _REGIONAL_INDICATOR_A + ord('A'))
+                           + chr(ord(next_ch) - _REGIONAL_INDICATOR_A + ord('A')))
+                    return (ch + next_ch, iso)
+    return None
+
+
 def _resolve_host_to_ip(host: str, timeout: float = 3.0) -> str:
     """Разрезолвить hostname в IPv4. Если уже IP — вернуть как есть.
 
@@ -404,41 +437,47 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
     log_sink(f"[gha] --geo-rename: geoip done, {geo_done} ok, {geo_failed} failed")
 
     # Переименовываем узлы.
+    # v48b: ВСЕ узлы получают "peppo" формат. Если api.ip.sb определил страну —
+    # "🇩🇪 DE peppo". Если НЕ определил (DNS-resolve fail для РФ-доменов на Azure
+    # US, или api.ip.sb rate-limit) — извлекаем emoji-флаг из оригинального имени
+    # (например "Литва 🇱🇹" → 🇱🇹 → "LT") → итоговое имя "🇱🇹 LT peppo".
+    # Если в имени флага нет → настоящий fallback "🏳 ?? peppo".
     renamed_count = 0
     fallback_count = 0
-    kept_original = 0
+    flag_from_name_count = 0
+    real_fallback_count = 0
     for node in nodes:
         host = (node.host or "").strip()
-        if not host:
-            new_name = f"{_GEO_FALLBACK_FLAG} {_GEO_FALLBACK_CODE} peppo"
-            fallback_count += 1
+        ip = host_to_ip.get(host, "") if host else ""
+        code, flag = _GEO_FALLBACK_CODE, _GEO_FALLBACK_FLAG
+
+        if host and ip:
+            code, flag = _geoip_lookup_ip(ip, timeout=timeout)
+
+        if code != _GEO_FALLBACK_CODE and code != "??":
+            # api.ip.sb определил страну → "🇩🇪 DE peppo".
+            new_name = f"{flag} {code} peppo"
+            renamed_count += 1
         else:
-            ip = host_to_ip.get(host, "")
-            if not ip:
-                # v46: НЕ меняем имя, если geo-rename fail (DNS-resolve не сработал).
-                # Юзер: "страны неизвестны, известных конфигов нету" — это потому
-                # что РФ-домены (test-cdn-kkk.com, qq.utiltools.site) на Azure US
-                # не резолвятся через DNS, и узлы получали "🏳 ?? peppo" вместо
-                # оригинального имени. Теперь оставляем оригинальное имя — юзер
-                # узнает свои known_good конфиги по их исходным именам.
-                kept_original += 1
-                continue  # skip rename, оставляем node.name как есть
+            # v48b: api.ip.sb fail. Пытаемся извлечь флаг из оригинального
+            # имени узла (например "Литва 🇱🇹" → 🇱🇹 → "LT").
+            extracted = _extract_flag_from_name(node.name)
+            if extracted:
+                flag_extracted, iso_extracted = extracted
+                new_name = f"{flag_extracted} {iso_extracted} peppo"
+                flag_from_name_count += 1
             else:
-                code, flag = _geoip_lookup_ip(ip, timeout=timeout)
-                if code == _GEO_FALLBACK_CODE or code == "??":
-                    # v46: geoip вернул fallback — НЕ меняем имя.
-                    fallback_count += 1
-                    kept_original += 1
-                    continue
-                else:
-                    new_name = f"{flag} {code} peppo"
-                    renamed_count += 1
+                # Даже в имени нет флага → настоящий fallback.
+                new_name = f"{_GEO_FALLBACK_FLAG} {_GEO_FALLBACK_CODE} peppo"
+                real_fallback_count += 1
+            fallback_count += 1
         # set_node_name перестраивает raw_url: для vless/trojan/ss — фрагмент #,
         # для vmess — поле ps в JSON. Тот же код, что в основном приложении.
         set_node_name(node, new_name)
 
-    log_sink(f"[gha] --geo-rename: {renamed_count} renamed, "
-             f"{fallback_count} fallback, {kept_original} kept original name")
+    log_sink(f"[gha] --geo-rename: {renamed_count} renamed (api.ip.sb), "
+             f"{flag_from_name_count} from name (flag extracted), "
+             f"{real_fallback_count} real fallback (no flag)")
 
 
 # ---------------------------------------------------------------------- known-good

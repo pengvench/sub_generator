@@ -1,40 +1,37 @@
 # GitHub Actions: авто-обновление списков подписок на cron'е.
 #
-# Что делает:
-#   1. Загружает источники из data/sources.txt (URL'ы подписок,
-#      happ://cryptN/, прямые vless://, и т.д.).
-#   2. Скачивает каждый через runtime.fetch._fetch_text (urllib → curl →
-#      PowerShell-транспорт = no-op на Linux; happ:// расшифровывается).
-#   3. Разбирает тела подписок через runtime.parse._subscription_lines
-#      (plain / base64 / JSON-объекты Xray/Hiddify / Clash-YAML).
-#   4. Дедуплицирует узлы по node.key.
-#   5. Классифицирует SNI каждого узла: БС / ЧС / серый / фейк / none
-#      (см. checkers/sni_category.py). С --tspu-sim оставляет только
-#      SNI в BS AND IP в BS-CIDR — для мобильных сетей РФ.
-#   6. TCP-ping socket'ом — дешёвый фильтр мёртвых узлов.
-#   7. Geo-rename: «<флаг> <ISO> peppo» через api.ip.sb/geoip.
-#   8. (full_test) Полный тест ВСЕХ узлов из preload.txt через xray/sing-box:
-#      alive + siberian + tcp16-20 + blocked_services + tg_media + resilience.
-#      Результат: subs.txt (base64, корень репо) + data/preload_working.txt
-#      (только рабочие узлы, перезаписывает preload.txt).
-#   9. Коммитит все изменения (preload + subs + report + whitelists).
+# Что делает (v48 — простой + peppo-имена, ~5-15 мин на прогон):
+#   1. fetch_tg_subs.py: парсит t.me/s/happvpn (happ://crypt5/...) и
+#      mifa.world главную (категории) → data/tg_subs.txt
+#   2. refresh_subs.py: собирает URL'ы из data/sources.txt + data/tg_subs.txt
+#      + data/saved_subs/* → fetch → parse → dedup → SNI sort (БС первыми)
+#      → TCP-ping ALL (workers=64, timeout=1.5s) → pattern-score (canonical:
+#      vless+reality / vless+tls+ws / trojan+tls+ws / hy2 / tuic)
+#      → known_good append (23 verified configs юзера) → geo-rename:
+#      "🇩🇪 DE peppo" через api.ip.sb/geoip (если fail — оригинальное имя)
+#      → --max-servers 100 → data/preload.txt
+#   3. cat preload.txt | base64 -w0 > subs.txt (готовая подписка для v2rayN/Happ/Karing)
+#   4. git-auto-commit-action пушит preload.txt + subs.txt + report + whitelists
+#
+# Чего НЕТ в v48 (по просьбе юзера):
+#   ❌ Speedtest (sing-box + Cloudflare 10MB) — отбрасывал РФ-узлы на Azure (гео-блок)
+#   ❌ Full test (xray alive + blocked_services + tg_media + siberian)
+#   ❌ Download sing-box/xray binaries (не нужны без speedtest/full_test)
+#
+# Что ЕСТЬ в v48 (по просьбе юзера):
+#   ✅ Geo-rename — узлы получают "🇩🇪 DE peppo" формат (если страна определена).
+#      Если api.ip.sb не смог определить страну (DNS-resolve fail для РФ-доменов
+#      типа test-cdn-kkk.com) — оставляем ОРИГИНАЛЬНОЕ имя из подписки (например
+#      "Франция 🇫🇷" из AetrisVPN). НЕ ставим "🏳 ?? peppo" — это было неузнаваемо.
 #
 # Когда запускать: см. on.schedule cron. По умолчанию — каждые 3 часа
 # (00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC).
 # Можно вызвать вручную через Actions → Refresh subs → Run workflow.
-#
-# v39: Каждые 3 часа — потому что t.me/happvpn выкладывает свежую
-# подписку ежедневно, а mifa.world/ категории обновляются в реальном
-# времени. 6 часов было слишком медленно — подписки успевали умереть
-# до следующего пайплайна.
 name: Refresh subs
 
 on:
   schedule:
     # v39: Каждые 3 часа (UTC): 0,3,6,9,12,15,18,21.
-    # Минимум 5 минут между запусками (ограничение GHA cron).
-    # Подстройте под свою нагрузку: чаще = актуальнее подписки,
-    # реже = меньше расход GHA-минут (8 запусков/день ≈ 2-5 мин каждый).
     - cron: "0 0,3,6,9,12,15,18,21 * * *"
   workflow_dispatch:
     # Ручной запуск из вкладки Actions — удобно для отладки.
@@ -44,51 +41,25 @@ on:
         type: boolean
         default: true
       tspu_sim:
-        # v43: default FALSE — раньше отсекал ЧС-узлы (instagram/chatgpt SNI).
-        # Юзер хочет собирать и БС, и ЧС — для разных сценариев. TSPU-фильтр
-        # включать вручную, только если нужна строгая эмуляция мобилки РФ.
-        description: "TSPU-эмулятор (SNI в BS AND IP в BS-CIDR) — ОТБРАСЫВАЕТ ЧС. Default OFF в v43"
+        description: "TSPU-эмулятор (отбрасывает ЧС SNI). Default OFF — собираем и БС, и ЧС"
         type: boolean
         default: false
       sort_by_sni:
         description: "Сортировать БС-узлы первыми в финальном списке (НЕ отбрасывает ЧС)"
         type: boolean
         default: true
-      with_speedtest:
-        # v46: default FALSE — speedtest на Azure US отбрасывает РФ-узлы
-        # (гео-блок, download_failed). Они РАБОЧИЕ на мобилке РФ, но GHA не
-        # может их проверить. Если включить — будут отсечены canonical-failed.
-        # Для БС-списков (только known_good-matched) speedtest не нужен.
-        description: "Speedtest: sing-box + Cloudflare 10MB (ОТБРАСЫВАЕТ РФ-узлы на Azure). Default OFF в v46"
-        type: boolean
-        default: false
       pattern_score_min:
-        # v46: default 25 (требует known_good match) — было 0 (только canonical-stack).
-        # Юзер: "получилось туча мёртвых конфигов, верни обрезку vless+reality".
-        # 25 = SNI TLD+1 match ИЛИ host suffix match ИЛИ полный стек протокола.
-        # 40 = нужно SNI exact match ИЛИ host+IP match.
-        description: "Минимальный pattern-score. 25 = known_good-matched (default v46), 0 = все canonical-stack"
+        description: "Минимальный pattern-score. 25 = known_good-matched (default), 0 = все canonical-stack"
         type: string
         default: "25"
       canonical_stack:
-        # v46: default FALSE — было True в v45. canonical-stack пропускал ВСЕ
-        # vless+reality / vless+tls+ws / trojan+tls+ws / vmess+tls+ws / hy2 / tuic,
-        # включая мёртвые на Azure. Теперь только known_good-matched.
-        description: "Canonical-stack multi-track (пропускает vless+tls+ws и т.д. БЕЗ known_good). Default OFF в v46"
+        description: "Canonical-stack multi-track (пропускает vless+tls+ws и т.д. БЕЗ known_good). Default OFF"
         type: boolean
         default: false
       max_servers:
-        description: "Финальный лимит узлов (после pattern-score, перед speedtest). 100 = стандарт"
+        description: "ФИНАЛЬНЫЙ лимит узлов в подписке. 100 = стандарт, 500 = щедро"
         type: string
         default: "100"
-      final_limit:
-        description: "ФИНАЛЬНЫЙ лимит узлов ПОСЛЕ speedtest. 100 = топ-100 по throughput"
-        type: string
-        default: "100"
-      full_test:
-        description: "Полная проверка ВСЕХ узлов через xray/sing-box (медленно: 50 узлов ≈ 30 мин, 500 узлов ≈ 4-5 часов)"
-        type: boolean
-        default: false
 
 # Чтобы не было параллельных запусков (старый коммит затрёт новый).
 concurrency:
@@ -100,15 +71,11 @@ permissions:
 
 jobs:
   refresh:
-    # Пиним к ubuntu-24.04 явно: 19 октября 2026 ubuntu-latest переключится
-    # на Ubuntu 26 (см. github.com/actions/runner-images/issues/14748).
-    # Пин = контролируем момент апгрейда сами.
     runs-on: ubuntu-24.04
-    # v44: 360 минут (6 часов) — на случай огромных списков (200k узлов).
-    # 200k × 1.5с timeout / 64 workers ≈ 78 минут пинга. Запас на TSPU + geo-rename.
-    # 100 узлов × ~30с (alive+tg+services+resilience+geo) = ~50 минут full_test.
-    # 500 узлов full_test = ~4-5 часов.
-    timeout-minutes: 360
+    # v47: 60 минут хватит (без speedtest/full_test прогон занимает ~5-15 мин).
+    # 200k узлов × 1.5с / 64 workers ≈ 78 минут — пинг самый долгий этап.
+    # На случай огромных списков — поднят до 90 мин.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -124,6 +91,7 @@ jobs:
           cache-dependency-path: |
             requirements-gha.txt
             scripts/refresh_subs.py
+            scripts/fetch_tg_subs.py
 
       - name: Install Python deps
         run: |
@@ -132,25 +100,16 @@ jobs:
 
       - name: Sync community SNI + CIDR whitelist
         # Качаем ~910 SNI доменов + ~30k CIDR-подсетей из hxehex upstream.
-        # Обновляется каждый раз (community-curated, обновляется людьми).
-        # Коммитим его ниже — для аудита upstream-изменений.
+        # Обновляется каждый раз (community-curated).
         run: |
           python scripts/sync_sni_whitelist.py --with-cidr
 
       - name: Fetch dynamic Telegram + mifa.world subscriptions
         # v39: Парсим t.me/s/happvpn (HTML) — ищем happ://crypt5/... в последнем
-        # посту. Парсим mifa.world главную — извлекаем все категории
-        # (ursa, vless, bober, ronin, hysteria, ...) и формируем URL'ы
-        # mifa.world/<category> (каждый отдаёт base64-encoded подписку).
-        #
+        # посту. Парсим mifa.world главную — извлекаем все категории (ursa,
+        # vless, bober, ronin, hysteria, ...) и формируем URL mifa.world/<cat>.
         # Результат: data/tg_subs.txt — мёрджится к data/sources.txt через
         # --extra-sources-file на следующем шаге.
-        #
-        # Если t.me/s/happvpn недоступен (rate limit, приватный канал) —
-        # mifa.world/ всё равно отдаёт подписки (через категории с главной).
-        # Если mifa.world недоступен — happ://crypt5/ из Telegram есть.
-        # Если ОБА упали — существующий data/tg_subs.txt сохраняется (не
-        # перезаписывается при 0 URL'ах), пайплайн продолжает работу.
         run: |
           python scripts/fetch_tg_subs.py \
             --channel happvpn \
@@ -159,63 +118,14 @@ jobs:
           echo "=== data/tg_subs.txt ==="
           cat data/tg_subs.txt 2>/dev/null || echo "(not generated — see logs above)"
 
-      - name: Download sing-box Linux binary (for speedtest)
-        # v40: sing-box нужен для scripts/speedtest.py — тест пропускной
-        # способности через download 10MB с Cloudflare. Скачиваем ВСЕГДА
-        # (не только в full_test), чтобы speedtest был доступен в обычном режиме.
-        # xray качаем только в full_test (для alive/blocked_services проверок).
-        run: |
-          mkdir -p bin
-          echo "=== Downloading sing-box-linux-64 ==="
-          # ВАЖНО: в URL filename НЕТ префикса 'v' — sing-box-1.13.16-linux-amd64.tar.gz
-          # (а в пути релиза 'v' есть: .../download/v1.13.16/sing-box-1.13.16-...).
-          SB_VERSION=v1.13.16
-          SB_VERSION_NO_V=${SB_VERSION#v}   # strip leading 'v' → 1.13.16
-          curl -sSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VERSION_NO_V}-linux-amd64.tar.gz"
-          if ! file /tmp/sb.tar.gz | grep -q "gzip compressed"; then
-            echo "FATAL: sing-box download is not gzip (likely 404). URL was wrong?"
-            head -c 200 /tmp/sb.tar.gz
-            exit 1
-          fi
-          tar -xzf /tmp/sb.tar.gz -C /tmp
-          cp /tmp/sing-box-*/sing-box bin/sing-box
-          chmod +x bin/sing-box
-          bin/sing-box version
-
-      - name: Download xray Linux binary (full-test mode only)
-        # xray нужен только для full_test (alive + blocked_services + tg_media).
-        # sing-box качается на предыдущем шаге (нужен для speedtest в любом режиме).
-        if: ${{ inputs.full_test == true }}
-        run: |
-          mkdir -p bin
-          echo "=== Downloading xray-linux-64 ==="
-          XRAY_VERSION=v26.3.27
-          curl -sSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/xray-linux-64.zip"
-          unzip -o /tmp/xray.zip -d /tmp/xray
-          cp /tmp/xray/xray bin/xray
-          chmod +x bin/xray
-          bin/xray version
-
-      - name: Refresh subs (fetch + parse + dedup + TSPU-sim + pattern-score + geo-rename)
-        # v37: Pattern-based scoring ЗАМЕНЯЕТ xray-ping.
-        # Каждый узел оценивается по сходству с known_good.txt (SNI, IP, proto).
-        # Быстро (30 сек на 25k), НЕ нужен xray, НЕ нужны GHA-минуты.
-        # subs.txt генерируется напрямую из preload.txt (base64 encode).
-        # v39: --extra-sources-file data/tg_subs.txt — мёрджит динамические
-        # URL'ы из предыдущего шага (Telegram + mifa.world) к data/sources.txt.
-        # v40: --pattern-score-min 25 (было 40) + --allow-canonical-stack
-        # (default ON) — multi-track фильтр. Теперь проходит если:
-        # (score >= 25 known_good match) ИЛИ (стек канонический:
-        # vless+reality / vless+tls+ws / trojan+tls+ws / vmess+tls+ws / hy2).
-        # Это даёт AetrisVPN-конфиги (vless+tls+ws = 13% от 550) и Pizduk hy2.
-        # v46: --pattern-score-min 25 (БЫЛО 0) — требует known_good match.
-        # Юзер: "получилось туча мёртвых конфигов, верни обрезку vless+reality".
-        # Теперь проходят ТОЛЬКО конфиги с SNI/host совпадающими с known_good.
-        # v46: --no-canonical-stack (БЫЛО --allow-canonical-stack) — выключить
-        # multi-track. Раньше пропускал ВСЕ vless+tls+ws/trojan/vmess/hy2/tuic,
-        # включая мёртвые на Azure. Теперь только known_good-matched.
-        # v46: --max-servers 100 (БЫЛО 1000) — финальный обрез после pattern-score.
-        # Speedtest по умолчанию OFF (смотри input with_speedtest).
+      - name: Refresh subs (fetch + parse + dedup + ping + pattern-score + geo-rename)
+        # v48: Вернул --geo-rename (v47 убрал, но юзер хочет "peppo" формат).
+        # Логика (v46 fallback в refresh_subs.py):
+        #   - Если api.ip.sb/geoip вернул страну → "🇩🇪 DE peppo"
+        #   - Если DNS-resolve fail ИЛИ api.ip.sb fallback → оригинальное имя
+        #     из подписки (например "Франция 🇫🇷" из AetrisVPN) — узнаваемо.
+        # Проблема Azure US: DNS-resolve для РФ-доменов (test-cdn-kkk.com)
+        # часто fail — эти узлы получат оригинальные имена (не "?? peppo").
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -241,154 +151,10 @@ jobs:
             ${{ inputs.canonical_stack == true && '--allow-canonical-stack' || '--no-canonical-stack' }} \
             ${{ inputs.tspu_sim == true && '--tspu-sim' || '' }} \
             --max-servers ${{ inputs.max_servers || '100' }}
-
-      - name: Speedtest (sing-box + Cloudflare 10MB download, RANKER mode)
-        # v40: Тест пропускной способности каждого узла через sing-box + SOCKS5
-        # + curl download 10MB с speed.cloudflare.com.
-        #
-        # v45: --final-limit — финальный обрез ПОСЛЕ speedtest, по throughput.
-        # Раньше --max-servers в refresh_subs.py обрезал до 100 ДО speedtest —
-        # теряли узлы, которые могли оказаться самыми быстрыми.
-        # Теперь: refresh_subs даёт 1000 узлов → speedtest тестирует все 1000
-        # (--max-nodes 1000) → финал топ-100 по throughput (--final-limit 100).
-        #
-        # 1000 узлов × 15с / 8 workers ≈ 31 минута (в рамках GHA timeout 360).
-        # workers=8 (было 4) — больше параллелизма, быстрее.
-        #
-        # Режим RANKER (default): узлы НЕ отбрасываются, а сортируются
-        # (fast → slow → canonical-failed). На Azure US многие узлы гео-блокированы,
-        # но реально работают на РФ-мобиле — их нельзя отбрасывать.
-        if: ${{ inputs.with_speedtest != false }}
-        run: |
-          if [ ! -x bin/sing-box ]; then
-            echo "[gha] sing-box binary not found — skipping speedtest"
-            echo "[gha] (download step above should have produced it; check logs)"
-            exit 0
-          fi
-          python scripts/speedtest.py \
-            --input data/preload.txt \
-            --output data/preload_speed.txt \
-            --report data/speedtest_report.json \
-            --singbox-bin bin/sing-box \
-            --min-speed-mbs 1.0 \
-            --max-nodes 1000 \
-            --workers 8 \
-            --download-timeout 15 \
-            --startup-timeout 5 \
-            --mode ranker \
-            --no-keep-canonical-failed \
-            --final-limit ${{ inputs.final_limit || '100' }}
-          # v46: APPEND known_good.txt после speedtest — известные конфиги
-          # ВСЕГДА в финале, даже если speedtest их отбросил (canonical-failed
-          # на Azure). Это гарант того, что проверенные на мобилке РФ конфиги
-          # попадают в финальную подписку.
-          if [ -f data/known_good.txt ]; then
-            echo "[gha] appending known_good.txt to preload_speed.txt (verified configs always in final)..."
-            # Дедуп по хосту (без порта — чтоб не было дублей)
-            cat data/preload_speed.txt data/known_good.txt > /tmp/subs_with_kg.txt 2>/dev/null
-            # Простая дедупликация (по строкам)
-            awk '!seen[$0]++' /tmp/subs_with_kg.txt > data/preload_speed.txt
-            echo "[gha] preload_speed.txt + known_good.txt: $(wc -l < data/preload_speed.txt) total"
-          fi
-          # Если speedtest нашёл хотя бы 1 узел — заменяем preload.txt на preload_speed.txt.
-          if [ -s data/preload_speed.txt ]; then
-            SPEED_COUNT=$(($(wc -l < data/preload_speed.txt) - 1))
-            echo "[gha] speedtest + known_good: $SPEED_COUNT nodes — replacing preload.txt"
-            cp data/preload_speed.txt data/preload.txt
-          else
-            echo "[gha] speedtest: 0 nodes in output — keeping original preload.txt"
-          fi
-
-      - name: Generate subs.txt (base64)
-        # v37: Генерируем subs.txt напрямую из preload.txt (base64 encode).
-        # БЕЗ cli_main / xray-ping — pattern-score (v37) + speedtest (v40)
-        # уже отфильтровали. Шаг идёт ПОСЛЕ speedtest — берёт финальный
-        # preload.txt (либо speedtest-отфильтрованный, либо оригинальный).
-        # Если speedtest был выключен — берёт оригинальный preload.txt.
-        run: |
+          # Генерируем subs.txt напрямую из preload.txt (base64 encode).
           echo "[gha] generating subs.txt from preload.txt (base64)..."
           cat data/preload.txt | base64 -w 0 > subs.txt
           echo "[gha] subs.txt: $(wc -c < subs.txt) bytes ($(wc -l < data/preload.txt) configs)"
-
-      - name: Full check via xray (alive + blocked_services + tg_media + siberian)
-        # Опционально: запускает существующий CLI на ВСЕХ узлах из preload.txt.
-        # cli_main.py = subgen.pipeline.run() — тот же движок, что в GUI.
-        # Нужны Linux binaries xray/sing-box (см. предыдущий step).
-        # Проверяет: alive (TLS-handshake), siberian, tcp 16-20, blocked_services
-        # (Instagram/ChatGPT/Discord/YouTube доступ через прокси), tg_media
-        # (загрузка видео из публичной t.me/s/<канал> веб-предпросмотра — БЕЗ токена).
-        # Результат: subs.txt (base64, в корне репо — финальная подписка для
-        # импорта в v2rayN/Happ/Karing) + data/preload_working.txt
-        # (только рабочие узлы, перезаписывает preload.txt).
-        if: ${{ inputs.full_test == true }}
-        env:
-          SUBGEN_DEBUG: "1"
-          # ui.cli_main лежит в python/ui/cli_main.py. Из корня репо
-          # `python -m ui.cli_main` не найдёт пакет ui (он в python/ui/).
-          # PYTHONPATH=python добавляет python/ в sys.path.
-          PYTHONPATH: python
-        run: |
-          # Тестируем ВСЕ узлы из preload.txt (БЕЗ лимита — было 20 в v30).
-          # Если узлов много (>100) — это займёт долго (до 4 часов, в рамках
-          # timeout-minutes: 240). Если хотите быстро — выключите full_test
-          # и оставьте только Refresh subs (TCP-ping filter).
-          NODES_COUNT=$(($(wc -l < data/preload.txt) - 1))  # -1 для header-комментария
-          echo "[gha] full test: testing ALL $NODES_COUNT nodes from preload.txt"
-          # ВАЖНО: --working и --report принимают ОТНОСИТЕЛЬНЫЕ имена,
-          # cli_main сам подставляет DATA_DIR (data/). Если написать
-          # --working data/preload_working.txt → получится data/data/...
-          # (удвоение). Поэтому передаём ПРОСТО ИМЯ ФАЙЛА.
-          # --sources, наоборот, читается как путь относительно CWD.
-          # --out = имя base64-подписки. "subs.txt" (default) → пишется
-          # В КОРЕНЬ репо (это и есть ваша финальная подписка для клиентов).
-          python -m ui.cli_main \
-            --sources data/preload.txt \
-            --working preload_working.txt \
-            --report preload_report_full.json \
-            --out subs.txt \
-            --max-ping 1500 \
-            --no-stress \
-            --initial-check-timeout 5.0
-          # Перезаписываем preload.txt только рабочими узлами (если они есть).
-          # cli_main пишет в data/preload_working.txt (относительно DATA_DIR).
-          if [ -s data/preload_working.txt ]; then
-            cp data/preload_working.txt data/preload.txt
-            echo "[gha] full test: kept $(wc -l < data/preload.txt) working nodes"
-          else
-            echo "[gha] full test: 0 working nodes — keeping original preload.txt"
-          fi
-          # v36: APPEND known_good.txt configs to subs.txt — ЭТО КРИТИЧНО.
-          # Причина: GHA на Azure US/EU, некоторые VPN-серверы гео-ограничены
-          # (отклоняют TLS handshake с US IP, но работают с RU мобильного).
-          # cli_main's xray-ping FAIL для таких серверов → они не в subs.txt.
-          # Но known_good.txt — это ПРОВЕРЕННЫЕ НА МОБИЛКЕ конфиги.
-          # Добавляем их в subs.txt ПОСЛЕ cli_main, в обход xray-ping.
-          if [ -f data/known_good.txt ]; then
-            echo "[gha] appending known_good.txt to subs.txt (verified mobile configs)..."
-            # Декодируем subs.txt (base64) → plain text
-            base64 -d subs.txt > /tmp/subs_plain.txt 2>/dev/null || true
-            # Добавляем known_good (без дублей).
-            # v38b: НЕ срезаем # (это fragment имени узла, не комментарий!).
-            # Раньше было line="${line%%#*}" → убивало имена «🇩🇪 Германия».
-            while IFS= read -r line; do
-                # Пропускаем пустые строки и комментарии (начинаются с #).
-                [ -z "$line" ] && continue
-                [[ "$line" =~ ^[[:space:]]*# ]] && continue
-                # Проверяем нет ли уже в subs (по началу строки до &pbk=).
-                config_base="${line%%#*}"  # берём часть до # (URL без имени)
-                if ! grep -qF "${config_base%%&pbk=*}" /tmp/subs_plain.txt 2>/dev/null; then
-                    echo "$line" >> /tmp/subs_plain.txt
-                fi
-            done < data/known_good.txt
-            # Переупаковываем в base64
-            base64 -w 0 /tmp/subs_plain.txt > subs.txt
-            echo "[gha] subs.txt updated with known_good: $(wc -l < /tmp/subs_plain.txt) total configs"
-          else
-            echo "[gha] known_good.txt NOT FOUND — create it with your verified mobile configs!"
-          fi
-          # Показать, где лежит base64-подписка.
-          echo "[gha] final base64 subscription: subs.txt ($(wc -c < subs.txt) bytes)"
-          echo "[gha] plain text preload: data/preload.txt ($(wc -l < data/preload.txt) nodes)"
 
       - name: Show stats
         if: always()
@@ -398,33 +164,32 @@ jobs:
           echo
           echo "=== subs.txt (base64 subscription — import into v2rayN/Happ/Karing) ==="
           if [ -f subs.txt ]; then
-            head -c 200 subs.txt
-            echo "..."
             echo "subs.txt size: $(wc -c < subs.txt) bytes"
+            echo "configs in subs.txt: $(base64 -d subs.txt 2>/dev/null | wc -l)"
           else
-            echo "subs.txt NOT generated (full_test was false — subs.txt создаётся только в full_test режиме)"
-            echo "Для получения subs.txt: Actions → Refresh subs → Run workflow → full_test: true"
+            echo "subs.txt NOT generated"
           fi
           echo
           echo "=== preload_report.json ==="
           cat data/preload_report.json 2>/dev/null || true
-          echo
-          echo "=== preload_report_full.json (full_test report) ==="
-          cat data/preload_report_full.json 2>/dev/null || true
+
+      - name: Cleanup old artifacts (v47)
+        # v47: Удаляем устаревшие файлы от прошлых версий (v40-v45):
+        # - preload_speed.txt (speedtest output)
+        # - preload_working.txt (full_test output)
+        # - preload_report_full.json (full_test report)
+        # - speedtest_report.json (speedtest report)
+        # Эти файлы больше не генерируются в v47, но могут остаться в репо.
+        # Удаляем, чтобы git-auto-commit не упал на "no changes".
+        run: |
+          rm -f data/preload_speed.txt data/preload_working.txt \
+                data/preload_report_full.json data/speedtest_report.json 2>/dev/null || true
+          echo "[gha] cleaned up old artifacts (v47+)"
 
       - name: Commit & push if changed
-        # git-auto-commit-action — популярное action для безопасного пуша.
-        # Коммитит ВСЕ изменения в data/ + subs.txt в корне репо.
-        # Включая sni_whitelist.txt + cidr_whitelist.txt (обновляются каждый
-        # раз из hxehex upstream — для аудита изменений community list'а).
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "auto: refresh subs (preload.txt + subs.txt + SNI/CIDR whitelist + report)"
-          # "data/" добавляет все изменения в data/ (preload.txt, reports,
-          # sni_whitelist.txt, cidr_whitelist.txt, preload_working.txt).
-          # "subs.txt" добавляет base64-подписку в корне репо.
-          # Используем паттерн (а не явный список файлов) — git add не падает
-          # на missing files (если full_test=false, subs.txt не создаётся).
           file_pattern: "data/ subs.txt"
           commit_user_name: "github-actions[bot]"
           commit_user_email: "github-actions[bot]@users.noreply.github.com"

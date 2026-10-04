@@ -185,6 +185,13 @@ jobs:
           rm -f data/preload_speed.txt data/preload_working.txt \
                 data/preload_report_full.json data/speedtest_report.json 2>/dev/null || true
           echo "[gha] cleaned up old artifacts (v47+)"
+          # v48c: Force-add data/tg_subs.txt — иначе git-auto-commit-action
+          # НЕ видит его (.gitignore содержит data/*). Даже после добавления
+          # исключения в .gitignore, нужен git add -f для первого коммита.
+          if [ -f data/tg_subs.txt ]; then
+            git add -f data/tg_subs.txt 2>/dev/null || true
+            echo "[gha] force-added data/tg_subs.txt"
+          fi
 
       - name: Commit & push if changed
         uses: stefanzweifel/git-auto-commit-action@v5

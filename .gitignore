@@ -37,6 +37,21 @@ data/*
 data/happ_keys/*
 !data/happ_keys/README.md
 
+# v48c: Разрешаем отслеживать GHA-генерируемые файлы в data/ — иначе
+# git-auto-commit-action НЕ видит их (т.к. data/* в .gitignore).
+# preload.txt, sources.txt, known_good.txt и т.д. — force-added ранее,
+# но tg_subs.txt терялся (git-auto-commit уважает .gitignore).
+!data/tg_subs.txt
+!data/preload.txt
+!data/preload_report.json
+!data/sources.txt
+!data/known_good.txt
+!data/sni_whitelist.txt
+!data/cidr_whitelist.txt
+!data/sni_whitelist_custom.txt
+!data/settings.json
+!data/geo_cache.json
+
 # Секреты happ-ключей — никогда в репо (README выше — единственное исключение).
 *.pem
 *.key

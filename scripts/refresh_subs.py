@@ -406,6 +406,7 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
     # Переименовываем узлы.
     renamed_count = 0
     fallback_count = 0
+    kept_original = 0
     for node in nodes:
         host = (node.host or "").strip()
         if not host:
@@ -414,21 +415,30 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
         else:
             ip = host_to_ip.get(host, "")
             if not ip:
-                new_name = f"{_GEO_FALLBACK_FLAG} {_GEO_FALLBACK_CODE} peppo"
-                fallback_count += 1
+                # v46: НЕ меняем имя, если geo-rename fail (DNS-resolve не сработал).
+                # Юзер: "страны неизвестны, известных конфигов нету" — это потому
+                # что РФ-домены (test-cdn-kkk.com, qq.utiltools.site) на Azure US
+                # не резолвятся через DNS, и узлы получали "🏳 ?? peppo" вместо
+                # оригинального имени. Теперь оставляем оригинальное имя — юзер
+                # узнает свои known_good конфиги по их исходным именам.
+                kept_original += 1
+                continue  # skip rename, оставляем node.name как есть
             else:
                 code, flag = _geoip_lookup_ip(ip, timeout=timeout)
-                new_name = f"{flag} {code} peppo"
                 if code == _GEO_FALLBACK_CODE or code == "??":
+                    # v46: geoip вернул fallback — НЕ меняем имя.
                     fallback_count += 1
+                    kept_original += 1
+                    continue
                 else:
+                    new_name = f"{flag} {code} peppo"
                     renamed_count += 1
         # set_node_name перестраивает raw_url: для vless/trojan/ss — фрагмент #,
         # для vmess — поле ps в JSON. Тот же код, что в основном приложении.
         set_node_name(node, new_name)
 
     log_sink(f"[gha] --geo-rename: {renamed_count} renamed, "
-             f"{fallback_count} fallback (geo недоступно)")
+             f"{fallback_count} fallback, {kept_original} kept original name")
 
 
 # ---------------------------------------------------------------------- known-good

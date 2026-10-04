@@ -55,25 +55,40 @@ on:
         type: boolean
         default: true
       with_speedtest:
-        description: "Speedtest: sing-box + Cloudflare 10MB download (медленнее ~5 мин, чистит медленные)"
+        # v46: default FALSE — speedtest на Azure US отбрасывает РФ-узлы
+        # (гео-блок, download_failed). Они РАБОЧИЕ на мобилке РФ, но GHA не
+        # может их проверить. Если включить — будут отсечены canonical-failed.
+        # Для БС-списков (только known_good-matched) speedtest не нужен.
+        description: "Speedtest: sing-box + Cloudflare 10MB (ОТБРАСЫВАЕТ РФ-узлы на Azure). Default OFF в v46"
         type: boolean
-        default: true
+        default: false
       pattern_score_min:
-        description: "Минимальный pattern-score (0 = только canonical-stack, 25 = +known_good, 40 = строго)"
+        # v46: default 25 (требует known_good match) — было 0 (только canonical-stack).
+        # Юзер: "получилось туча мёртвых конфигов, верни обрезку vless+reality".
+        # 25 = SNI TLD+1 match ИЛИ host suffix match ИЛИ полный стек протокола.
+        # 40 = нужно SNI exact match ИЛИ host+IP match.
+        description: "Минимальный pattern-score. 25 = known_good-matched (default v46), 0 = все canonical-stack"
         type: string
-        default: "0"
+        default: "25"
+      canonical_stack:
+        # v46: default FALSE — было True в v45. canonical-stack пропускал ВСЕ
+        # vless+reality / vless+tls+ws / trojan+tls+ws / vmess+tls+ws / hy2 / tuic,
+        # включая мёртвые на Azure. Теперь только known_good-matched.
+        description: "Canonical-stack multi-track (пропускает vless+tls+ws и т.д. БЕЗ known_good). Default OFF в v46"
+        type: boolean
+        default: false
+      max_servers:
+        description: "Финальный лимит узлов (после pattern-score, перед speedtest). 100 = стандарт"
+        type: string
+        default: "100"
+      final_limit:
+        description: "ФИНАЛЬНЫЙ лимит узлов ПОСЛЕ speedtest. 100 = топ-100 по throughput"
+        type: string
+        default: "100"
       full_test:
         description: "Полная проверка ВСЕХ узлов через xray/sing-box (медленно: 50 узлов ≈ 30 мин, 500 узлов ≈ 4-5 часов)"
         type: boolean
         default: false
-      max_servers:
-        description: "Мягкий лимит узлов ПОСЛЕ pattern-score (перед speedtest). 1000 = speedtest тестирует топ-1000. Реальный финал задаёт final_limit (ниже)."
-        type: string
-        default: "1000"
-      final_limit:
-        description: "ФИНАЛЬНЫЙ лимит узлов в подписке ПОСЛЕ speedtest (по throughput). 100 = топ-100 самых быстрых. 0 = без лимита."
-        type: string
-        default: "100"
 
 # Чтобы не было параллельных запусков (старый коммит затрёт новый).
 concurrency:
@@ -193,21 +208,14 @@ jobs:
         # (score >= 25 known_good match) ИЛИ (стек канонический:
         # vless+reality / vless+tls+ws / trojan+tls+ws / vmess+tls+ws / hy2).
         # Это даёт AetrisVPN-конфиги (vless+tls+ws = 13% от 550) и Pizduk hy2.
-        # v43: --pattern-score-min 0 (БЫЛО 25) — выключить known_good filter
-        # совсем. Только canonical-stack проходит. Это даёт:
-        #   - ВСЕ vless+reality / vless+tls+ws / trojan+tls+ws / hy2 / tuic
-        #   - НЕ отсекает по SNI (БС и ЧС списки попадают в финал)
-        # Юзер: "14k узлов → 27 конфигов — чертовски мало. Aetris и Piduk
-        # более щадящие, их конфиги живые." Теперь пропускаем ВСЕ canonical.
-        # v44: --max-ping-nodes 0 (БЫЛО 2000) — пингуем ВСЕ узлы, не обрезаем
-        # список. Раньше 198k из 200k узлов тупо терялись без пинга.
-        # 200k × 1.5с timeout / 64 workers ≈ 78 минут (в рамках GHA timeout 360).
-        # v44: --ping-timeout 1.5 (БЫЛО 3.0) — быстрее отсев мёртвых.
-        # v44: --ping-workers 64 (БЫЛО 32) — больше параллелизма.
-        # v44: --max-servers 100 (БЫЛО 500) — финальный обрез на 100 (по просьбе юзера).
-        # v45: --max-servers 1000 (БЫЛО 100) — МЯГКИЙ лимит ПОСЛЕ pattern-score,
-        # ПЕРЕД speedtest. Speedtest тестирует все 1000 узлов, потом финально
-        # обрезает --final-limit 100 (по throughput). НЕ теряем быстрые узлы.
+        # v46: --pattern-score-min 25 (БЫЛО 0) — требует known_good match.
+        # Юзер: "получилось туча мёртвых конфигов, верни обрезку vless+reality".
+        # Теперь проходят ТОЛЬКО конфиги с SNI/host совпадающими с known_good.
+        # v46: --no-canonical-stack (БЫЛО --allow-canonical-stack) — выключить
+        # multi-track. Раньше пропускал ВСЕ vless+tls+ws/trojan/vmess/hy2/tuic,
+        # включая мёртвые на Azure. Теперь только known_good-matched.
+        # v46: --max-servers 100 (БЫЛО 1000) — финальный обрез после pattern-score.
+        # Speedtest по умолчанию OFF (смотри input with_speedtest).
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -229,10 +237,10 @@ jobs:
             --known-good data/known_good.txt \
             --known-good-mode none \
             --pattern-score \
-            --pattern-score-min ${{ inputs.pattern_score_min || '0' }} \
-            --allow-canonical-stack \
+            --pattern-score-min ${{ inputs.pattern_score_min || '25' }} \
+            ${{ inputs.canonical_stack == true && '--allow-canonical-stack' || '--no-canonical-stack' }} \
             ${{ inputs.tspu_sim == true && '--tspu-sim' || '' }} \
-            --max-servers ${{ inputs.max_servers || '1000' }}
+            --max-servers ${{ inputs.max_servers || '100' }}
 
       - name: Speedtest (sing-box + Cloudflare 10MB download, RANKER mode)
         # v40: Тест пропускной способности каждого узла через sing-box + SOCKS5
@@ -268,13 +276,24 @@ jobs:
             --download-timeout 15 \
             --startup-timeout 5 \
             --mode ranker \
-            --keep-canonical-failed \
+            --no-keep-canonical-failed \
             --final-limit ${{ inputs.final_limit || '100' }}
-          # Если speedtest нашёл хотя бы 1 узел (fast/slow/canonical-failed) —
-          # заменяем preload.txt на preload_speed.txt (узлы в порядке скорости).
+          # v46: APPEND known_good.txt после speedtest — известные конфиги
+          # ВСЕГДА в финале, даже если speedtest их отбросил (canonical-failed
+          # на Azure). Это гарант того, что проверенные на мобилке РФ конфиги
+          # попадают в финальную подписку.
+          if [ -f data/known_good.txt ]; then
+            echo "[gha] appending known_good.txt to preload_speed.txt (verified configs always in final)..."
+            # Дедуп по хосту (без порта — чтоб не было дублей)
+            cat data/preload_speed.txt data/known_good.txt > /tmp/subs_with_kg.txt 2>/dev/null
+            # Простая дедупликация (по строкам)
+            awk '!seen[$0]++' /tmp/subs_with_kg.txt > data/preload_speed.txt
+            echo "[gha] preload_speed.txt + known_good.txt: $(wc -l < data/preload_speed.txt) total"
+          fi
+          # Если speedtest нашёл хотя бы 1 узел — заменяем preload.txt на preload_speed.txt.
           if [ -s data/preload_speed.txt ]; then
             SPEED_COUNT=$(($(wc -l < data/preload_speed.txt) - 1))
-            echo "[gha] speedtest: $SPEED_COUNT ranked nodes — replacing preload.txt"
+            echo "[gha] speedtest + known_good: $SPEED_COUNT nodes — replacing preload.txt"
             cp data/preload_speed.txt data/preload.txt
           else
             echo "[gha] speedtest: 0 nodes in output — keeping original preload.txt"

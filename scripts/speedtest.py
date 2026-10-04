@@ -339,6 +339,14 @@ def main(argv: list[str]) -> int:
                         "Причина: на GHA Azure US многие узлы гео-блокированы — "
                         "не отвечают, но реально работают на РФ-мобиле. "
                         "Default: ON.")
+    # v46: --no-keep-canonical-failed — выключить сохранение canonical-failed.
+    # Юзер: "получилось туча мёртвых конфигов". В Azure canonical-failed — это
+    # в основном мёртвые узлы (гео-блок). Отбросить их, оставить только fast+slow.
+    p.add_argument("--no-keep-canonical-failed", dest="keep_canonical_failed",
+                   action="store_false",
+                   help="(с --mode ranker) НЕ сохранять canonical-failed узлы. "
+                        "Только fast+slow (status=ok). Default: keep=True, "
+                        "v46 workflow использует --no-keep-canonical-failed.")
     args = p.parse_args(argv)
 
     def log(msg: str) -> None:

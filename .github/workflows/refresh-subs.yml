@@ -67,7 +67,11 @@ on:
         type: boolean
         default: false
       max_servers:
-        description: "ФИНАЛЬНЫЙ лимит узлов в подписке (после всех фильтров). 100 = стандарт, 500 = щедро, 0 = без лимита"
+        description: "Мягкий лимит узлов ПОСЛЕ pattern-score (перед speedtest). 1000 = speedtest тестирует топ-1000. Реальный финал задаёт final_limit (ниже)."
+        type: string
+        default: "1000"
+      final_limit:
+        description: "ФИНАЛЬНЫЙ лимит узлов в подписке ПОСЛЕ speedtest (по throughput). 100 = топ-100 самых быстрых. 0 = без лимита."
         type: string
         default: "100"
 
@@ -201,9 +205,9 @@ jobs:
         # v44: --ping-timeout 1.5 (БЫЛО 3.0) — быстрее отсев мёртвых.
         # v44: --ping-workers 64 (БЫЛО 32) — больше параллелизма.
         # v44: --max-servers 100 (БЫЛО 500) — финальный обрез на 100 (по просьбе юзера).
-        # v44: --max-servers ПЕРЕНЕСЁН в конец пайплайна (после pattern-score + geo-rename)
-        # в refresh_subs.py — раньше обрезал alive-список ДО known_good filter,
-        # теряя рабочий материал. Теперь обрезает только финал: топ-100 по score.
+        # v45: --max-servers 1000 (БЫЛО 100) — МЯГКИЙ лимит ПОСЛЕ pattern-score,
+        # ПЕРЕД speedtest. Speedtest тестирует все 1000 узлов, потом финально
+        # обрезает --final-limit 100 (по throughput). НЕ теряем быстрые узлы.
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -228,32 +232,24 @@ jobs:
             --pattern-score-min ${{ inputs.pattern_score_min || '0' }} \
             --allow-canonical-stack \
             ${{ inputs.tspu_sim == true && '--tspu-sim' || '' }} \
-            --max-servers ${{ inputs.max_servers || '100' }}
+            --max-servers ${{ inputs.max_servers || '1000' }}
 
       - name: Speedtest (sing-box + Cloudflare 10MB download, RANKER mode)
         # v40: Тест пропускной способности каждого узла через sing-box + SOCKS5
         # + curl download 10MB с speed.cloudflare.com.
         #
-        # v41: РЕЖИМ RANKER (default) — узлы НЕ отбрасываются, а просто
-        # сортируются (быстрые первыми, canonical-stack failed — в конце).
-        # Причина: на GHA Azure US многие узлы гео-блокированы (отклоняют
-        # US IP), но реально работают на РФ-мобиле. Их нельзя отбрасывать —
-        # просто пускаем в финал последними.
+        # v45: --final-limit — финальный обрез ПОСЛЕ speedtest, по throughput.
+        # Раньше --max-servers в refresh_subs.py обрезал до 100 ДО speedtest —
+        # теряли узлы, которые могли оказаться самыми быстрыми.
+        # Теперь: refresh_subs даёт 1000 узлов → speedtest тестирует все 1000
+        # (--max-nodes 1000) → финал топ-100 по throughput (--final-limit 100).
         #
-        # Что отсекается ТОЛЬКО в ranker:
-        # - sb_config_failed / sb_start_failed — конфиг сломанный (не проходит sing-box).
-        # - canonical-stack=False И download_failed — мусорный стек (ss, vless+none).
+        # 1000 узлов × 15с / 8 workers ≈ 31 минута (в рамках GHA timeout 360).
+        # workers=8 (было 4) — больше параллелизма, быстрее.
         #
-        # Что СОХРАНЯЕТСЯ в ranker:
-        # - fast (status=ok, mbps >= 1.0) — идут первыми.
-        # - slow (status=ok, mbps < 1.0) — после fast.
-        # - canonical-failed (vless+reality / vless+tls+ws / hy2 / ..., но
-        #   download_failed) — после slow. Это РАБОЧИЕ узлы, которые Azure не
-        #   может достучаться (гео-блок), но на мобиле РФ они работают.
-        #
-        # 30 узлов × ~10с download = ~5 мин (workers=4).
-        # Результат: data/preload_speed.txt (узлы в порядке скорости desc).
-        # Если в нём хотя бы 1 узел — заменяем preload.txt на preload_speed.txt.
+        # Режим RANKER (default): узлы НЕ отбрасываются, а сортируются
+        # (fast → slow → canonical-failed). На Azure US многие узлы гео-блокированы,
+        # но реально работают на РФ-мобиле — их нельзя отбрасывать.
         if: ${{ inputs.with_speedtest != false }}
         run: |
           if [ ! -x bin/sing-box ]; then
@@ -267,12 +263,13 @@ jobs:
             --report data/speedtest_report.json \
             --singbox-bin bin/sing-box \
             --min-speed-mbs 1.0 \
-            --max-nodes 100 \
-            --workers 4 \
+            --max-nodes 1000 \
+            --workers 8 \
             --download-timeout 15 \
             --startup-timeout 5 \
             --mode ranker \
-            --keep-canonical-failed
+            --keep-canonical-failed \
+            --final-limit ${{ inputs.final_limit || '100' }}
           # Если speedtest нашёл хотя бы 1 узел (fast/slow/canonical-failed) —
           # заменяем preload.txt на preload_speed.txt (узлы в порядке скорости).
           if [ -s data/preload_speed.txt ]; then

@@ -292,8 +292,20 @@ def main(argv: list[str]) -> int:
                    help="Минимальный throughput, MB/s (default: 1.0 = 8 Mbit/s). "
                         "Узлы с меньшей скоростью отбраковываются.")
     p.add_argument("--max-nodes", type=int, default=20,
-                   help="Лимит числа узлов для тестирования (default: 20). "
-                        "Больше = дольше (20 узлов × ~10с = ~3 мин с workers=4).")
+                   help="Лимит числа узлов для ТЕСТИРОВАНИЯ speedtest'ом (default: 20). "
+                        "Берём первые N из preload.txt (уже отсортированы pattern-score "
+                        "в refresh_subs.py — лучшие первыми). "
+                        "1000 узлов × 15с / 8 workers ≈ 31 мин. 200 узлов ≈ 6 мин.")
+    # v45: --final-limit — финальный обрез ПОСЛЕ speedtest, по throughput.
+    # Логика: refresh_subs даёт N узлов → speedtest тестирует их все →
+    # финал топ-final-limit по скорости (fast first, потом canonical-failed).
+    # Раньше --max-servers в refresh_subs.py обрезал ДО speedtest, теряя
+    # узлы, которые могли оказаться самыми быстрыми. Теперь обрезает speedtest.
+    p.add_argument("--final-limit", type=int, default=0,
+                   help="ФИНАЛЬНЫЙ лимит узлов в финале ПОСЛЕ speedtest (default: 0 = "
+                        "без лимита). 100 = топ-100 по throughput (fast → slow → "
+                        "canonical-failed). Применяется ПОСЛЕ speedtest, НЕ ПЕРЕД — "
+                        "тестятся все N (--max-nodes), в финал берём топ-final-limit.")
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                    help="Параллелизм (default: 4). Больше = быстрее, но "
                         "больше трафика. Sing-box процессы не пересекаются "
@@ -490,6 +502,14 @@ def main(argv: list[str]) -> int:
                 f"({len(lats)} successful downloads)")
 
     # 6) Пишем preload_speed.txt (final_results, в порядке скорости).
+    # v45: --final-limit — финальный обрез ПОСЛЕ speedtest, по throughput.
+    # Берём ТОП-N из final_results: сначала все fast (по throughput desc),
+    # потом slow, потом canonical-failed. Если final-limit=100 — берём первые 100.
+    if args.final_limit > 0 and len(final_results) > args.final_limit:
+        before_count = len(final_results)
+        final_results = final_results[:args.final_limit]
+        log(f"[speedtest] FINAL --final-limit: {before_count} → {args.final_limit} "
+            f"(после speedtest, по throughput desc)")
     # Находим исходный URL узла по (host, port, protocol). Это медленно
     # для больших списков, но max_nodes обычно ≤ 100.
     url_map: dict[tuple[str, str, str], str] = {}
@@ -505,9 +525,9 @@ def main(argv: list[str]) -> int:
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | "
                 f"{len(final_results)} nodes "
-                f"({len(fast_results)} fast + {len(slow_results)} slow + "
-                f"{len(final_results) - len(fast_results) - len(slow_results)} canonical-failed-kept) | "
-                f"tested: {len(nodes)} | mode={args.mode}\n")
+                f"(fast={len(fast_results)} slow={len(slow_results)} "
+                f"canonical-failed-kept={len(final_results) - len(fast_results) - len(slow_results)}) | "
+                f"tested: {len(nodes)} | mode={args.mode} | final_limit={args.final_limit}\n")
         for r in final_results:
             url = url_map.get((r["host"], str(r["port"]), r["protocol"]))
             if url:

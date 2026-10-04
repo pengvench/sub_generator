@@ -1,14 +1,10 @@
 {
-  "timestamp": 1791058930,
+  "timestamp": 1791084555,
   "total_sources": 114,
   "failed_sources": [
-    "https://etoneya.su/whitelist",
-    "https://etoneya.su/other",
-    "https://etoneya.su/gemini",
-    "https://etoneya.su/youtube",
-    "https://etoneya.su/ytm"
+    "https://hub.mos.ru/nfajih/wildvf/-/raw/main/WVFBLACK"
   ],
-  "nodes_collected": 66,
+  "nodes_collected": 54,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

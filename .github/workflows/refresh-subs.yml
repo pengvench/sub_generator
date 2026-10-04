@@ -44,25 +44,32 @@ on:
         type: boolean
         default: true
       tspu_sim:
-        description: "TSPU-эмулятор (SNI в BS AND IP в BS-CIDR) — для мобильных сетей РФ"
+        # v43: default FALSE — раньше отсекал ЧС-узлы (instagram/chatgpt SNI).
+        # Юзер хочет собирать и БС, и ЧС — для разных сценариев. TSPU-фильтр
+        # включать вручную, только если нужна строгая эмуляция мобилки РФ.
+        description: "TSPU-эмулятор (SNI в BS AND IP в BS-CIDR) — ОТБРАСЫВАЕТ ЧС. Default OFF в v43"
         type: boolean
-        default: true
+        default: false
       sort_by_sni:
-        description: "Сортировать БС-узлы первыми в финальном списке"
+        description: "Сортировать БС-узлы первыми в финальном списке (НЕ отбрасывает ЧС)"
         type: boolean
         default: true
       with_speedtest:
         description: "Speedtest: sing-box + Cloudflare 10MB download (медленнее ~5 мин, чистит медленные)"
         type: boolean
         default: true
+      pattern_score_min:
+        description: "Минимальный pattern-score (0 = только canonical-stack, 25 = +known_good, 40 = строго)"
+        type: string
+        default: "0"
       full_test:
         description: "Полная проверка ВСЕХ узлов через xray/sing-box (медленно: 50 узлов ≈ 30 мин, 500 узлов ≈ 4-5 часов)"
         type: boolean
         default: false
       max_servers:
-        description: "Лимит итоговых узлов в финальной подписке (0 = без лимита)"
+        description: "ФИНАЛЬНЫЙ лимит узлов в подписке (после всех фильтров). 100 = стандарт, 500 = щедро, 0 = без лимита"
         type: string
-        default: "0"
+        default: "100"
 
 # Чтобы не было параллельных запусков (старый коммит затрёт новый).
 concurrency:
@@ -78,10 +85,11 @@ jobs:
     # на Ubuntu 26 (см. github.com/actions/runner-images/issues/14748).
     # Пин = контролируем момент апгрейда сами.
     runs-on: ubuntu-24.04
-    # 240 минут (4 часа) — на случай full_test=true с большим числом узлов.
-    # 100 узлов × ~30с (alive+tg+services+resilience+geo) = ~50 минут.
-    # 500 узлов = ~4-5 часов. Без full_test — отработает за 2-5 минут.
-    timeout-minutes: 240
+    # v44: 360 минут (6 часов) — на случай огромных списков (200k узлов).
+    # 200k × 1.5с timeout / 64 workers ≈ 78 минут пинга. Запас на TSPU + geo-rename.
+    # 100 узлов × ~30с (alive+tg+services+resilience+geo) = ~50 минут full_test.
+    # 500 узлов full_test = ~4-5 часов.
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -181,6 +189,21 @@ jobs:
         # (score >= 25 known_good match) ИЛИ (стек канонический:
         # vless+reality / vless+tls+ws / trojan+tls+ws / vmess+tls+ws / hy2).
         # Это даёт AetrisVPN-конфиги (vless+tls+ws = 13% от 550) и Pizduk hy2.
+        # v43: --pattern-score-min 0 (БЫЛО 25) — выключить known_good filter
+        # совсем. Только canonical-stack проходит. Это даёт:
+        #   - ВСЕ vless+reality / vless+tls+ws / trojan+tls+ws / hy2 / tuic
+        #   - НЕ отсекает по SNI (БС и ЧС списки попадают в финал)
+        # Юзер: "14k узлов → 27 конфигов — чертовски мало. Aetris и Piduk
+        # более щадящие, их конфиги живые." Теперь пропускаем ВСЕ canonical.
+        # v44: --max-ping-nodes 0 (БЫЛО 2000) — пингуем ВСЕ узлы, не обрезаем
+        # список. Раньше 198k из 200k узлов тупо терялись без пинга.
+        # 200k × 1.5с timeout / 64 workers ≈ 78 минут (в рамках GHA timeout 360).
+        # v44: --ping-timeout 1.5 (БЫЛО 3.0) — быстрее отсев мёртвых.
+        # v44: --ping-workers 64 (БЫЛО 32) — больше параллелизма.
+        # v44: --max-servers 100 (БЫЛО 500) — финальный обрез на 100 (по просьбе юзера).
+        # v44: --max-servers ПЕРЕНЕСЁН в конец пайплайна (после pattern-score + geo-rename)
+        # в refresh_subs.py — раньше обрезал alive-список ДО known_good filter,
+        # теряя рабочий материал. Теперь обрезает только финал: топ-100 по score.
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -190,10 +213,10 @@ jobs:
             --output data/preload.txt \
             --report data/preload_report.json \
             --with-ping \
-            --ping-timeout 3.0 \
-            --ping-workers 32 \
-            --max-ping-nodes 500 \
-            --max-ping-ms 1000 \
+            --ping-timeout 1.5 \
+            --ping-workers 64 \
+            --max-ping-nodes 0 \
+            --max-ping-ms 2000 \
             --fetch-timeout 25.0 \
             --sort-by-sni \
             --geo-rename \
@@ -202,7 +225,7 @@ jobs:
             --known-good data/known_good.txt \
             --known-good-mode none \
             --pattern-score \
-            --pattern-score-min 25 \
+            --pattern-score-min ${{ inputs.pattern_score_min || '0' }} \
             --allow-canonical-stack \
             ${{ inputs.tspu_sim == true && '--tspu-sim' || '' }} \
             --max-servers ${{ inputs.max_servers || '100' }}
@@ -244,7 +267,7 @@ jobs:
             --report data/speedtest_report.json \
             --singbox-bin bin/sing-box \
             --min-speed-mbs 1.0 \
-            --max-nodes 30 \
+            --max-nodes 100 \
             --workers 4 \
             --download-timeout 15 \
             --startup-timeout 5 \

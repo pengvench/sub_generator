@@ -404,6 +404,9 @@ def main(argv: list[str]) -> int:
                 return True
             if proto in ("hysteria2", "hy2"):
                 return True
+            # v43: tuic — UDP-over-QUIC, DPI не видит
+            if proto == "tuic":
+                return True
             return False
     else:
         def _is_canonical(_n: XrayNode) -> bool:
@@ -446,13 +449,17 @@ def main(argv: list[str]) -> int:
 
     if args.mode == "ranker" and args.keep_canonical_failed:
         # Сохраняем canonical-stack failed узлы (гео-блок на Azure, но рабочие на РФ-мобиле).
+        # v43: sb_config_failed ТОЖЕ сохраняем — это узлы, протокол которых
+        # sing-box не поддерживает (например, tuic). Сам конфиг валидный,
+        # просто sing-box не может его протестировать. Клиенты (Hiddify,
+        # Karing) их поддерживают — оставляем.
         canonical_failed = [r for r in results
                            if r["status"] != "ok"
                            and r.get("canonical_stack", False)
-                           and r["status"] not in ("sb_config_failed",
-                                                   "sb_start_failed",
+                           and r["status"] not in ("sb_start_failed",
                                                    "exception")]
-        # Совсем отбрасываем только sb_failed (конфиг сломанный).
+        # Совсем отбрасываем только sb_start_failed (sing-box не стартовал —
+        # это обычно значит, что конфиг сломанный, или что-то с системой).
         hard_failed = [r for r in results
                       if r not in fast_results
                       and r not in slow_results

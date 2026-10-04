@@ -199,11 +199,18 @@ def _ping_filter(nodes: list[XrayNode], *, timeout: float, workers: int,
     """Пропинговать узлы параллельно, оставить только живые + быстрые.
 
     max_nodes > 0: пингуем только первые max_nodes (после BS-sort'а).
+        v44: НЕЛЬЗЯ использовать — отбрасывает 198k узлов из 200k!
+        По умолчанию 0 = без лимита, пингуем ВСЕ узлы.
     max_ping_ms > 0: отбраковываем узлы с latency > max_ping_ms (FakeDNS/медленные).
     Возвращает список, отсортированный по latency (быстрые первыми).
     """
+    # v44: --max-ping-nodes ОПАСЕН — обрезает список ДО пинга, непингованные
+    # узлы просто теряются. Если юзер явно не передал лимит — пингуем ВСЕ.
+    # При огромных списках (200k узлов × 1.5с / 64 workers = ~78 мин) это ОК.
     if max_nodes > 0 and len(nodes) > max_nodes:
-        log_sink(f"[gha] truncating ping list: {len(nodes)} → {max_nodes} (--max-ping-nodes)")
+        log_sink(f"[gha] WARNING: --max-ping-nodes truncating ping list: "
+                 f"{len(nodes)} → {max_nodes}. Неотпингованные {len(nodes) - max_nodes} "
+                 f"узлов БУДУТ ПОТЕРЯНЫ. Уберите --max-ping-nodes или поставьте 0.")
         nodes = nodes[:max_nodes]
     # tuple (node, latency_ms or None if dead)
     pinged: list[tuple[XrayNode, float | None]] = []
@@ -834,6 +841,12 @@ def _matches_canonical_stack(node: XrayNode) -> bool:
     # hysteria2 / hy2 — UDP-протокол, DPI не видит (Pizduk/Test включает 2 hy2)
     if proto in ("hysteria2", "hy2"):
         return True
+    # v43: tuic — UDP-over-QUIC, DPI не видит (в allproxy.txt 22k hy2+tuic)
+    if proto == "tuic":
+        return True
+    # vless + reality + grpc — alternative transport for reality
+    if proto == "vless" and security == "reality":
+        return True  # already covered above, but explicit
     return False
 
 
@@ -1285,10 +1298,10 @@ def main(argv: list[str]) -> int:
         log(f"[gha] ping: {len(alive)}/{len(nodes)} alive")
         nodes = alive
 
-    # 5) Лимит итоговых узлов.
-    if args.max_servers > 0 and len(nodes) > args.max_servers:
-        nodes = nodes[:args.max_servers]
-        log(f"[gha] truncated to {len(nodes)} (--max-servers {args.max_servers})")
+    # 5) v44: --max-servers ПЕРЕНЕСЁН В КОНЕЦ пайплайна (после pattern-score + geo-rename).
+    #     Раньше стоял ПЕРЕД known_good filter — обрезал alive-список до known_good,
+    #     теряя рабочий материал. Теперь: known_good → pattern-score → geo-rename → max-servers.
+    #     ВАЖНО: max-servers здесь НЕ применяем — он в самом конце (после geo-rename).
 
     # 5b) known-good фильтр: оставить только узлы, похожие на ПРОВЕРЕННЫЕ
     #     на мобилке конфиги (data/known_good.txt). Если файла нет — skip.
@@ -1348,6 +1361,16 @@ def main(argv: list[str]) -> int:
             timeout=args.geo_rename_timeout,
             log_sink=log,
         )
+
+    # 7) v44: ЛИМИТ ИТОГОВЫХ УЗЛОВ — в самом конце, ПОСЛЕ всех фильтров.
+    #    Раньше стоял ПЕРЕД known_good + pattern-score → обрезал alive-список
+    #    до known_good, теряя рабочий материал. Теперь обрезает только финал:
+    #    топ-N по pattern-score (после known_good-match first, потом canonical).
+    if args.max_servers > 0 and len(nodes) > args.max_servers:
+        log(f"[gha] FINAL truncate: {len(nodes)} → {args.max_servers} (--max-servers)")
+        nodes = nodes[:args.max_servers]
+    else:
+        log(f"[gha] FINAL list: {len(nodes)} nodes (no --max-servers limit)")
 
     # 7) Записываем preload.txt (по строке на узел — то, что sub_generator уже
     #    умеет читать как «рабочие конфиги» через _extract_configs в ImportPage).

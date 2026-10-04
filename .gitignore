@@ -29,6 +29,14 @@ pip-selfcheck.json
 .vscode/
 .idea/
 
+# Runtime data (создаётся при запуске).
+# data/sources.txt в репо НЕ хранится: при первом запуске создаётся пустым
+# (ui/paths.py::ensure_sources_file); сборка тоже генерирует пустышку.
+data/*
+!data/happ_keys/
+data/happ_keys/*
+!data/happ_keys/README.md
+
 # Секреты happ-ключей — никогда в репо (README выше — единственное исключение).
 *.pem
 *.key
@@ -41,3 +49,6 @@ dist/
 target/
 *.egg-info/
 
+# Binaries: ядра ПК скачиваются/обновляются отдельно (см. bin/CORE_VERSIONS.txt)
+# bin/ в репозитории хранится (готовые ядра), раскомментируйте чтобы исключить:
+# bin/*.exe

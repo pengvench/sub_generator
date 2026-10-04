@@ -2,23 +2,30 @@
 
 `scripts/refresh_subs.py` + `.github/workflows/refresh-subs.yml` — лёгкая
 версия sub_generator для GitHub Actions (Linux), которая делает ровно
-одно: скачивает источники из `data/sources.txt`, парсит их, дедуплицирует
-узлы, и коммитит итоговый список в `data/preload.txt` каждые 6 часов.
+одно: скачивает источники из `data/sources.txt` (плюс динамические URL'ы
+из `data/tg_subs.txt` — см. v39 ниже), парсит их, дедуплицирует
+узлы, и коммитит итоговый список в `data/preload.txt` каждые 3 часа.
 
 Без `xray.exe` / `sing-box.exe` — только Python-стек.
 
 ## Что делает workflow
 
 ```
-data/sources.txt (URL'ы подписок, happ://cryptN/, прямые vless://)
-   ↓ fetch (urllib → curl → happ-decrypt)
+data/sources.txt + data/tg_subs.txt   ← v39: динамические URL'ы из Telegram + mifa.world
+   ↓ scripts/fetch_tg_subs.py (парсит t.me/s/happvpn + mifa.world/)
+   ↓ refresh_subs.py: --sources-file + --extra-sources-file
+fetch (urllib → curl → happ-decrypt)
 тела подписок (plain / base64 / JSON Xray/Hiddify / Clash-YAML)
    ↓ parse + dedup по node.key
 список уникальных узлов
    ↓ TCP-ping socket'ом (опционально)
 список TCP-доступных узлов
-   ↓
+   ↓ SNI-категоризация (БС/ЧС/серый/фейк/none) + опц. TSPU-sim
+   ↓ Pattern scoring (сходство с known_good.txt, замена xray-ping)
+   ↓ Geo-rename (api.ip.sb/geoip → «🇩🇪 DE peppo»)
 data/preload.txt (по строке на узел) + data/preload_report.json
+   ↓ cat | base64 -w 0 > subs.txt
+subs.txt (base64-подписка для импорта в v2rayN/Happ/Karing)
    ↓ git-auto-commit-action
 коммит в main
 ```
@@ -38,7 +45,87 @@ data/preload.txt (по строке на узел) + data/preload_report.json
 4. **Проверьте вручную**: GitHub → вкладка **Actions** → **Refresh subs**
    → **Run workflow** (зелёная кнопка справа).
 5. **Готово**: после первого прогона в `data/preload.txt` будет актуальный
-   список узлов, обновляемый каждые 6 часов (UTC: 00:00, 06:00, 12:00, 18:00).
+   список узлов, обновляемый каждые 3 часа
+   (UTC: 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00).
+
+## v39: Динамические подписки из Telegram + mifa.world
+
+Если у ваших источников подписки меняются каждый день (например
+`t.me/happvpn` выкладывает свежую `happ://crypt5/...` ссылку, а
+`mifa.world/<category>` меняет имя категории), вы не можете держать
+их статически в `data/sources.txt`. Для этого в v39 добавлен
+`scripts/fetch_tg_subs.py`, который ПЕРЕД `refresh_subs.py` парсит
+динамические источники и пишет их в `data/tg_subs.txt`.
+
+### Что парсит `fetch_tg_subs.py`
+
+1. **`t.me/s/<channel>`** (по умолчанию `happvpn`) — Telegram web-preview
+   последних 20 постов публичного канала. HTML парсится регуляркой
+   `<div class="tgme_widget_message_text">...</div>`, в каждом посту
+   ищется:
+   - `happ://crypt5/...` (Hiddify-зашифрованная подписка, приоритет)
+   - `https://.../sub/...` / `.../exec?url=...` / `.../auto`
+   Берётся ПОСЛЕДНИЙ пост с совпадением (самый свежий).
+
+2. **`mifa.world/`** — главная страница содержит таблицу со статистикой
+   по категориям (`<td>NAME</td><td>COUNT</td>`). Скрипт извлекает
+   все имена категорий (ursa, vless, bober, ronin, hysteria, ...)
+   и формирует URL `https://mifa.world/<category>` для каждой.
+   Каждый такой URL возвращает base64-encoded подписку.
+
+   **Почему не парсим конкретный пост t.me/mifa_world/1310?**
+   Пост 1310 — это «service message» (фото/видео), Telegram
+   web-preview НЕ отдаёт его текст анонимным пользователям. Парсинг
+   главной `mifa.world` надёжнее: не зависит от доступности конкретного
+   поста и даёт все категории (а не одну).
+
+### Где взять список категорий
+
+Скрипт сам парсит их с `https://mifa.world/` (HTML-таблица статистики).
+Если сайт недоступен или сменился layout — есть hardcoded fallback:
+`ursa, vless, bober, ronin, hysteria`.
+
+Чтобы добавить свои категории явно:
+```bash
+python scripts/fetch_tg_subs.py \
+  --channel happvpn \
+  --mifa-categories ursa bober ronin NEWCAT \
+  --output data/tg_subs.txt
+```
+
+### Только Telegram или только mifa.world
+
+```bash
+# Только happ://crypt5 из Telegram (без mifa):
+python scripts/fetch_tg_subs.py --no-mifa
+
+# Только mifa.world категории (без Telegram):
+python scripts/fetch_tg_subs.py --no-tg
+```
+
+### Отказоустойчивость
+
+- Если `t.me/s/happvpn` недоступен (rate limit, приватный канал) —
+  mifa.world/ всё равно отдаёт подписки.
+- Если mifa.world недоступен — happ://crypt5 из Telegram есть.
+- Если ОБА упали — существующий `data/tg_subs.txt` сохраняется (не
+  перезаписывается при 0 URL'ах), пайплайн продолжает работу с тем
+  что есть в `data/sources.txt`.
+
+### Свой канал Telegram
+
+Если у вас свой публичный канал (например `my_proxy_channel`) с
+ежедневной подпиской:
+```bash
+python scripts/fetch_tg_subs.py --channel my_proxy_channel
+```
+
+Если канал приватный — web-preview `t.me/s/<channel>` вернёт пустую
+страницу. В этом случае можно:
+- Использовать TG Bot API + `getChat`/`forwardMessage` (нужен bot token,
+  bot должен быть подписчиком канала).
+- Запустить свой mtproto-bridge (сложно).
+- Просто вручную обновить `data/tg_subs.txt` когда подписка поменяется.
 
 ## Настройка частоты / объёма
 
@@ -47,7 +134,8 @@ data/preload.txt (по строке на узел) + data/preload_report.json
 ```yaml
 on:
   schedule:
-    - cron: "0 0,6,12,18 * * *"   # ← поменяйте, например на "0 */3 * * *"
+    # v39: каждые 3 часа — t.me/happvpn и mifa.world обновляются часто.
+    - cron: "0 0,3,6,9,12,15,18,21 * * *"
 ```
 
 | Cron           | Что значит                       |

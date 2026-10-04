@@ -844,6 +844,18 @@ def main(argv: list[str]) -> int:
                         "По умолчанию: data/sources.txt.")
     p.add_argument("--sources", nargs="*", default=[],
                    help="Доп. URL'ы (добавляются к --sources-file).")
+    # v39: --extra-sources-file — мёрджит доп. файл (например data/tg_subs.txt,
+    # который генерирует scripts/fetch_tg_subs.py: парсит t.me/s/happvpn на
+    # happ://crypt5/... ссылки + парсит mifa.world главную на категории).
+    # Файл перезаписывается каждый запуск fetch_tg_subs.py — динамические
+    # подписки (меняются каждый день) попадают в пайплайн автоматически.
+    p.add_argument("--extra-sources-file", type=Path, default=None,
+                   help="Доп. файл с URL'ами (мёрджится к --sources-file). "
+                        "Используется для динамических подписок: например "
+                        "data/tg_subs.txt, который генерирует "
+                        "scripts/fetch_tg_subs.py (парсит Telegram-каналы и "
+                        "mifa.world). Строки '#' = комментарий, пустые = skip. "
+                        "Если файл не существует — молча skip.")
     p.add_argument("--output", type=Path,
                    default=REPO / "data" / "preload.txt",
                    help="Куда писать итоговый список vless://... (по умолчанию: data/preload.txt).")
@@ -996,7 +1008,25 @@ def main(argv: list[str]) -> int:
     # (sources_page.get_sources с тумблером _use_saved_subs=True по умолчанию).
     # Юзер push'ит свои файлы в репо, GHA их автоматически подхватывает.
     saved_subs_dir = args.saved_subs_dir if not args.no_saved_subs else None
-    sources = _read_sources(args.sources_file, args.sources,
+    # v39: extra_sources — URL'ы из доп. файла (--extra-sources-file).
+    # Используется для динамических подписок: scripts/fetch_tg_subs.py
+    # парсит t.me/s/happvpn (happ://crypt5/...) и mifa.world (категории),
+    # пишет всё в data/tg_subs.txt. Workflow запускает fetch_tg_subs.py
+    # ПЕРЕД refresh_subs.py, к моменту чтения файл готов.
+    extra_sources: list[str] = []
+    if args.extra_sources_file is not None and args.extra_sources_file.exists():
+        try:
+            for line in args.extra_sources_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                extra_sources.append(line)
+            if extra_sources:
+                log(f"[gha] extra-sources-file {args.extra_sources_file}: "
+                    f"merged {len(extra_sources)} URL(s)")
+        except OSError as exc:
+            log(f"[gha] extra-sources-file read failed: {exc}")
+    sources = _read_sources(args.sources_file, args.sources + extra_sources,
                             saved_subs_dir=saved_subs_dir,
                             use_saved_subs=not args.no_saved_subs)
     if not sources:

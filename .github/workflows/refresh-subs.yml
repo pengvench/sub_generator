@@ -19,16 +19,23 @@
 #      (только рабочие узлы, перезаписывает preload.txt).
 #   9. Коммитит все изменения (preload + subs + report + whitelists).
 #
-# Когда запускать: см. on.schedule cron. По умолчанию — каждые 6 часов
-# (00:00, 06:00, 12:00, 18:00 UTC). Можно вызвать вручную через
-# Actions → Refresh subs → Run workflow.
+# Когда запускать: см. on.schedule cron. По умолчанию — каждые 3 часа
+# (00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 UTC).
+# Можно вызвать вручную через Actions → Refresh subs → Run workflow.
+#
+# v39: Каждые 3 часа — потому что t.me/happvpn выкладывает свежую
+# подписку ежедневно, а mifa.world/ категории обновляются в реальном
+# времени. 6 часов было слишком медленно — подписки успевали умереть
+# до следующего пайплайна.
 name: Refresh subs
 
 on:
   schedule:
-    # Каждые 6 часов (UTC). Подстройте под свою нагрузку.
+    # v39: Каждые 3 часа (UTC): 0,3,6,9,12,15,18,21.
     # Минимум 5 минут между запусками (ограничение GHA cron).
-    - cron: "0 0,6,12,18 * * *"
+    # Подстройте под свою нагрузку: чаще = актуальнее подписки,
+    # реже = меньше расход GHA-минут (8 запусков/день ≈ 2-5 мин каждый).
+    - cron: "0 0,3,6,9,12,15,18,21 * * *"
   workflow_dispatch:
     # Ручной запуск из вкладки Actions — удобно для отладки.
     inputs:
@@ -99,6 +106,28 @@ jobs:
         run: |
           python scripts/sync_sni_whitelist.py --with-cidr
 
+      - name: Fetch dynamic Telegram + mifa.world subscriptions
+        # v39: Парсим t.me/s/happvpn (HTML) — ищем happ://crypt5/... в последнем
+        # посту. Парсим mifa.world главную — извлекаем все категории
+        # (ursa, vless, bober, ronin, hysteria, ...) и формируем URL'ы
+        # mifa.world/<category> (каждый отдаёт base64-encoded подписку).
+        #
+        # Результат: data/tg_subs.txt — мёрджится к data/sources.txt через
+        # --extra-sources-file на следующем шаге.
+        #
+        # Если t.me/s/happvpn недоступен (rate limit, приватный канал) —
+        # mifa.world/ всё равно отдаёт подписки (через категории с главной).
+        # Если mifa.world недоступен — happ://crypt5/ из Telegram есть.
+        # Если ОБА упали — существующий data/tg_subs.txt сохраняется (не
+        # перезаписывается при 0 URL'ах), пайплайн продолжает работу.
+        run: |
+          python scripts/fetch_tg_subs.py \
+            --channel happvpn \
+            --output data/tg_subs.txt \
+            --timeout 20.0
+          echo "=== data/tg_subs.txt ==="
+          cat data/tg_subs.txt 2>/dev/null || echo "(not generated — see logs above)"
+
       - name: Download xray + sing-box Linux binaries (full-test mode only)
         if: ${{ inputs.full_test == true }}
         run: |
@@ -131,11 +160,14 @@ jobs:
         # Каждый узел оценивается по сходству с known_good.txt (SNI, IP, proto).
         # Быстро (30 сек на 25k), НЕ нужен xray, НЕ нужны GHA-минуты.
         # subs.txt генерируется напрямую из preload.txt (base64 encode).
+        # v39: --extra-sources-file data/tg_subs.txt — мёрджит динамические
+        # URL'ы из предыдущего шага (Telegram + mifa.world) к data/sources.txt.
         env:
           SUBGEN_DEBUG: "1"
         run: |
           python scripts/refresh_subs.py \
             --sources-file data/sources.txt \
+            --extra-sources-file data/tg_subs.txt \
             --output data/preload.txt \
             --report data/preload_report.json \
             --with-ping \

@@ -1,5 +1,5 @@
 {
-  "timestamp": 1791134536,
+  "timestamp": 1791136869,
   "total_sources": 161,
   "failed_sources": [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
@@ -13,8 +13,7 @@
     "https://etoneya.su/other",
     "https://etoneya.su/gemini",
     "https://etoneya.su/youtube",
-    "https://etoneya.su/ytm",
-    "https://hub.mos.ru/nfajih/wildvf/-/raw/main/WVFBLACK"
+    "https://etoneya.su/ytm"
   ],
   "nodes_collected": 100,
   "ping_filter_applied": true,

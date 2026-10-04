@@ -1,6 +1,6 @@
 # community-curated CIDR (TSPU IPv4 subnets) whitelist for RU mobile operators (TSPU).
 # Source: https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/cidrwhitelist.txt
-# Synced: 2026-10-04 16:44:44 UTC
+# Synced: 2026-10-04 17:31:38 UTC
 # Entry count: 30228
 # Total size: 470393 bytes
 #

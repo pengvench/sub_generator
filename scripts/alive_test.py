@@ -235,9 +235,11 @@ def main(argv: list[str]) -> int:
         log("[alive] FATAL: 0 valid nodes")
         return 1
 
-    if len(nodes) > args.max_nodes:
+    if args.max_nodes > 0 and len(nodes) > args.max_nodes:
         log(f"[alive] truncating to {args.max_nodes} (--max-nodes)")
         nodes = nodes[:args.max_nodes]
+    elif args.max_nodes == 0:
+        log(f"[alive] --max-nodes 0 = NO LIMIT, testing ALL {len(nodes)} nodes")
 
     log(f"[alive] testing {len(nodes)} nodes with {args.workers} workers "
         f"(head_timeout={args.head_timeout}s, startup={args.startup_timeout}s)")

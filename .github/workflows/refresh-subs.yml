@@ -181,6 +181,13 @@ jobs:
                 data/preload_report_full.json data/speedtest_report.json \
                 subs_all.txt 2>/dev/null || true
           echo "[gha] cleaned up old artifacts (v47+, v49b: subs_all.txt)"
+          # v58: Гарантируем существование subs_chs.txt — если refresh_subs
+          # упал на split_bs_chs, subs_chs.txt НЕ создаётся, и git-auto-commit
+          # падает на "pathspec did not match". Создаём пустой файл-заглушку.
+          if [ ! -f subs_chs.txt ]; then
+            echo "# empty ChS (split failed)" | base64 -w 0 > subs_chs.txt
+            echo "[gha] created empty subs_chs.txt (split failed in refresh_subs)"
+          fi
           # v48c: Force-add data/tg_subs.txt — иначе git-auto-commit-action
           # НЕ видит его (.gitignore содержит data/*). Даже после добавления
           # исключения в .gitignore, нужен git add -f для первого коммита.
@@ -193,9 +200,10 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "auto: refresh subs (preload.txt + subs.txt + SNI/CIDR whitelist + report)"
-          # v51: file_pattern включает subs_bs.txt и subs_chs.txt — РАНЬШЕ они
-          # НЕ коммитились (был только "data/ subs.txt"). Теперь git-auto-commit
-          # видит и пушит их в репо.
-          file_pattern: "data/ subs.txt subs_bs.txt subs_chs.txt"
+          # v51: file_pattern включает subs_chs.txt (subs_bs.txt НЕ создаём —
+          # subs.txt уже = base64(preload_bs.txt), а subs_chs.txt = base64(preload_chs.txt)).
+          # v58: Убрал subs_bs.txt из pattern — он НЕ создаётся, и git-auto-commit
+          # падал с "fatal: pathspec 'subs_bs.txt' did not match any files".
+          file_pattern: "data/ subs.txt subs_chs.txt"
           commit_user_name: "github-actions[bot]"
           commit_user_email: "github-actions[bot]@users.noreply.github.com"

@@ -40,12 +40,8 @@ on:
         description: "TCP-ping фильтр (медленнее, чистит мёртвые)"
         type: boolean
         default: true
-      tspu_sim:
-        description: "TSPU-эмулятор (отбрасывает ЧС SNI). Default OFF — собираем и БС, и ЧС"
-        type: boolean
-        default: false
       sort_by_sni:
-        description: "Сортировать БС-узлы первыми в финальном списке (НЕ отбрасывает ЧС)"
+        description: "Сортировать БС-узлы первыми в финальном списке (внутри subs_bs.txt)"
         type: boolean
         default: true
       max_servers:
@@ -143,7 +139,6 @@ jobs:
             --no-pattern-score \
             --allow-canonical-stack \
             --split-bs-chs \
-            ${{ inputs.tspu_sim == true && '--tspu-sim' || '' }} \
             --max-servers ${{ inputs.max_servers || '200' }}
           # Генерируем subs.txt = preload_bs.txt (БС для мобилки РФ).
           echo "[gha] generating subs.txt (БС base64)..."

@@ -113,6 +113,27 @@ def _read_sources(sources_file: Path, extra: list[str],
                     current_section = "mixed"
                 # Строку-разделитель пропускаем (не URL).
                 continue
+            # v62: Также проверяем сам URL на ключевые слова wl/bl/alive_bs.
+            # Это для источников, которые попали в MIXED секцию, но по названию
+            # файла явно БС (wl.txt, alive_bs.txt, whitelist.txt) или ЧС (bl.txt).
+            url_lower = stripped.lower()
+            if not current_section or current_section == "mixed":
+                # Проверяем filename в URL на WL/BL маркеры.
+                # "wl" / "bl" — проверяем как отдельное слово (не подстрока owl/cable).
+                import re as _re_mod
+                # /wl. /wl_ /wl/ /wl# → БС
+                if _re_mod.search(r'[/_.]wl[/_.#]|[/_.]wl$', url_lower) or \
+                   "alive_bs" in url_lower or "whitelist" in url_lower or \
+                   "white" in url_lower or "бс" in url_lower:
+                    current_section_override = "bs"
+                    add(stripped, current_section_override)
+                    continue
+                # /bl. /bl_ /bl/ /bl# → ЧС
+                if _re_mod.search(r'[/_.]bl[/_.#]|[/_.]bl$', url_lower) or \
+                   "blacklist" in url_lower or "black" in url_lower or "чс" in url_lower:
+                    current_section_override = "chs"
+                    add(stripped, current_section_override)
+                    continue
             add(stripped, current_section)
     for value in extra or []:
         add(value, "mixed")  # CLI args — без секции (mixed = БС по умолчанию).
@@ -146,7 +167,7 @@ _DNS_LABEL_RE = re.compile(r"^[a-zA-Z0-9_](?:[a-zA-Z0-9_-]*[a-zA-Z0-9_])?$")
 _IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)$")
 
 
-# v52: Чёрный список IP-диапазонов DNS, которые часто встречаются в фейковых
+# v53: Чёрный список IP-диапазонов DNS, которые часто встречаются в фейковых
 # подписках (mifa.world, Epodonios, AetrisVPN-заглушки). Это НЕ VPN-сервера,
 # но порты 443 открыты — TCP-ping говорит "alive", и они попадают в финал
 # как мёртвые. Отбрасываем на этапе _is_valid_hostname.
@@ -154,13 +175,18 @@ _IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-
 # v53: Убрал Cloudflare/Fastly CDN IP-диапазоны — на них МОГУТ быть VPN
 # (Reality с SNI=cloudflare.com/fastly.com — сервер стоит в CDN сети).
 # Оставил только явные DNS IP (100% не VPN).
+#
+# v63: ВЕРНУЛ Cloudflare/Fastly/Akamai CDN IP-диапазоны. Юзер доказал ошибками
+# v2rayN (403, reality verification failed, tls handshake failure) — 99% CDN IP
+# в публичных подписках это ФЕЙК, не VPN. Cloudflare Spectrum (через который
+# мог бы работать VPN) дорогой и НЕ используется в бесплатных подписках.
 import ipaddress as _ipaddr_module
 import ipaddress  # v52: используем в нескольких функциях (раньше был в функции)
 _CDN_DNS_BLACKLIST: list[_ipaddr_module.IPv4Network] = [
     # Google DNS (AS15169) — 100% не VPN
     _ipaddr_module.ip_network("8.8.8.8/32"),
     _ipaddr_module.ip_network("8.8.4.4/32"),
-    # Cloudflare DNS — 100% не VPN (это публичные DNS-резолверы)
+    # Cloudflare DNS — 100% не VPN
     _ipaddr_module.ip_network("1.1.1.1/32"),
     _ipaddr_module.ip_network("1.0.0.1/32"),
     # Quad9 DNS — 100% не VPN
@@ -175,14 +201,36 @@ _CDN_DNS_BLACKLIST: list[_ipaddr_module.IPv4Network] = [
     # AdGuard DNS — 100% не VPN
     _ipaddr_module.ip_network("94.140.14.14/32"),
     _ipaddr_module.ip_network("94.140.15.15/32"),
-    # v53: Loopback / unspecified / private — отбрасываем сразу
-    # (это и есть причина p50=0ms — loopback мгновенный TCP-handshake)
-    _ipaddr_module.ip_network("0.0.0.0/8"),       # unspecified
-    _ipaddr_module.ip_network("127.0.0.0/8"),      # loopback
-    _ipaddr_module.ip_network("10.0.0.0/8"),       # private
-    _ipaddr_module.ip_network("172.16.0.0/12"),    # private
-    _ipaddr_module.ip_network("192.168.0.0/16"),   # private
-    _ipaddr_module.ip_network("169.254.0.0/16"),    # link-local
+    # v63: Loopback / unspecified / private
+    _ipaddr_module.ip_network("0.0.0.0/8"),
+    _ipaddr_module.ip_network("127.0.0.0/8"),
+    _ipaddr_module.ip_network("10.0.0.0/8"),
+    _ipaddr_module.ip_network("172.16.0.0/12"),
+    _ipaddr_module.ip_network("192.168.0.0/16"),
+    _ipaddr_module.ip_network("169.254.0.0/16"),
+
+    # v63: Cloudflare CDN (AS13335) — 99% фейк в публичных подписках.
+    # Ошибки v2rayN: 403, connection reset, tls handshake failure.
+    # Cloudflare Spectrum (VPN через CDN) — платный, НЕ используется в бесплатных подписках.
+    _ipaddr_module.ip_network("104.16.0.0/13"),   # 104.16-23.x.x
+    _ipaddr_module.ip_network("104.24.0.0/14"),   # 104.24-27.x.x
+    _ipaddr_module.ip_network("172.64.0.0/13"),   # 172.64-71.x.x
+    _ipaddr_module.ip_network("188.114.96.0/20"), # 188.114.96-111.x
+    _ipaddr_module.ip_network("190.93.240.0/20"), # 190.93.240-255.x
+    _ipaddr_module.ip_network("197.234.240.0/22"),# 197.234.240-243.x
+
+    # v63: Fastly CDN (AS54113) — 99% фейк. Ошибки: 403, EOF, connection reset.
+    _ipaddr_module.ip_network("151.101.0.0/16"),  # Fastly
+    _ipaddr_module.ip_network("167.82.0.0/16"),   # Fastly
+    _ipaddr_module.ip_network("199.232.0.0/16"), # Fastly
+
+    # v63: Akamai CDN —偶尔 встречается в фейк-подписках
+    _ipaddr_module.ip_network("23.0.0.0/8"),       # Akamai (большой диапазон)
+    _ipaddr_module.ip_network("95.100.0.0/15"),    # Akamai
+
+    # v63: Amazon CloudFront CDN
+    _ipaddr_module.ip_network("13.224.0.0/14"),    # CloudFront
+    _ipaddr_module.ip_network("52.84.0.0/15"),     # CloudFront
 ]
 
 
@@ -1456,10 +1504,12 @@ def main(argv: list[str]) -> int:
             # Проверяем первые ~20 строк тела на ключевые слова БС/ЧС.
             head = body[:5000].lower()  # первые 5KB — обычно хватает
             has_white = any(w in head for w in (
-                "white", "бс", "белый", "белые", "whitelist", "беловой"
+                "white", "бс", "белый", "белые", "whitelist", "беловой",
+                "wl list", "white list", "белые списки", "бс список"
             ))
             has_black = any(w in head for w in (
-                "black", "чс", "чёрный", "чёрные", "blacklist", "чёрной"
+                "black", "чс", "чёрный", "чёрные", "blacklist",
+                "bl list", "black list", "чёрные списки", "чс список"
             ))
             if has_white and not has_black:
                 body_tags[url] = "bs"
@@ -1721,14 +1771,18 @@ def main(argv: list[str]) -> int:
                 bs_nodes.append(n)
         log(f"[gha] SPLIT (before max-servers): BS={len(bs_nodes)}, "
             f"ChS={len(chs_nodes)}, total={len(nodes)}")
-        # --max-servers применяется к БС отдельно (ЧС — без лимита, всё в финал).
+        # v62: --max-servers применяется к ОБАМ спискам (БС и ЧС) независимо.
+        # Раньше ЧС не обрезался → в финале 387 ЧС узлов при 200 БС.
         if args.max_servers > 0 and len(bs_nodes) > args.max_servers:
             log(f"[gha] BS truncate: {len(bs_nodes)} → {args.max_servers} (--max-servers)")
             bs_nodes = bs_nodes[:args.max_servers]
         else:
-            log(f"[gha] BS list: {len(bs_nodes)} nodes (no max-servers limit)")
-        # ЧС — без лимита (все узлы попадают в финал, их обычно мало).
-        log(f"[gha] ChS list: {len(chs_nodes)} nodes (no limit)")
+            log(f"[gha] BS list: {len(bs_nodes)} nodes")
+        if args.max_servers > 0 and len(chs_nodes) > args.max_servers:
+            log(f"[gha] ChS truncate: {len(chs_nodes)} → {args.max_servers} (--max-servers)")
+            chs_nodes = chs_nodes[:args.max_servers]
+        else:
+            log(f"[gha] ChS list: {len(chs_nodes)} nodes")
         # Финальный nodes = bs + chs (для preload.txt = общий список).
         nodes = bs_nodes + chs_nodes
     else:
@@ -1769,6 +1823,26 @@ def main(argv: list[str]) -> int:
             chs_path.write_text("", encoding="utf-8")  # ПУСТОЙ — fix v2rayN
         log(f"[gha] SPLIT files: BS={len(bs_nodes)} ({bs_path.name}) + "
             f"ChS={len(chs_nodes)} ({chs_path.name})")
+
+        # v62: ФИНАЛЬНЫЕ source stats — кто дожил до финала (после всех фильтров).
+        # Это показывает, какие источники реально вкладывают рабочие конфиги.
+        final_bs_counts: dict[str, int] = {}
+        final_chs_counts: dict[str, int] = {}
+        for n in bs_nodes:
+            src = n.source_url or "?"
+            short = src.split("/")[-1] if "/" in src else src[:40]
+            final_bs_counts[short] = final_bs_counts.get(short, 0) + 1
+        for n in chs_nodes:
+            src = n.source_url or "?"
+            short = src.split("/")[-1] if "/" in src else src[:40]
+            final_chs_counts[short] = final_chs_counts.get(short, 0) + 1
+        log(f"[gha] FINAL source stats (BS, top 10):")
+        for name, count in sorted(final_bs_counts.items(), key=lambda x: -x[1])[:10]:
+            log(f"[gha]   {count:6d} configs  ← {name}")
+        if final_chs_counts:
+            log(f"[gha] FINAL source stats (ChS, top 10):")
+            for name, count in sorted(final_chs_counts.items(), key=lambda x: -x[1])[:10]:
+                log(f"[gha]   {count:6d} configs  ← {name}")
 
     # 6) Короткий JSON-отчёт для отладки и пуша в коммит-сообщение.
     report = {

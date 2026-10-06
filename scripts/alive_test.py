@@ -198,6 +198,13 @@ def main(argv: list[str]) -> int:
                    help="Таймаут HTTP HEAD, сек (default: 5.0).")
     p.add_argument("--startup-timeout", type=float, default=5.0,
                    help="Таймаут запуска sing-box, сек (default: 5.0).")
+    # v65: --final-limit — обрез ПОСЛЕ alive-test (не ДО!).
+    # Раньше refresh_subs обрезал до 200 ДО alive-test → из 200 выживало 11.
+    # Теперь: refresh_subs даёт 1000, alive-test проверяет 1000,
+    # --final-limit 200 берёт топ-200 из alive.
+    p.add_argument("--final-limit", type=int, default=0,
+                   help="ФИНАЛЬНЫЙ обрез ПОСЛЕ alive-test. 200 = топ-200 alive "
+                        "(по latency). 0 = без лимита (все alive). Default: 0.")
     args = p.parse_args(argv)
 
     def log(msg: str) -> None:
@@ -271,6 +278,18 @@ def main(argv: list[str]) -> int:
                 + (f" {r.get('error', '')[:80]}" if r.get("error") else ""))
 
     log(f"[alive] done: {alive_count} alive, {dead_count} dead")
+
+    # v65: --final-limit — обрез ПОСЛЕ alive-test, по latency (быстрые первыми).
+    # Сортируем alive по latency, берём топ-N.
+    if args.final_limit > 0 and len(alive_urls) > args.final_limit:
+        # Нужно отсортировать alive по latency. Перестроим alive_urls по latency.
+        alive_results = [(url, r) for url, r in zip(alive_urls, results)
+                         if r["status"] == "alive"]
+        alive_results.sort(key=lambda x: x[1].get("latency_ms") or 9999)
+        before = len(alive_urls)
+        alive_urls = [url for url, _ in alive_results[:args.final_limit]]
+        log(f"[alive] FINAL --final-limit: {before} → {args.final_limit} "
+            f"(по latency, быстрые первыми)")
 
     # Записываем alive узлы.
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -53,9 +53,9 @@ on:
         type: boolean
         default: true
       max_servers:
-        description: "ФИНАЛЬНЫЙ лимит узлов. 100 = стандарт, 200 = щедро (default v49), 0 = без лимита"
+        description: "Лимит узлов ПЕРЕД alive-test. 0 = ВСЕ (без лимита). Финальный обрез = 200 внутри alive-test"
         type: string
-        default: "200"
+        default: "0"
 
 # Чтобы не было параллельных запусков (старый коммит затрёт новый).
 concurrency:
@@ -170,13 +170,11 @@ jobs:
             ${{ inputs.vless_only == true && '--vless-only' || '' }} \
             ${{ inputs.drop_geo_fallback == true && '--drop-geo-fallback' || '--no-drop-geo-fallback' }} \
             --max-servers ${{ inputs.max_servers || '200' }}
-      - name: Alive-test (sing-box SOCKS5 + HTTP HEAD — отсеивает CDN/фейк)
-        # v64: Для КАЖДОГО узла из preload_bs.txt — запускаем sing-box,
-        # делаем HTTP HEAD к gstatic.com/generate_204 через SOCKS5.
-        # Если HTTP 204 → узел ЖИВОЙ (прокси работает).
-        # Если 403/TLS failure/timeout → МЁРТВЫЙ (отбрасываем).
-        # Это ОТЛИЧАЕТ реальные VPN от CDN/Railway/Vercel/фейк.
-        # Скорость: ~200 узлов × 3с / 8 workers ≈ 75 секунд.
+      - name: Alive-test (sing-box SOCKS5 + HTTP HEAD — ВСЕ узлы)
+        # v65b: БЕЗ ОБРЕЗКИ. ВСЕ alive узлы из preload_bs.txt тестируются.
+        # max-servers=0 → refresh_subs даёт ВСЕ (~28k БС + ~920 ЧС).
+        # alive-test тестирует ВСЕ → ~200-500 alive → final-limit 200.
+        # workers=16 для скорости. 28k × 1s / 16 ≈ 30 минут.
         run: |
           if [ ! -x bin/sing-box ]; then
             echo "[gha] sing-box not found — skipping alive-test"
@@ -187,38 +185,36 @@ jobs:
             --output data/preload_alive.txt \
             --report data/alive_test_report.json \
             --singbox-bin bin/sing-box \
-            --max-nodes 200 \
-            --workers 8 \
+            --max-nodes 0 \
+            --workers 16 \
             --head-timeout 5 \
-            --startup-timeout 5
-          # Если alive-test нашёл живые узлы — заменяем preload_bs.txt.
+            --startup-timeout 5 \
+            --final-limit 200
           if [ -s data/preload_alive.txt ]; then
             ALIVE_COUNT=$(($(wc -l < data/preload_alive.txt) - 1))
-            echo "[gha] alive-test: $ALIVE_COUNT confirmed alive — replacing preload_bs.txt"
+            echo "[gha] alive-test BS: $ALIVE_COUNT alive — replacing preload_bs.txt"
             cp data/preload_alive.txt data/preload_bs.txt
           else
-            echo "[gha] alive-test: 0 alive — keeping original preload_bs.txt"
+            echo "[gha] alive-test BS: 0 alive — keeping original preload_bs.txt"
           fi
-          # Также тестируем ЧС.
           if [ -s data/preload_chs.txt ]; then
             python scripts/alive_test.py \
               --input data/preload_chs.txt \
               --output data/preload_chs_alive.txt \
               --report data/alive_test_chs_report.json \
               --singbox-bin bin/sing-box \
-              --max-nodes 200 \
-              --workers 8 \
+              --max-nodes 0 \
+              --workers 16 \
               --head-timeout 5 \
-              --startup-timeout 5
+              --startup-timeout 5 \
+              --final-limit 200
             if [ -s data/preload_chs_alive.txt ]; then
               cp data/preload_chs_alive.txt data/preload_chs.txt
             fi
           fi
-          # Генерируем subs.txt = preload_bs.txt (alive-confirmed БС).
           echo "[gha] generating subs.txt (БС alive-confirmed base64)..."
           cat data/preload_bs.txt | base64 -w 0 > subs.txt
           echo "[gha] subs.txt (БС): $(wc -c < subs.txt) bytes ($(wc -l < data/preload_bs.txt) configs)"
-          # subs_chs.txt = preload_chs.txt (alive-confirmed ЧС).
           echo "[gha] generating subs_chs.txt (ЧС alive-confirmed base64)..."
           cat data/preload_chs.txt | base64 -w 0 > subs_chs.txt
           echo "[gha] subs_chs.txt (ЧС): $(wc -c < subs_chs.txt) bytes ($(wc -l < data/preload_chs.txt) configs)"

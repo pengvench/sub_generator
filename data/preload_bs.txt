@@ -1,4 +1,4 @@
-# 2026-10-06 14:05:20 | 200 nodes | sources: 334 | failed: 12
+# 2026-10-06 14:05:20 | BS list (mobile RF) | 200 nodes | sources: 334
 vless://e166eda9-ddce-43f9-90b8-aecf00000000@104.17.147.22:443?security=tls&type=ws&path=/NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN-NetliVPN&host=netlivpn6982.bshsb72772.workers.dev&sni=netlivpn6982.bshsb72772.workers.dev&fp=chrome&encryption=none#%F0%9F%8C%90%20peppo
 trojan://humanity@104.17.111.3:443?sni=www.ignitelimit.com&type=ws&path=%2Fassignment&fp=chrome#%F0%9F%87%AB%F0%9F%87%B7%20FR%20peppo
 vless://61d93b9b-00d0-4df1-8027-6e036f4c1f11@104.21.26.58:443?path=%2F&security=tls&encryption=none&host=freedom13.bypasojd.workers.dev&fp=chrome&type=ws&sni=freedom13.bypasojd.workers.dev#%F0%9F%8C%90%20peppo

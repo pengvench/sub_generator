@@ -60,10 +60,11 @@ permissions:
 jobs:
   refresh:
     runs-on: ubuntu-24.04
-    # v47: 60 минут хватит (без speedtest/full_test прогон занимает ~5-15 мин).
-    # 200k узлов × 1.5с / 64 workers ≈ 78 минут — пинг самый долгий этап.
-    # На случай огромных списков — поднят до 90 мин.
-    timeout-minutes: 90
+    # v57: 180 минут (3 часа) — для огромных списков (200k узлов).
+    # v56 упал на ping 197k узлов (workers=64, timeout=1.5с = 83 минуты).
+    # GHA timeout 90 минут не хватило. Поднимаем до 180 + workers=128 (в 2× быстрее).
+    # 200k × 1.5с / 128 workers ≈ 39 минут (запас 5×).
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -126,7 +127,7 @@ jobs:
             --report data/preload_report.json \
             --with-ping \
             --ping-timeout 1.5 \
-            --ping-workers 64 \
+            --ping-workers 128 \
             --max-ping-nodes 0 \
             --max-ping-ms 2000 \
             --fetch-timeout 25.0 \

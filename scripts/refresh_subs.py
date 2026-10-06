@@ -339,22 +339,14 @@ def _tcp_ping(node: XrayNode, timeout: float) -> tuple[bool, float]:
     try:
         with socket.create_connection((host, port), timeout=timeout):
             latency = time.perf_counter() - t0
-            # v55: если latency < 80ms — подозрительно быстро для реального VPN.
+            # v57: если latency < 10ms — подозрительно быстро для реального VPN.
             # Замеры на known_good.txt юзера (test-cdn-kkk.com — реальные РФ-сервера)
-            # показывают latency 185-320ms с Azure US. Юзер: "если конфиг отдает 20
-            # мы его пропускаем, хотя он опять же ну хуйню отдаст скорее всего".
-            #
-            # Что отбрасываем порогом 80ms:
-            # - Loopback (127.0.0.1) = 0ms — уже отброшен в _is_valid_hostname
-            # - CDN-cache (Cloudflare/Fastly edge рядом с Azure) = 0.5-5ms
-            # - US VPN рядом с Azure = 10-50ms — ОК, отбрасываем (юзеру нужны РФ/EU)
-            # - "Слишком быстрые" фейк-узлы (CDN, кеш) — отбрасываем
-            #
-            # Что проходит:
-            # - EU VPN: 80-150ms
-            # - РФ VPN: 150-300ms (известные конфиги 185-320ms)
-            # - Азия VPN: 200-400ms
-            if latency < 0.080:  # < 80ms
+            # показывают latency 185-320ms с Azure US. Юзер просил порог 80ms,
+            # НО это отбрасывает легитимные VPN через Fastly/Cloudflare Spectrum
+            # (mitivpn@167.82.76.7 — trojan+ws+tls, host=fastly.net, latency 5-15ms).
+            # Порог 10ms — компромисс: отбрасываем loopback (0ms) и CDN-cache (<3ms),
+            # пропускаем legitimate CDN VPN (5-15ms), реальные VPN (150-300ms).
+            if latency < 0.010:  # < 10ms
                 return False, 0.0
             return True, latency
     except Exception:

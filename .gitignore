@@ -43,6 +43,8 @@ data/happ_keys/*
 # но tg_subs.txt терялся (git-auto-commit уважает .gitignore).
 !data/tg_subs.txt
 !data/preload.txt
+!data/preload_bs.txt
+!data/preload_chs.txt
 !data/preload_report.json
 !data/sources.txt
 !data/known_good.txt

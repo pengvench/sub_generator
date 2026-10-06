@@ -129,6 +129,117 @@ _DNS_LABEL_RE = re.compile(r"^[a-zA-Z0-9_](?:[a-zA-Z0-9_-]*[a-zA-Z0-9_])?$")
 _IPV4_RE = re.compile(r"^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)$")
 
 
+# v52: Чёрный список IP-диапазонов DNS, которые часто встречаются в фейковых
+# подписках (mifa.world, Epodonios, AetrisVPN-заглушки). Это НЕ VPN-сервера,
+# но порты 443 открыты — TCP-ping говорит "alive", и они попадают в финал
+# как мёртвые. Отбрасываем на этапе _is_valid_hostname.
+#
+# v53: Убрал Cloudflare/Fastly CDN IP-диапазоны — на них МОГУТ быть VPN
+# (Reality с SNI=cloudflare.com/fastly.com — сервер стоит в CDN сети).
+# Оставил только явные DNS IP (100% не VPN).
+import ipaddress as _ipaddr_module
+import ipaddress  # v52: используем в нескольких функциях (раньше был в функции)
+_CDN_DNS_BLACKLIST: list[_ipaddr_module.IPv4Network] = [
+    # Google DNS (AS15169) — 100% не VPN
+    _ipaddr_module.ip_network("8.8.8.8/32"),
+    _ipaddr_module.ip_network("8.8.4.4/32"),
+    # Cloudflare DNS — 100% не VPN (это публичные DNS-резолверы)
+    _ipaddr_module.ip_network("1.1.1.1/32"),
+    _ipaddr_module.ip_network("1.0.0.1/32"),
+    # Quad9 DNS — 100% не VPN
+    _ipaddr_module.ip_network("9.9.9.9/32"),
+    _ipaddr_module.ip_network("149.112.112.112/32"),
+    # OpenDNS (Cisco) — 100% не VPN
+    _ipaddr_module.ip_network("208.67.222.222/32"),
+    _ipaddr_module.ip_network("208.67.220.220/32"),
+    # Control D — 100% не VPN
+    _ipaddr_module.ip_network("76.76.2.0/24"),
+    _ipaddr_module.ip_network("76.76.10.0/24"),
+    # AdGuard DNS — 100% не VPN
+    _ipaddr_module.ip_network("94.140.14.14/32"),
+    _ipaddr_module.ip_network("94.140.15.15/32"),
+    # v53: Loopback / unspecified / private — отбрасываем сразу
+    # (это и есть причина p50=0ms — loopback мгновенный TCP-handshake)
+    _ipaddr_module.ip_network("0.0.0.0/8"),       # unspecified
+    _ipaddr_module.ip_network("127.0.0.0/8"),      # loopback
+    _ipaddr_module.ip_network("10.0.0.0/8"),       # private
+    _ipaddr_module.ip_network("172.16.0.0/12"),    # private
+    _ipaddr_module.ip_network("192.168.0.0/16"),   # private
+    _ipaddr_module.ip_network("169.254.0.0/16"),    # link-local
+]
+
+
+# v53: Чёрный список доменов, которые явно НЕ VPN (gov.ua, speedtest.net, ...).
+# Эти домены часто встречаются в фейк-подписках как SNI/host — фейк-конфиги.
+# Отбрасываем в _is_valid_hostname.
+_NON_VPN_DOMAINS: frozenset[str] = frozenset({
+    # Государственные домены — точно не VPN
+    "www.gov.ua", "gov.ua", "www.gov.ru", "gov.ru",
+    "www.kremlin.ru", "kremlin.ru", "www.cbr.ru", "cbr.ru",
+    "www.nalog.ru", "nalog.ru", "www.gosuslugi.ru", "gosuslugi.ru",
+    # Тестовые / метрические домены
+    "www.speedtest.net", "speedtest.net",
+    "www.fast.com", "fast.com",
+    "speed.cloudflare.com",
+    # Игровые / медиа-домены (не VPN)
+    "log.bpminecraft.com", "bpminecraft.com",
+    # Китайские публичные домены (часто в фейк-подписках)
+    "www.baipiao.eu.org", "baipiao.eu.org",
+    # Поисковики (SNI=google.com — это фейк, не VPN)
+    "www.google.com",  # SNI для маскировки ОК, но host=www.google.com = фейк
+    "www.bing.com",
+    "www.yahoo.com",
+    "www.yandex.ru", "yandex.ru", "ya.ru",
+    # Соцсети (host=instagram.com = фейк, SNI=instagram.com = маскировка ОК)
+    "www.instagram.com", "instagram.com",
+    "www.facebook.com", "facebook.com",
+    "www.twitter.com", "twitter.com",
+    "www.youtube.com", "youtube.com",
+    # Streaming
+    "www.netflix.com", "netflix.com",
+    # Cloudflare/Fastly как host (НЕ SNI!) — фейк
+    "www.cloudflare.com",  # но IP 1.1.1.1 в blacklist
+    # AdGuard
+    "adguard.com",
+})
+
+
+def _is_cdn_dns_ip(host: str) -> bool:
+    """Проверить, является ли host DNS IP (8.8.8.8, 1.1.1.1, etc.).
+
+    Возвращает True если host — это IP из чёрного списка DNS.
+    v53: Убрал Cloudflare/Fastly CDN IP-диапазоны — на них могут быть VPN.
+    """
+    try:
+        ip = _ipaddr_module.IPv4Address(host)
+    except (ValueError, TypeError):
+        return False
+    for net in _CDN_DNS_BLACKLIST:
+        if ip in net:
+            return True
+    return False
+
+
+def _is_non_vpn_domain(host: str) -> bool:
+    """Проверить, является ли host не-VPN доменом (gov.ua, speedtest.net, ...).
+
+    v53: Эти домены часто встречаются в фейк-подписках. Если host (НЕ SNI!)
+    равен одному из них — это фейк-конфиг, отбрасываем.
+    """
+    if not host:
+        return False
+    host_lower = host.strip().lower().rstrip(".")
+    if host_lower in _NON_VPN_DOMAINS:
+        return True
+    # Также проверим домен второго уровня (например, gov.ua для sub.gov.ua)
+    parts = host_lower.split(".")
+    if len(parts) >= 2:
+        domain2 = ".".join(parts[-2:])
+        if domain2 in _NON_VPN_DOMAINS:
+            return True
+    return False
+
+
 def _is_valid_hostname(host: str) -> bool:
     """Проверка, что host — валидное DNS-имя или IP.
 
@@ -138,6 +249,10 @@ def _is_valid_hostname(host: str) -> bool:
 
     Возвращает True для: IPv4 (4 октета), IPv6 (содержит ':'), валидное
     DNS-имя (≤253 символа, метки 1..63 из [a-zA-Z0-9_-]).
+
+    v51: ОТсекает loopback / private / link-local IP — они НЕ валидные VPN-сервера,
+    но проходят IPv4 regex и вызывают TCP-ping = 0ms (мгновенный connect/refuse).
+    Также это убирает "ping stats: p50=0ms" баг — реальная latency никогда не 0ms.
     """
     if not host or not isinstance(host, str):
         return False
@@ -146,9 +261,36 @@ def _is_valid_hostname(host: str) -> bool:
         return False
     # IPv4 — без IDNA, валидируем регуляркой.
     if _IPV4_RE.match(host):
+        # v51: отбрасываем loopback / private / link-local IP.
+        # Это фиктивные хосты из подписок-заглушек (mifa.world и т.д.) —
+        # 127.0.0.1:443 мгновенно проходит TCP-handshake на localhost, давая
+        # latency=0ms и фейковые "alive" в ping stats.
+        try:
+            ip = ipaddress.IPv4Address(host)
+            if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+                return False
+            # Private IP (10.0/8, 192.168/16, 172.16/12) — на GHArunner тоже
+            # не валидные VPN-сервера (локальная сеть runner'а).
+            if ip.is_private:
+                return False
+        except (ValueError, TypeError):
+            return False
+        # v52: отбрасываем CDN/DNS IP (Cloudflare, Fastly, Google DNS, ...).
+        # Эти IP часто встречаются в фейк-подписках — порты 443 открыты (CDN!),
+        # но vless+reality там не работает.
+        if _is_cdn_dns_ip(host):
+            return False
         return True
     # IPv6 — содержит ':', валидируем как есть (с или без скобок).
     if ":" in host:
+        # v51: отбрасываем IPv6 loopback (::1) и link-local (fe80::/10).
+        try:
+
+            ip = ipaddress.IPv6Address(host.strip("[]"))
+            if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+                return False
+        except (ValueError, TypeError):
+            pass
         return True
     # DNS-имя: лимит длины.
     if len(host) > _DNS_NAME_MAX_LEN:
@@ -161,6 +303,14 @@ def _is_valid_hostname(host: str) -> bool:
             return False
         if not _DNS_LABEL_RE.match(label):
             return False
+    # v51: отбрасываем localhost-домены (не валидный VPN-сервер).
+    if host.lower() in ("localhost", "ip6-localhost", "ip6-loopback"):
+        return False
+    # v53: отбрасываем "не VPN" домены (gov.ua, speedtest.net, google.com, ...).
+    # Эти домены часто в фейк-подписках как host — gov.ua / speedtest.net /
+    # baipiao.eu.org / bpminecraft.com — точно не VPN-сервера.
+    if _is_non_vpn_domain(host):
+        return False
     return True
 
 
@@ -170,6 +320,10 @@ def _tcp_ping(node: XrayNode, timeout: float) -> tuple[bool, float]:
     НЕ запускает xray — это просто socket.connect() с таймаутом. Дешёвый
     фильтр мёртвых узлов (TCP RST / timeout / DNS-fail / IDNA-fail).
     Реальная проверка работы узла требует xray.exe (только Windows), её тут нет.
+
+    v51: Если latency < 0.5ms — считаем подозрительно быстрой (вероятно
+    loopback или CDN-кешированный TCP-handshake). Помечаем как dead (False).
+    Реальная сетевая latency никогда не < 0.5ms даже для localhost в Docker.
     """
     host = (node.host or "").strip()
     port = int(node.port or 0)
@@ -181,15 +335,29 @@ def _tcp_ping(node: XrayNode, timeout: float) -> tuple[bool, float]:
     # OSError — except (OSError, ...) не ловит. Отбраковываем на старте.
     if not _is_valid_hostname(host):
         return False, 0.0
-    t0 = time.monotonic()
+    t0 = time.perf_counter()  # v53: high-resolution timer (наносекунды на Linux)
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True, (time.monotonic() - t0)
+            latency = time.perf_counter() - t0
+            # v55: если latency < 80ms — подозрительно быстро для реального VPN.
+            # Замеры на known_good.txt юзера (test-cdn-kkk.com — реальные РФ-сервера)
+            # показывают latency 185-320ms с Azure US. Юзер: "если конфиг отдает 20
+            # мы его пропускаем, хотя он опять же ну хуйню отдаст скорее всего".
+            #
+            # Что отбрасываем порогом 80ms:
+            # - Loopback (127.0.0.1) = 0ms — уже отброшен в _is_valid_hostname
+            # - CDN-cache (Cloudflare/Fastly edge рядом с Azure) = 0.5-5ms
+            # - US VPN рядом с Azure = 10-50ms — ОК, отбрасываем (юзеру нужны РФ/EU)
+            # - "Слишком быстрые" фейк-узлы (CDN, кеш) — отбрасываем
+            #
+            # Что проходит:
+            # - EU VPN: 80-150ms
+            # - РФ VPN: 150-300ms (известные конфиги 185-320ms)
+            # - Азия VPN: 200-400ms
+            if latency < 0.080:  # < 80ms
+                return False, 0.0
+            return True, latency
     except Exception:
-        # Любая ошибка (OSError, TimeoutError, gaierror, herror, UnicodeError
-        # от IDNA, ValueError, ConnectionRefusedError, ...) — узел недоступен.
-        # Широкое except OK для ping-фильтра: мы НЕ логируем каждую ошибку
-        # (их будут тысячи), только возвращаем «не прошёл».
         return False, 0.0
 
 
@@ -325,7 +493,7 @@ def _resolve_host_to_ip(host: str, timeout: float = 3.0) -> str:
         return ""
     # Если уже IPv4 — возвращаем как есть.
     try:
-        import ipaddress
+
         ipaddress.IPv4Address(host)
         return host
     except ValueError:
@@ -537,7 +705,7 @@ def _load_known_good(path: Path) -> tuple[set[str], set[str], list[XrayNode]]:
         # IP-подсеть: host это IPv4 → берём /24 (или /N по known_good_ip_prefix).
         host = (node.host or "").strip()
         try:
-            import ipaddress
+
             ip = ipaddress.IPv4Address(host)
             # /24 по умолчанию — но cached без prefix, prefix applied at filter time.
             ip_subnet_set.add(str(ip))
@@ -574,7 +742,7 @@ def _node_matches_known_good(node: XrayNode, sni_set: set[str], ip_set: set[str]
     if mode in ("ip", "sni_or_ip", "sni_and_ip"):
         host = (node.host or "").strip()
         try:
-            import ipaddress
+
             ip = ipaddress.IPv4Address(host)
             # Сравниваем подсеть host'а с known-good IP в той же /prefix.
             host_net = ipaddress.IPv4Network(f"{host}/{ip_prefix}", strict=False)
@@ -706,7 +874,7 @@ def _load_known_good_patterns(path: Path) -> dict:
         # Host → IP (for /24 match)
         host = (node.host or "").strip()
         try:
-            import ipaddress
+
             ipaddress.IPv4Address(host)
             patterns["ip_subnets"].add(host)
         except (ValueError, TypeError):
@@ -789,7 +957,7 @@ def _pattern_score(node: XrayNode, patterns: dict) -> int:
     # Host /24 or domain suffix
     host = (node.host or "").strip()
     try:
-        import ipaddress
+
         ipaddress.IPv4Address(host)
         # It's an IP → check /24
         for known_ip in ip_subnets:

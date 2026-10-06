@@ -197,6 +197,9 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "auto: refresh subs (preload.txt + subs.txt + SNI/CIDR whitelist + report)"
-          file_pattern: "data/ subs.txt"
+          # v51: file_pattern включает subs_bs.txt и subs_chs.txt — РАНЬШЕ они
+          # НЕ коммитились (был только "data/ subs.txt"). Теперь git-auto-commit
+          # видит и пушит их в репо.
+          file_pattern: "data/ subs.txt subs_bs.txt subs_chs.txt"
           commit_user_name: "github-actions[bot]"
           commit_user_email: "github-actions[bot]@users.noreply.github.com"

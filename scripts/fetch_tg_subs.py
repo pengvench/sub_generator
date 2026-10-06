@@ -258,12 +258,27 @@ def main(argv: list[str]) -> int:
             log(f"[tg] {args.channel}: parsed {len(posts)} posts")
             # Идём от свежих к старым (t.me/s/ отдаёт старые → свежие,
             # так что переворачиваем).
+            # v56b: Берём ВСЕ happ://crypt5 URL'ы из постов (не только первый).
+            # Причина: самый свежий happ://crypt5 может быть УСТАРЕВШИМ
+            # (отдаёт заглушку "Подписка недействительна. Новая ссылка на канале").
+            # Если взять только первый — получим 0 конфигов. Берём все, в цикле
+            # скачивания отбракуем заглушки по _is_fake_config.
+            #
+            # v56c: НО! Если брать ВСЕ happ://crypt5 (8+), каждый fetch по 10 сек
+            # = 80+ сек только на них. mifa.world не успеет обработаться.
+            # Ограничиваем — берём только первые 3 happ://crypt5.
+            tg_happ_count = 0
             for post_html in reversed(posts):
                 sub = _find_subscription_in_post(post_html)
                 if sub:
+                    tg_happ_count += 1
+                    if tg_happ_count > 3:
+                        # Достаточно — переходим к mifa.world.
+                        break
                     log(f"[tg] {args.channel}: found {sub[:80]}{'...' if len(sub) > 80 else ''}")
                     urls.append(sub)
-                    break  # только последний пост
+                    # НЕ break — продолжаем собирать happ://crypt5 (макс 3).
+                    # Фильтрация заглушек (127.0.0.1) — на этапе скачивания.
             else:
                 log(f"[tg] {args.channel}: NO subscription URL in recent posts "
                     "(channel may be private or post is service-message)")
@@ -361,7 +376,29 @@ def main(argv: list[str]) -> int:
                 log(f"[tg] fetch returned empty: {sub_url[:80]}")
                 failed_subs.append(sub_url)
                 continue
+            # v55b: Если body — это чистый base64 (одной строкой, без переносов),
+            # _node_links_from_text НЕ парсит. Декодируем вручную, потом парсим.
+            # mifa.world/nitrino отдаёт 87KB base64 одной строкой — парсер не справляется.
             configs = _node_links_from_text(body)
+            if not configs:
+                # Попробуем декодировать base64.
+                import base64 as _b64
+                try:
+                    # Уберём ВСЁ кроме base64-символов (A-Z a-z 0-9 + / =).
+                    # Иногда body содержит HTML-обрамление или не-ASCII — это ломает b64decode.
+                    clean = re.sub(r"[^A-Za-z0-9+/=]", "", body).strip()
+                    if not clean.endswith("="):
+                        clean += "=" * (-len(clean) % 4)
+                    decoded_bytes = _b64.b64decode(clean)
+                    decoded = decoded_bytes.decode("utf-8", errors="replace")
+                    if decoded and ("vless://" in decoded or "vmess://" in decoded
+                                    or "trojan://" in decoded or "ss://" in decoded
+                                    or "hysteria" in decoded):
+                        log(f"[tg] {sub_url[:60]}: base64-decoded body "
+                            f"({len(body)} → {len(decoded)} bytes)")
+                        configs = _node_links_from_text(decoded)
+                except Exception as decode_exc:
+                    log(f"[tg] {sub_url[:60]}: base64 decode failed: {decode_exc}")
             # v50b: отфильтровать фейковые (заглушки mifa.world).
             real_configs = [c for c in configs if not _is_fake_config(c)]
             fake_count = len(configs) - len(real_configs)
@@ -373,7 +410,7 @@ def main(argv: list[str]) -> int:
             elif configs:
                 log(f"[tg] {sub_url[:60]}: 0 real ({len(configs)} all fake — placeholder)")
             else:
-                log(f"[tg] {sub_url[:60]}: parsed 0 configs")
+                log(f"[tg] {sub_url[:60]}: parsed 0 configs (body length: {len(body)})")
         except Exception as exc:
             log(f"[tg] {sub_url[:60]}: FAILED: {type(exc).__name__}: {exc}")
             failed_subs.append(sub_url)

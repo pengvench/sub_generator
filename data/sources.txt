@@ -111,8 +111,6 @@ https://raw.githubusercontent.com/Diversan313/apex-parser/main/subs/main/alive_b
 https://translate.yandex.ru/translate?url=https://etoneya.su/whitelist&lang=en-ru
 https://etoneya.su/whitelist
 https://etoneya.su/other
-https://etoneya.su/gemini
-https://translate.yandex.ru/translate?url=https://etoneya.su/gemini&lang=en-ru
 https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/main/kizyakbeta7.txt
 https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/main/kizyakbeta6.txt
 https://gist.githubusercontent.com/SlavaKat/a82a9698ff9f2f6dc4798a13e8b69a10/raw/

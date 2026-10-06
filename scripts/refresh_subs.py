@@ -1345,6 +1345,15 @@ def main(argv: list[str]) -> int:
     p.add_argument("--no-split-bs-chs", dest="split_bs_chs",
                    action="store_false",
                    help="НЕ разделять на БС/ЧС. Только preload.txt (как в v48).")
+    # v59: --drop-geo-fallback — отбрасывать узлы с именем "🌐 peppo"
+    # (geo-rename не смог определить страну — часто это мёртвые узлы).
+    p.add_argument("--drop-geo-fallback", action="store_true", default=True,
+                   help="Отбрасывать узлы с именем '🌐 peppo' (geo-rename не "
+                        "смог определить страну). Юзер: 'большая часть 🌐 peppo "
+                        "— мертвые'. Default: ON. v59.")
+    p.add_argument("--no-drop-geo-fallback", dest="drop_geo_fallback",
+                   action="store_false",
+                   help="НЕ отбрасывать '🌐 peppo' узлы (оставить в финале).")
     # v23: saved_subs/ — авто-мёрдж (как в локальном GUI по умолчанию).
     # Юзер кладёт свои файлы в data/saved_subs/*.txt через git push,
     # GHA автоматически их подхватывает. --no-saved-subs чтобы выключить.
@@ -1594,6 +1603,17 @@ def main(argv: list[str]) -> int:
             log_sink=log,
         )
 
+    # v59: drop-geo-fallback — отбрасываем узлы с именем "🌐 peppo"
+    # (geo-rename не смог определить страну). Юзер: "большая часть 🌐 peppo
+    # — мертвые". Это происходит ПОСЛЕ geo-rename, но ДО --max-servers.
+    if args.drop_geo_fallback and nodes:
+        before_count = len(nodes)
+        # "🌐 peppo" — это fallback имя. Если node.name == "🌐 peppo" — отбрасываем.
+        nodes = [n for n in nodes if n.name != "🌐 peppo"]
+        dropped = before_count - len(nodes)
+        log(f"[gha] --drop-geo-fallback: dropped {dropped} '🌐 peppo' nodes "
+            f"(geo-rename не нашёл страну). Before: {before_count}, after: {len(nodes)}")
+
     # 7) v44: ЛИМИТ ИТОГОВЫХ УЗЛОВ — в самом конце, ПОСЛЕ всех фильтров.
     #    Раньше стоял ПЕРЕД known_good + pattern-score → обрезал alive-список
     #    до known_good, теряя рабочий материал. Теперь обрезает только финал:
@@ -1623,14 +1643,37 @@ def main(argv: list[str]) -> int:
     #    subs.txt (общий base64) = preload_bs + preload_chs.
     if args.split_bs_chs:
         from checkers.sni_category import sni_category as _sni_cat
-        bs_nodes: list[XrayNode] = []  # белый + серый + фейк + none
-        chs_nodes: list[XrayNode] = []  # чёрный
+        # v59: Классификация БС/ЧС по ИМЕНИ источника (source_url узла),
+        # не только по SNI. Если source_url содержит "black"/"BLACK" — это
+        # ЧС-список (для WiFi), "white"/"WHITE" — БС-список (для РФ-мобилки).
+        # Иначе fallback на SNI-категорию (как раньше).
+        bs_nodes: list[XrayNode] = []
+        chs_nodes: list[XrayNode] = []
+        source_classified_count = 0
+        sni_classified_count = 0
         for n in nodes:
-            cat = _sni_cat(n)
-            if cat == "black":
+            src = (n.source_url or "").lower()
+            # Проверяем, содержит ли source_url слова "black" / "white"
+            is_black_source = any(w in src for w in (
+                "black", "чс", "чёрный", "bypass", "obhod", "обход"
+            )) and "white" not in src and "бс" not in src
+            is_white_source = any(w in src for w in (
+                "white", "бс", "белый", "беловой"
+            )) and "black" not in src and "чс" not in src
+            if is_black_source and not is_white_source:
                 chs_nodes.append(n)
-            else:
+                source_classified_count += 1
+            elif is_white_source and not is_black_source:
                 bs_nodes.append(n)
+                source_classified_count += 1
+            else:
+                # Fallback на SNI-категорию (как раньше).
+                cat = _sni_cat(n)
+                if cat == "black":
+                    chs_nodes.append(n)
+                else:
+                    bs_nodes.append(n)
+                sni_classified_count += 1
         # preload_bs.txt
         bs_path = args.output.parent / "preload_bs.txt"
         with open(bs_path, "w", encoding="utf-8") as f:
@@ -1639,16 +1682,24 @@ def main(argv: list[str]) -> int:
                     f"sources: {len(sources)}\n")
             for n in bs_nodes:
                 f.write(n.raw_url + "\n")
-        # preload_chs.txt
+        # v59: preload_chs.txt — ПУСТОЙ если 0 узлов (без комментария!).
+        # Раньше писали комментарий "# ..." в base64 → v2rayN падал с
+        # "v2ray unsupport format: [://] was not found" при импорте.
         chs_path = args.output.parent / "preload_chs.txt"
-        with open(chs_path, "w", encoding="utf-8") as f:
-            f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | ChS list "
-                    f"(WiFi / non-RU) | {len(chs_nodes)} nodes | "
-                    f"sources: {len(sources)}\n")
-            for n in chs_nodes:
-                f.write(n.raw_url + "\n")
+        if chs_nodes:
+            with open(chs_path, "w", encoding="utf-8") as f:
+                f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | ChS list "
+                        f"(WiFi / non-RU) | {len(chs_nodes)} nodes | "
+                        f"sources: {len(sources)}\n")
+                for n in chs_nodes:
+                    f.write(n.raw_url + "\n")
+        else:
+            # ПУСТОЙ файл (0 bytes) — base64 = пустая строка, v2rayN не падает.
+            chs_path.write_text("", encoding="utf-8")
         log(f"[gha] SPLIT: BS={len(bs_nodes)} ({bs_path.name}) + "
-            f"ChS={len(chs_nodes)} ({chs_path.name})")
+            f"ChS={len(chs_nodes)} ({chs_path.name}) "
+            f"(source-classified: {source_classified_count}, "
+            f"sni-classified: {sni_classified_count})")
 
     # 6) Короткий JSON-отчёт для отладки и пуша в коммит-сообщение.
     report = {

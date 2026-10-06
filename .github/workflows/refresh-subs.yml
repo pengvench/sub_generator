@@ -140,6 +140,7 @@ jobs:
             --no-pattern-score \
             --allow-canonical-stack \
             --split-bs-chs \
+            --drop-geo-fallback \
             --max-servers ${{ inputs.max_servers || '200' }}
           # Генерируем subs.txt = preload_bs.txt (БС для мобилки РФ).
           echo "[gha] generating subs.txt (БС base64)..."

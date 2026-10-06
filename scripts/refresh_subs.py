@@ -275,8 +275,10 @@ _geo_cache: dict[str, tuple[str, str]] = {}
 _geo_cache_lock = threading.Lock()
 
 # fallback если api.ip.sb недоступен / rate-limit / невалидный IP.
-_GEO_FALLBACK_CODE = "??"
-_GEO_FALLBACK_FLAG = "🏳"
+# v49b: Если страна не определена (api.ip.sb fail и в имени нет флага) —
+# ставим "🌐 peppo" (земной шар). Не "🏳 ?? peppo" — юзер сказал так не делать.
+_GEO_FALLBACK_CODE = "🌐"   # Земной шар вместо "??" + "🏳"
+_GEO_FALLBACK_FLAG = "🌐"
 
 
 # v48b: Региональные indicator-символы для emoji-флагов.
@@ -376,7 +378,7 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
     (IP дублируются у CDN-узлов).
 
     Имя формата: «🇩🇪 DE peppo» (с пробелом перед peppo, как в serialize_working).
-    На fallback (geo недоступно): «🏳 ?? peppo».
+    На fallback (geo недоступно): «🌐 peppo» (v49b: земля вместо "??").
     """
     if not nodes:
         return
@@ -441,7 +443,7 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
     # "🇩🇪 DE peppo". Если НЕ определил (DNS-resolve fail для РФ-доменов на Azure
     # US, или api.ip.sb rate-limit) — извлекаем emoji-флаг из оригинального имени
     # (например "Литва 🇱🇹" → 🇱🇹 → "LT") → итоговое имя "🇱🇹 LT peppo".
-    # Если в имени флага нет → настоящий fallback "🏳 ?? peppo".
+    # Если в имени флага нет → настоящий fallback "🌐 peppo" (v49b).
     renamed_count = 0
     fallback_count = 0
     flag_from_name_count = 0
@@ -467,8 +469,8 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
                 new_name = f"{flag_extracted} {iso_extracted} peppo"
                 flag_from_name_count += 1
             else:
-                # Даже в имени нет флага → настоящий fallback.
-                new_name = f"{_GEO_FALLBACK_FLAG} {_GEO_FALLBACK_CODE} peppo"
+                # Даже в имени нет флага → настоящий fallback "🌐 peppo".
+                new_name = "🌐 peppo"
                 real_fallback_count += 1
             fallback_count += 1
         # set_node_name перестраивает raw_url: для vless/trojan/ss — фрагмент #,
@@ -1142,6 +1144,14 @@ def main(argv: list[str]) -> int:
                         "Узлы с score < --pattern-score-min отбраковываются. "
                         "По умолчанию ON если known_good.txt существует. "
                         "Это ЗАМЕНА xray-ping — не нужен xray, не нужны GHA-минуты.")
+    # v49: --no-pattern-score — выключить pattern-score (как у Pizduk/Aetris/Mifa).
+    # Pattern-score отсекал рабочие конфиги, оставляя только похожие на known_good
+    # (которые могли умереть за пару дней). Без pattern-score проходит ВСЁ canonical-stack.
+    p.add_argument("--no-pattern-score", dest="pattern_score",
+                   action="store_false",
+                   help="Выключить pattern-score. Просто canonical-stack фильтр "
+                        "(как у Pizduk/Aetris/Mifa — берут все публичные конфиги без "
+                        "сужения по known_good). Рекомендуется v49.")
     p.add_argument("--pattern-score-min", type=int, default=25,
                    help="Минимальный score для попадания в финал (default: 25). "
                         "0 = пропустить все (фильтр выключен). "
@@ -1162,6 +1172,19 @@ def main(argv: list[str]) -> int:
                    help="Выключить multi-track. Только known_good match "
                         "(score >= --pattern-score-min). Строго — отсечёт "
                         "AetrisVPN WS+TLS конфиги.")
+    # v49: Разделение финала на БС (мобилка РФ) и ЧС (WiFi / не-RU).
+    # На мобильной сети РФ ТСПУ блокирует ЧС-SNI (instagram, chatgpt, ...).
+    # На WiFi / вне РФ — ЧС-SNI работает (нет ТСПУ). Поэтому делим финал:
+    #   preload_bs.txt  — БС + серый + фейк + none (НЕ ЧС) → для мобилки РФ
+    #   preload_chs.txt — ТОЛЬКО ЧС-SNI → для WiFi / не-RU
+    # subs.txt (в GHA workflow) = preload_bs.txt (base64).
+    p.add_argument("--split-bs-chs", action="store_true", default=True,
+                   help="Разделить финал на 2 файла: preload_bs.txt (БС+серый+фейк+none, "
+                        "для мобилки РФ) и preload_chs.txt (только ЧС-SNI, для WiFi/не-RU). "
+                        "Default: ON. Позволяет юзеру выбрать подписку под сеть.")
+    p.add_argument("--no-split-bs-chs", dest="split_bs_chs",
+                   action="store_false",
+                   help="НЕ разделять на БС/ЧС. Только preload.txt (как в v48).")
     # v23: saved_subs/ — авто-мёрдж (как в локальном GUI по умолчанию).
     # Юзер кладёт свои файлы в data/saved_subs/*.txt через git push,
     # GHA автоматически их подхватывает. --no-saved-subs чтобы выключить.
@@ -1430,6 +1453,42 @@ def main(argv: list[str]) -> int:
         for n in nodes:
             f.write(n.raw_url + "\n")
     log(f"[gha] wrote {len(nodes)} nodes to {args.output}")
+
+    # 8) v49: РАЗДЕЛЕНИЕ на БС (для мобилки РФ) и ЧС (для WiFi / не-RU).
+    #    Идея: на мобильной сети РФ ТСПУ блокирует ЧС-SNI (instagram, chatgpt,
+    #    discord, etc.). На WiFi / вне РФ — ЧС-SNI работает (там нет ТСПУ).
+    #    Поэтому делим финал на 2 списка:
+    #      preload_bs.txt  — БС + серый + фейк + none (НЕ ЧС) → для мобилки РФ
+    #      preload_chs.txt — ТОЛЬКО ЧС-SNI → для WiFi / не-RU
+    #    subs.txt (общий base64) = preload_bs + preload_chs.
+    if args.split_bs_chs:
+        from checkers.sni_category import sni_category as _sni_cat
+        bs_nodes: list[XrayNode] = []  # белый + серый + фейк + none
+        chs_nodes: list[XrayNode] = []  # чёрный
+        for n in nodes:
+            cat = _sni_cat(n)
+            if cat == "black":
+                chs_nodes.append(n)
+            else:
+                bs_nodes.append(n)
+        # preload_bs.txt
+        bs_path = args.output.parent / "preload_bs.txt"
+        with open(bs_path, "w", encoding="utf-8") as f:
+            f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | BS list "
+                    f"(mobile RF) | {len(bs_nodes)} nodes | "
+                    f"sources: {len(sources)}\n")
+            for n in bs_nodes:
+                f.write(n.raw_url + "\n")
+        # preload_chs.txt
+        chs_path = args.output.parent / "preload_chs.txt"
+        with open(chs_path, "w", encoding="utf-8") as f:
+            f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | ChS list "
+                    f"(WiFi / non-RU) | {len(chs_nodes)} nodes | "
+                    f"sources: {len(sources)}\n")
+            for n in chs_nodes:
+                f.write(n.raw_url + "\n")
+        log(f"[gha] SPLIT: BS={len(bs_nodes)} ({bs_path.name}) + "
+            f"ChS={len(chs_nodes)} ({chs_path.name})")
 
     # 6) Короткий JSON-отчёт для отладки и пуша в коммит-сообщение.
     report = {

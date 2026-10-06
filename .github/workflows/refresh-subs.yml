@@ -48,18 +48,10 @@ on:
         description: "Сортировать БС-узлы первыми в финальном списке (НЕ отбрасывает ЧС)"
         type: boolean
         default: true
-      pattern_score_min:
-        description: "Минимальный pattern-score. 25 = known_good-matched (default), 0 = все canonical-stack"
-        type: string
-        default: "25"
-      canonical_stack:
-        description: "Canonical-stack multi-track (пропускает vless+tls+ws и т.д. БЕЗ known_good). Default OFF"
-        type: boolean
-        default: false
       max_servers:
-        description: "ФИНАЛЬНЫЙ лимит узлов в подписке. 100 = стандарт, 500 = щедро"
+        description: "ФИНАЛЬНЫЙ лимит узлов. 100 = стандарт, 200 = щедро (default v49), 0 = без лимита"
         type: string
-        default: "100"
+        default: "200"
 
 # Чтобы не было параллельных запусков (старый коммит затрёт новый).
 concurrency:
@@ -118,14 +110,16 @@ jobs:
           echo "=== data/tg_subs.txt ==="
           cat data/tg_subs.txt 2>/dev/null || echo "(not generated — see logs above)"
 
-      - name: Refresh subs (fetch + parse + dedup + ping + pattern-score + geo-rename)
-        # v48: Вернул --geo-rename (v47 убрал, но юзер хочет "peppo" формат).
-        # Логика (v46 fallback в refresh_subs.py):
-        #   - Если api.ip.sb/geoip вернул страну → "🇩🇪 DE peppo"
-        #   - Если DNS-resolve fail ИЛИ api.ip.sb fallback → оригинальное имя
-        #     из подписки (например "Франция 🇫🇷" из AetrisVPN) — узнаваемо.
-        # Проблема Azure US: DNS-resolve для РФ-доменов (test-cdn-kkk.com)
-        # часто fail — эти узлы получат оригинальные имена (не "?? peppo").
+      - name: Refresh subs (fetch + parse + dedup + ping + canonical-stack + geo-rename + split БС/ЧС)
+        # v49: Упростил как у Pizduk/Aetris/Mifa — НЕТ pattern-score.
+        # Просто canonical-stack filter (vless+reality / vless+tls+ws /
+        # trojan+tls+ws / vmess+tls+ws / hy2 / tuic). Pattern-score отсекал
+        # рабочие конфиги, оставляя только похожие на known_good (которые
+        # могли умереть за пару дней).
+        # v49: Разделяем финал на 2 списка по SNI-категории:
+        #   preload_bs.txt  — БС + серый + фейк + none → для мобилки РФ
+        #   preload_chs.txt — только ЧС SNI → для WiFi / не-RU
+        # subs.txt (общий base64) = preload_bs.txt (т.к. юзер в РФ на мобилке).
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -146,15 +140,19 @@ jobs:
             --geo-rename-timeout 8.0 \
             --known-good data/known_good.txt \
             --known-good-mode none \
-            --pattern-score \
-            --pattern-score-min ${{ inputs.pattern_score_min || '25' }} \
-            ${{ inputs.canonical_stack == true && '--allow-canonical-stack' || '--no-canonical-stack' }} \
+            --no-pattern-score \
+            --allow-canonical-stack \
+            --split-bs-chs \
             ${{ inputs.tspu_sim == true && '--tspu-sim' || '' }} \
-            --max-servers ${{ inputs.max_servers || '100' }}
-          # Генерируем subs.txt напрямую из preload.txt (base64 encode).
-          echo "[gha] generating subs.txt from preload.txt (base64)..."
-          cat data/preload.txt | base64 -w 0 > subs.txt
-          echo "[gha] subs.txt: $(wc -c < subs.txt) bytes ($(wc -l < data/preload.txt) configs)"
+            --max-servers ${{ inputs.max_servers || '200' }}
+          # Генерируем subs.txt = preload_bs.txt (БС для мобилки РФ).
+          echo "[gha] generating subs.txt (БС base64)..."
+          cat data/preload_bs.txt | base64 -w 0 > subs.txt
+          echo "[gha] subs.txt (БС): $(wc -c < subs.txt) bytes ($(wc -l < data/preload_bs.txt) configs)"
+          # subs_chs.txt = preload_chs.txt (ЧС для WiFi/не-RU).
+          echo "[gha] generating subs_chs.txt (ЧС base64)..."
+          cat data/preload_chs.txt | base64 -w 0 > subs_chs.txt
+          echo "[gha] subs_chs.txt (ЧС): $(wc -c < subs_chs.txt) bytes ($(wc -l < data/preload_chs.txt) configs)"
 
       - name: Show stats
         if: always()
@@ -179,12 +177,14 @@ jobs:
         # - preload_working.txt (full_test output)
         # - preload_report_full.json (full_test report)
         # - speedtest_report.json (speedtest report)
-        # Эти файлы больше не генерируются в v47, но могут остаться в репо.
+        # v49b: Удаляем subs_all.txt (юзер сказал убрать — только ЧС и БС).
+        # Эти файлы больше не генерируются, но могут остаться в репо.
         # Удаляем, чтобы git-auto-commit не упал на "no changes".
         run: |
           rm -f data/preload_speed.txt data/preload_working.txt \
-                data/preload_report_full.json data/speedtest_report.json 2>/dev/null || true
-          echo "[gha] cleaned up old artifacts (v47+)"
+                data/preload_report_full.json data/speedtest_report.json \
+                subs_all.txt 2>/dev/null || true
+          echo "[gha] cleaned up old artifacts (v47+, v49b: subs_all.txt)"
           # v48c: Force-add data/tg_subs.txt — иначе git-auto-commit-action
           # НЕ видит его (.gitignore содержит data/*). Даже после добавления
           # исключения в .gitignore, нужен git add -f для первого коммита.

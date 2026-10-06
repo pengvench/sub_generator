@@ -61,7 +61,7 @@ from runtime.collect import collect_subscription_nodes  # noqa: E402
 # ---------------------------------------------------------------------- helpers
 def _read_sources(sources_file: Path, extra: list[str],
                   *, saved_subs_dir: Path | None = None,
-                  use_saved_subs: bool = True) -> list[str]:
+                  use_saved_subs: bool = True) -> tuple[list[str], dict[str, str]]:
     """Прочитать URL'ы подписок из файла + доп. аргументы CLI + saved_subs/.
 
     Поведение зеркалит локальное приложение (sources_page.get_sources):
@@ -75,11 +75,20 @@ def _read_sources(sources_file: Path, extra: list[str],
     git push (GHA не имеет доступа к локальному C:\\... на машине юзера).
 
     Файл README.txt в saved_subs/ игнорируется (как и в локальном app).
+
+    v60: Возвращает (sources, source_tags) где source_tags — dict[url] = "bs"|"chs"|"mixed".
+    Источники РАЗДЕЛЕНЫ на 3 секции в sources.txt:
+      # === БС === — БС-списки (мобилка РФ)
+      # === ЧС === — ЧС-списки (WiFi / не-RU)
+      # === MIXED === — без явного маркера (по умолчанию БС)
+    Каждый URL помечается по секции, в которой он находится.
     """
     sources: list[str] = []
+    source_tags: dict[str, str] = {}  # url → "bs" / "chs" / "mixed"
     seen: set[str] = set()
+    current_section = "mixed"  # default — MIXED секция (БС по умолчанию)
 
-    def add(value: str) -> None:
+    def add(value: str, tag: str = "mixed") -> None:
         value = (value or "").strip()
         if not value or value.startswith("#"):
             return
@@ -88,25 +97,33 @@ def _read_sources(sources_file: Path, extra: list[str],
         if value not in seen:
             seen.add(value)
             sources.append(value)
+            source_tags[value] = tag
 
     if sources_file.exists():
         for line in sources_file.read_text(encoding="utf-8").splitlines():
-            add(line)
+            stripped = line.strip()
+            # v60: Парсер секций. Когда видим "# === БС ===" — переключаемся.
+            if stripped.startswith("# ==="):
+                upper = stripped.upper()
+                if "БС" in upper or "БЕЛЫЙ" in upper or "BS" in upper or "WHITE" in upper:
+                    current_section = "bs"
+                elif "ЧС" in upper or "ЧЁРНЫЙ" in upper or "CHS" in upper or "BLACK" in upper:
+                    current_section = "chs"
+                elif "MIXED" in upper:
+                    current_section = "mixed"
+                # Строку-разделитель пропускаем (не URL).
+                continue
+            add(stripped, current_section)
     for value in extra or []:
-        add(value)
+        add(value, "mixed")  # CLI args — без секции (mixed = БС по умолчанию).
 
-    # Авто-мёрдж data/saved_subs/*.txt + *.json — как в локальном app
-    # (sources_page._use_saved_subs = True по умолчанию). Файлы в saved_subs
-    # могут содержать либо прямые vless:// (по строке), либо JSON-массив
-    # объектов Xray/Hiddify — оба формата _subscription_lines понимает.
+    # Авто-мёрдж data/saved_subs/*.txt + *.json — как в локальном app.
     if use_saved_subs and saved_subs_dir is not None and saved_subs_dir.is_dir():
         for f in sorted(saved_subs_dir.glob("*.txt")) + sorted(saved_subs_dir.glob("*.json")):
             if f.name == "README.txt":
                 continue
-            # Передаём абсолютный путь — _fetch_text проверит Path.exists()
-            # и прочитает файл напрямую (без HTTP-запроса).
-            add(str(f.resolve()))
-    return sources
+            add(str(f.resolve()), "mixed")  # saved_subs — mixed (БС по умолчанию).
+    return sources, source_tags
 
 
 # RFC 1035: метка DNS-имени — 1..63 символа, всё имя — 1..253 символа.
@@ -1354,6 +1371,10 @@ def main(argv: list[str]) -> int:
     p.add_argument("--no-drop-geo-fallback", dest="drop_geo_fallback",
                    action="store_false",
                    help="НЕ отбрасывать '🌐 peppo' узлы (оставить в финале).")
+    # v60: --vless-only — собирать ТОЛЬКО vless:// конфиги (отсев trojan/ss/vmess/hy2/tuic).
+    p.add_argument("--vless-only", action="store_true", default=False,
+                   help="Собирать ТОЛЬКО vless:// конфиги. Все trojan/ss/vmess/"
+                        "hysteria2/tuic отбрасываются. Default: OFF (все протоколы).")
     # v23: saved_subs/ — авто-мёрдж (как в локальном GUI по умолчанию).
     # Юзер кладёт свои файлы в data/saved_subs/*.txt через git push,
     # GHA автоматически их подхватывает. --no-saved-subs чтобы выключить.
@@ -1395,16 +1416,17 @@ def main(argv: list[str]) -> int:
                     f"merged {len(extra_sources)} URL(s)")
         except OSError as exc:
             log(f"[gha] extra-sources-file read failed: {exc}")
-    sources = _read_sources(args.sources_file, args.sources + extra_sources,
-                            saved_subs_dir=saved_subs_dir,
-                            use_saved_subs=not args.no_saved_subs)
+    sources, source_tags = _read_sources(args.sources_file, args.sources + extra_sources,
+                                          saved_subs_dir=saved_subs_dir,
+                                          use_saved_subs=not args.no_saved_subs)
     if not sources:
         log("[gha] FATAL: sources list is empty")
         return 1
-    log(f"[gha] sources: {len(sources)} (from {args.sources_file} + CLI"
-        + (f" + {args.saved_subs_dir}" if not args.no_saved_subs
-           and args.saved_subs_dir.is_dir() else "")
-        + ")")
+    # v60: Логируем классификацию источников по секциям.
+    bs_count = sum(1 for t in source_tags.values() if t == "bs")
+    chs_count = sum(1 for t in source_tags.values() if t == "chs")
+    mixed_count = sum(1 for t in source_tags.values() if t == "mixed")
+    log(f"[gha] sources: {len(sources)} (BS={bs_count}, ChS={chs_count}, MIXED={mixed_count})")
     # Логируем сколько saved_subs-файлов подхвачено (для отладки).
     if not args.no_saved_subs and args.saved_subs_dir.is_dir():
         saved_files = [f.name for f in
@@ -1426,18 +1448,90 @@ def main(argv: list[str]) -> int:
             failed_sources.append(url)
 
     try:
+        # v61: on_source_body callback — проверяем ТЕЛО подписки на БС/ЧС.
+        # Часто первая строка "#profile-title: AetrisVPN White list" указывает
+        # тип списка, даже если в URL нет "white"/"black".
+        body_tags: dict[str, str] = {}  # url → "bs"/"chs" (from body keywords)
+        def _on_body(url: str, body: str) -> None:
+            # Проверяем первые ~20 строк тела на ключевые слова БС/ЧС.
+            head = body[:5000].lower()  # первые 5KB — обычно хватает
+            has_white = any(w in head for w in (
+                "white", "бс", "белый", "белые", "whitelist", "беловой"
+            ))
+            has_black = any(w in head for w in (
+                "black", "чс", "чёрный", "чёрные", "blacklist", "чёрной"
+            ))
+            if has_white and not has_black:
+                body_tags[url] = "bs"
+            elif has_black and not has_white:
+                body_tags[url] = "chs"
+
         nodes = collect_subscription_nodes(
             sources,
             timeout=args.fetch_timeout,
-            max_servers=0,  # режем лимит сами (после ping, чтобы не выкинуть живых)
+            max_servers=0,
             log_sink=log,
             on_source_result=on_result,
+            on_source_body=_on_body,
         )
     except Exception as exc:
         log(f"[gha] FATAL: collect_subscription_nodes crashed: {type(exc).__name__}: {exc}")
         return 1
 
+    # v61: Обновить source_tags на основе body-анализа (override URL-based tag).
+    body_overrides = 0
+    for url, body_tag in body_tags.items():
+        url_tag = source_tags.get(url, "mixed")
+        if url_tag != body_tag and body_tag != "mixed":
+            source_tags[url] = body_tag
+            body_overrides += 1
+    if body_overrides:
+        log(f"[gha] body-analysis: {body_overrides} sources reclassified "
+            f"(БС/ЧС по содержимому подписки, не по URL)")
+
+    # v61: Присваиваем каждому узлу его tag (bs/chs/mixed) из source_tags.
+    tagged_count = 0
+    for n in nodes:
+        src_url = n.source_url or ""
+        tag = source_tags.get(src_url, "mixed")
+        if tag == "mixed" and src_url:
+            for s, t in source_tags.items():
+                if s == src_url or src_url.startswith(s.split("#")[0]):
+                    tag = t
+                    break
+        if not n.extra:
+            n.extra = {}
+        n.extra["bs_chs"] = tag
+        tagged_count += 1
+    log(f"[gha] tagged {tagged_count} nodes with bs/chs/mixed from sources.txt + body")
+
     log(f"[gha] collected {len(nodes)} unique nodes (failed sources: {len(failed_sources)})")
+
+    # v61: Debug stats — сколько конфигов дал каждый источник (топ-10).
+    source_node_counts: dict[str, int] = {}
+    for n in nodes:
+        src = n.source_url or "?"
+        # Сокращаем URL для читаемости.
+        short = src.split("/")[-1] if "/" in src else src[:40]
+        source_node_counts[short] = source_node_counts.get(short, 0) + 1
+    if source_node_counts:
+        top_sources = sorted(source_node_counts.items(),
+                             key=lambda x: -x[1])[:10]
+        log(f"[gha] source stats (top 10 by node count):")
+        for name, count in top_sources:
+            log(f"[gha]   {count:6d} configs  ← {name}")
+
+    # v60: --vless-only — отсев НЕ-vless конфигов (trojan/ss/vmess/hy2/tuic).
+    # Применяется ПОСЛЕ collect, ДО ping (чтобы не пинговать то, что всё равно отбросим).
+    if args.vless_only:
+        before_vless = len(nodes)
+        nodes = [n for n in nodes if (n.protocol or "").lower() == "vless"]
+        dropped_vless = before_vless - len(nodes)
+        log(f"[gha] --vless-only: dropped {dropped_vless} non-vless nodes "
+            f"(trojan/ss/vmess/hy2/tuic). Before: {before_vless}, after: {len(nodes)}")
+        if not nodes:
+            log("[gha] WARNING: 0 vless nodes after filter — preload.txt NOT written")
+            return 1
 
     # 3) SNI-категоризация (БС/ЧС/серый/фейк/none) И опциональная фильтрация.
     #    ВАЖНО: SNI-фильтр/сорт идёт ДО TCP-ping, чтобы:
@@ -1608,24 +1702,44 @@ def main(argv: list[str]) -> int:
     # — мертвые". Это происходит ПОСЛЕ geo-rename, но ДО --max-servers.
     if args.drop_geo_fallback and nodes:
         before_count = len(nodes)
-        # "🌐 peppo" — это fallback имя. Если node.name == "🌐 peppo" — отбрасываем.
         nodes = [n for n in nodes if n.name != "🌐 peppo"]
         dropped = before_count - len(nodes)
         log(f"[gha] --drop-geo-fallback: dropped {dropped} '🌐 peppo' nodes "
             f"(geo-rename не нашёл страну). Before: {before_count}, after: {len(nodes)}")
 
-    # 7) v44: ЛИМИТ ИТОГОВЫХ УЗЛОВ — в самом конце, ПОСЛЕ всех фильтров.
-    #    Раньше стоял ПЕРЕД known_good + pattern-score → обрезал alive-список
-    #    до known_good, теряя рабочий материал. Теперь обрезает только финал:
-    #    топ-N по pattern-score (после known_good-match first, потом canonical).
-    if args.max_servers > 0 and len(nodes) > args.max_servers:
-        log(f"[gha] FINAL truncate: {len(nodes)} → {args.max_servers} (--max-servers)")
-        nodes = nodes[:args.max_servers]
+    # v60: SPLIT БС/ЧС СРАЗУ (до --max-servers!). Каждый список обрезается
+    # независимо. Юзер: "сначала обрезал до 200 и только потом ЧС — это
+    # не последовательно". Теперь: сначала разделили БС/ЧС, потом обрезали.
+    bs_nodes: list[XrayNode] = []
+    chs_nodes: list[XrayNode] = []
+    if args.split_bs_chs:
+        for n in nodes:
+            tag = (n.extra or {}).get("bs_chs", "mixed")
+            if tag == "chs":
+                chs_nodes.append(n)
+            else:  # "bs" или "mixed" → БС (по умолчанию)
+                bs_nodes.append(n)
+        log(f"[gha] SPLIT (before max-servers): BS={len(bs_nodes)}, "
+            f"ChS={len(chs_nodes)}, total={len(nodes)}")
+        # --max-servers применяется к БС отдельно (ЧС — без лимита, всё в финал).
+        if args.max_servers > 0 and len(bs_nodes) > args.max_servers:
+            log(f"[gha] BS truncate: {len(bs_nodes)} → {args.max_servers} (--max-servers)")
+            bs_nodes = bs_nodes[:args.max_servers]
+        else:
+            log(f"[gha] BS list: {len(bs_nodes)} nodes (no max-servers limit)")
+        # ЧС — без лимита (все узлы попадают в финал, их обычно мало).
+        log(f"[gha] ChS list: {len(chs_nodes)} nodes (no limit)")
+        # Финальный nodes = bs + chs (для preload.txt = общий список).
+        nodes = bs_nodes + chs_nodes
     else:
-        log(f"[gha] FINAL list: {len(nodes)} nodes (no --max-servers limit)")
+        # Без split — как раньше, --max-servers к общему списку.
+        if args.max_servers > 0 and len(nodes) > args.max_servers:
+            log(f"[gha] FINAL truncate: {len(nodes)} → {args.max_servers} (--max-servers)")
+            nodes = nodes[:args.max_servers]
+        else:
+            log(f"[gha] FINAL list: {len(nodes)} nodes (no --max-servers limit)")
 
-    # 7) Записываем preload.txt (по строке на узел — то, что sub_generator уже
-    #    умеет читать как «рабочие конфиги» через _extract_configs в ImportPage).
+    # Записываем preload.txt (общий список = bs + chs).
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | {len(nodes)} nodes | "
@@ -1634,47 +1748,8 @@ def main(argv: list[str]) -> int:
             f.write(n.raw_url + "\n")
     log(f"[gha] wrote {len(nodes)} nodes to {args.output}")
 
-    # 8) v49: РАЗДЕЛЕНИЕ на БС (для мобилки РФ) и ЧС (для WiFi / не-RU).
-    #    Идея: на мобильной сети РФ ТСПУ блокирует ЧС-SNI (instagram, chatgpt,
-    #    discord, etc.). На WiFi / вне РФ — ЧС-SNI работает (там нет ТСПУ).
-    #    Поэтому делим финал на 2 списка:
-    #      preload_bs.txt  — БС + серый + фейк + none (НЕ ЧС) → для мобилки РФ
-    #      preload_chs.txt — ТОЛЬКО ЧС-SNI → для WiFi / не-RU
-    #    subs.txt (общий base64) = preload_bs + preload_chs.
+    # v60: Записываем preload_bs.txt + preload_chs.txt (раздельные списки).
     if args.split_bs_chs:
-        from checkers.sni_category import sni_category as _sni_cat
-        # v59: Классификация БС/ЧС по ИМЕНИ источника (source_url узла),
-        # не только по SNI. Если source_url содержит "black"/"BLACK" — это
-        # ЧС-список (для WiFi), "white"/"WHITE" — БС-список (для РФ-мобилки).
-        # Иначе fallback на SNI-категорию (как раньше).
-        bs_nodes: list[XrayNode] = []
-        chs_nodes: list[XrayNode] = []
-        source_classified_count = 0
-        sni_classified_count = 0
-        for n in nodes:
-            src = (n.source_url or "").lower()
-            # Проверяем, содержит ли source_url слова "black" / "white"
-            is_black_source = any(w in src for w in (
-                "black", "чс", "чёрный", "bypass", "obhod", "обход"
-            )) and "white" not in src and "бс" not in src
-            is_white_source = any(w in src for w in (
-                "white", "бс", "белый", "беловой"
-            )) and "black" not in src and "чс" not in src
-            if is_black_source and not is_white_source:
-                chs_nodes.append(n)
-                source_classified_count += 1
-            elif is_white_source and not is_black_source:
-                bs_nodes.append(n)
-                source_classified_count += 1
-            else:
-                # Fallback на SNI-категорию (как раньше).
-                cat = _sni_cat(n)
-                if cat == "black":
-                    chs_nodes.append(n)
-                else:
-                    bs_nodes.append(n)
-                sni_classified_count += 1
-        # preload_bs.txt
         bs_path = args.output.parent / "preload_bs.txt"
         with open(bs_path, "w", encoding="utf-8") as f:
             f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | BS list "
@@ -1682,9 +1757,6 @@ def main(argv: list[str]) -> int:
                     f"sources: {len(sources)}\n")
             for n in bs_nodes:
                 f.write(n.raw_url + "\n")
-        # v59: preload_chs.txt — ПУСТОЙ если 0 узлов (без комментария!).
-        # Раньше писали комментарий "# ..." в base64 → v2rayN падал с
-        # "v2ray unsupport format: [://] was not found" при импорте.
         chs_path = args.output.parent / "preload_chs.txt"
         if chs_nodes:
             with open(chs_path, "w", encoding="utf-8") as f:
@@ -1694,12 +1766,9 @@ def main(argv: list[str]) -> int:
                 for n in chs_nodes:
                     f.write(n.raw_url + "\n")
         else:
-            # ПУСТОЙ файл (0 bytes) — base64 = пустая строка, v2rayN не падает.
-            chs_path.write_text("", encoding="utf-8")
-        log(f"[gha] SPLIT: BS={len(bs_nodes)} ({bs_path.name}) + "
-            f"ChS={len(chs_nodes)} ({chs_path.name}) "
-            f"(source-classified: {source_classified_count}, "
-            f"sni-classified: {sni_classified_count})")
+            chs_path.write_text("", encoding="utf-8")  # ПУСТОЙ — fix v2rayN
+        log(f"[gha] SPLIT files: BS={len(bs_nodes)} ({bs_path.name}) + "
+            f"ChS={len(chs_nodes)} ({chs_path.name})")
 
     # 6) Короткий JSON-отчёт для отладки и пуша в коммит-сообщение.
     report = {

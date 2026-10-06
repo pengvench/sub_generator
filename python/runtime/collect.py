@@ -100,6 +100,7 @@ def _collect_from_source(
     per_source_limit: int,
     log_sink: Callable[[str], None] | None,
     on_source_result: Callable[[str, bool], None] | None,
+    on_source_body: Callable[[str, str], None] | None = None,
 ) -> list[XrayNode]:
     # HARD FIX: If source_url is a direct config (vless://, vmess://, etc),
     # parse it directly via parse_node_link instead of fetching as HTTP URL.
@@ -136,6 +137,15 @@ def _collect_from_source(
         if on_source_result is not None:
             on_source_result(source_url, ok=False)
         return []
+
+    # v61: on_source_body callback — даём вызывающему коду доступ к ТЕЛУ
+    # подписки. refresh_subs.py использует это для проверки БС/ЧС по содержимому
+    # (не только по URL). Часто первая строка "#profile-title: AetrisVPN White list".
+    if on_source_body is not None and text:
+        try:
+            on_source_body(source_url, text)
+        except Exception:
+            pass  # callback не должен ронять collect
 
     source_nodes: list[XrayNode] = []
     source_added = 0
@@ -186,6 +196,7 @@ def collect_subscription_nodes(
     max_servers: int,
     log_sink: Callable[[str], None] | None = None,
     on_source_result: Callable[[str, bool], None] | None = None,
+    on_source_body: Callable[[str, str], None] | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel_event: threading.Event | None = None,
     pause_event: threading.Event | None = None,
@@ -222,6 +233,7 @@ def collect_subscription_nodes(
                     per_source_limit=per_source_limit,
                     log_sink=log_sink,
                     on_source_result=on_source_result,
+                    on_source_body=on_source_body,
                 )
             )
             completed += 1
@@ -237,6 +249,7 @@ def collect_subscription_nodes(
                     per_source_limit=per_source_limit,
                     log_sink=log_sink,
                     on_source_result=on_source_result,
+                    on_source_body=on_source_body,
                 ): source_url
                 for source_url in source_urls
             }

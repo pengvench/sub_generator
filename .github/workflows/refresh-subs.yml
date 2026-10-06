@@ -44,6 +44,14 @@ on:
         description: "Сортировать БС-узлы первыми в финальном списке (внутри subs_bs.txt)"
         type: boolean
         default: true
+      vless_only:
+        description: "Собирать ТОЛЬКО vless:// конфиги (отсев trojan/ss/vmess/hy2/tuic). Default OFF"
+        type: boolean
+        default: false
+      drop_geo_fallback:
+        description: "Отбрасывать узлы с именем '🌐 peppo' (geo-rename не нашёл страну). Default ON"
+        type: boolean
+        default: true
       max_servers:
         description: "ФИНАЛЬНЫЙ лимит узлов. 100 = стандарт, 200 = щедро (default v49), 0 = без лимита"
         type: string
@@ -140,7 +148,8 @@ jobs:
             --no-pattern-score \
             --allow-canonical-stack \
             --split-bs-chs \
-            --drop-geo-fallback \
+            ${{ inputs.vless_only == true && '--vless-only' || '' }} \
+            ${{ inputs.drop_geo_fallback == true && '--drop-geo-fallback' || '--no-drop-geo-fallback' }} \
             --max-servers ${{ inputs.max_servers || '200' }}
           # Генерируем subs.txt = preload_bs.txt (БС для мобилки РФ).
           echo "[gha] generating subs.txt (БС base64)..."
@@ -168,34 +177,34 @@ jobs:
           echo "=== preload_report.json ==="
           cat data/preload_report.json 2>/dev/null || true
 
-      - name: Cleanup old artifacts (v47)
-        # v47: Удаляем устаревшие файлы от прошлых версий (v40-v45):
-        # - preload_speed.txt (speedtest output)
-        # - preload_working.txt (full_test output)
-        # - preload_report_full.json (full_test report)
-        # - speedtest_report.json (speedtest report)
-        # v49b: Удаляем subs_all.txt (юзер сказал убрать — только ЧС и БС).
-        # Эти файлы больше не генерируются, но могут остаться в репо.
-        # Удаляем, чтобы git-auto-commit не упал на "no changes".
+      - name: Cleanup + force-add (v61)
+        # v61: ВЕРНУЛ cleanup + force-add (юзер: "если нужно то делай").
+        # cleanup удаляет устаревшие файлы (preload_speed.txt и т.д.)
+        # force-add нужен — .gitignore содержит data/*, без git add -f
+        # новые файлы (preload_bs.txt, preload_chs.txt, tg_subs.txt)
+        # НЕ коммитятся git-auto-commit-action'ом.
         run: |
+          # Удаляем устаревшие файлы от прошлых версий.
           rm -f data/preload_speed.txt data/preload_working.txt \
                 data/preload_report_full.json data/speedtest_report.json \
                 subs_all.txt 2>/dev/null || true
-          echo "[gha] cleaned up old artifacts (v47+, v49b: subs_all.txt)"
-          # v58: Гарантируем существование subs_chs.txt — если refresh_subs
-          # упал на split_bs_chs, subs_chs.txt НЕ создаётся, и git-auto-commit
-          # падает на "pathspec did not match". Создаём пустой файл-заглушку.
+          echo "[gha] cleaned up old artifacts"
+          # Гарантируем существование subs_chs.txt (если split failed).
           if [ ! -f subs_chs.txt ]; then
-            echo "# empty ChS (split failed)" | base64 -w 0 > subs_chs.txt
-            echo "[gha] created empty subs_chs.txt (split failed in refresh_subs)"
+            > subs_chs.txt
           fi
-          # v48c: Force-add data/tg_subs.txt — иначе git-auto-commit-action
-          # НЕ видит его (.gitignore содержит data/*). Даже после добавления
-          # исключения в .gitignore, нужен git add -f для первого коммита.
-          if [ -f data/tg_subs.txt ]; then
-            git add -f data/tg_subs.txt 2>/dev/null || true
-            echo "[gha] force-added data/tg_subs.txt"
-          fi
+          # Force-add data/ файлы — .gitignore содержит data/*, без -f
+          # git-auto-commit НЕ видит preload_bs.txt, preload_chs.txt, tg_subs.txt.
+          for f in data/tg_subs.txt data/preload_bs.txt data/preload_chs.txt \
+                   data/preload.txt data/preload_report.json \
+                   data/sni_whitelist.txt data/cidr_whitelist.txt \
+                   data/sni_whitelist_custom.txt data/known_good.txt \
+                   data/sources.txt; do
+            if [ -f "$f" ]; then
+              git add -f "$f" 2>/dev/null || true
+            fi
+          done
+          echo "[gha] force-added data/ files (bypass .gitignore data/* rule)"
 
       - name: Commit & push if changed
         uses: stefanzweifel/git-auto-commit-action@v5

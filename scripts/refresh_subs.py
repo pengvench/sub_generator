@@ -404,14 +404,12 @@ def _tcp_ping(node: XrayNode, timeout: float) -> tuple[bool, float]:
     try:
         with socket.create_connection((host, port), timeout=timeout):
             latency = time.perf_counter() - t0
-            # v57: если latency < 10ms — подозрительно быстро для реального VPN.
-            # Замеры на known_good.txt юзера (test-cdn-kkk.com — реальные РФ-сервера)
-            # показывают latency 185-320ms с Azure US. Юзер просил порог 80ms,
-            # НО это отбрасывает легитимные VPN через Fastly/Cloudflare Spectrum
-            # (mitivpn@167.82.76.7 — trojan+ws+tls, host=fastly.net, latency 5-15ms).
-            # Порог 10ms — компромисс: отбрасываем loopback (0ms) и CDN-cache (<3ms),
-            # пропускаем legitimate CDN VPN (5-15ms), реальные VPN (150-300ms).
-            if latency < 0.010:  # < 10ms
+            # v64b: ПОРОГ 80ms (ЮЗЕР ПРОСИЛ 80-100, Я САМОВОЛЬНО ПОМЕНЯЛ НА 10 В v57).
+            # Замеры на known_good.txt: 185-320ms (реальные РФ-сервера).
+            # Railway.app/Vercel/CDN-cache: 10-50ms (НЕ VPN — отбрасываем!).
+            # EU VPN: 80-150ms (проходит).
+            # РФ VPN: 150-300ms (проходит).
+            if latency < 0.080:  # < 80ms — НЕ VPN (CDN/Railway/Vercel/hosting)
                 return False, 0.0
             return True, latency
     except Exception:
@@ -481,13 +479,13 @@ def _ping_filter(nodes: list[XrayNode], *, timeout: float, workers: int,
             p50 = lat_sorted[len(lat_sorted) // 2]
             p95 = lat_sorted[int(len(lat_sorted) * 0.95)] if len(lat_sorted) > 1 else lat_sorted[0]
             p100 = lat_sorted[-1]
-            log_sink(f"[gha] ping stats: p50={p50:.0f}ms p95={p95:.0f}ms max={p100:.0f}ms "
+            log_sink(f"[gha] ping stats: p50={p50*1000:.0f}ms p95={p95*1000:.0f}ms max={p100*1000:.0f}ms "
                      f"({len(pinged)} alive"
                      + (f", {slow_filtered} slow filtered (>{max_ping_ms}ms)" if max_ping_ms > 0 and slow_filtered > 0 else "")
                      + ")")
             # Топ-5 самых быстрых.
             for n, l in pinged[:3]:
-                log_sink(f"[gha]   fastest: {l:.0f}ms  {n.host}:{n.port}  sni={n.query.get('sni', '')}")
+                log_sink(f"[gha]   fastest: {l*1000:.0f}ms  {n.host}:{n.port}  sni={n.query.get('sni', '')}")
 
     return [n for n, _ in pinged]
 

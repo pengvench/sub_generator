@@ -1,21 +1,10 @@
 {
-  "timestamp": 1791300139,
-  "total_sources": 323,
+  "timestamp": 1791306306,
+  "total_sources": 317,
   "failed_sources": [
-    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
-    "https://raw.githubusercontent.com/dequar/deqwl/main/vless_checked.txt",
-    "https://obwl.vercel.app/sub.txt",
-    "https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt",
-    "https://obwl.obprojects.lol/sub.txt",
-    "https://raw.githubusercontent.com/EtoNeYaProject/etoneyaproject.github.io/refs/heads/main/whitelist",
-    "https://raw.githubusercontent.com/vsevjik/OBWLautoupd/refs/heads/main/ru_vless_reality.txt#OBWL",
-    "https://etoneya.su/whitelist",
-    "https://etoneya.su/other",
-    "https://etoneya.su/gemini",
-    "https://etoneya.su/youtube",
-    "https://etoneya.su/ytm"
+    "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL"
   ],
-  "nodes_collected": 200,
+  "nodes_collected": 587,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

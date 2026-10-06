@@ -1,6 +1,6 @@
 {
-  "timestamp": 1791295520,
-  "total_sources": 334,
+  "timestamp": 1791300139,
+  "total_sources": 323,
   "failed_sources": [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
     "https://raw.githubusercontent.com/dequar/deqwl/main/vless_checked.txt",
@@ -9,11 +9,11 @@
     "https://obwl.obprojects.lol/sub.txt",
     "https://raw.githubusercontent.com/EtoNeYaProject/etoneyaproject.github.io/refs/heads/main/whitelist",
     "https://raw.githubusercontent.com/vsevjik/OBWLautoupd/refs/heads/main/ru_vless_reality.txt#OBWL",
-    "https://etoneya.su/other",
     "https://etoneya.su/whitelist",
+    "https://etoneya.su/other",
     "https://etoneya.su/gemini",
-    "https://etoneya.su/ytm",
-    "https://etoneya.su/youtube"
+    "https://etoneya.su/youtube",
+    "https://etoneya.su/ytm"
   ],
   "nodes_collected": 200,
   "ping_filter_applied": true,

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -47,17 +48,41 @@ from runtime.parse import parse_node_link, _node_links_from_text
 from runtime.types import XrayNode
 from singbox_convert import sing_box_full_config
 
-# v73: Тестовые URL — ЗАБЛОКИРОВАННЫЕ в РФ сайты.
-# Если прокси может открыть Instagram/YouTube/TG → реально рабочий.
-# gstatic.com/cloudflare слишком лёгкие (0 bytes HEAD) — проходят даже
-# перегруженные/полумёртвые серверы. Реальные сайты требуют полный TLS +
-# HTTP response → отсеивает "handshake OK но traffic dead".
-_TEST_URLS = [
-    "https://www.instagram.com/",           # Instagram — заблокирован в РФ
-    "https://www.youtube.com/",             # YouTube — замедлен в РФ
-    "https://api.telegram.org/",            # Telegram API — заблокирован в РФ
-    "https://www.gstatic.com/generate_204",  # Fallback (лёгкий, если все тяжёлые упали)
+# v75: Все 5 сервисов тестируются ПАРАЛЛЕЛЬНО через ThreadPoolExecutor.
+# Если ЛЮБОЙ из Instagram/YouTube/Telegram ответил 2xx/3xx → ALIVE.
+# api.ipify.org + ifconfig.me — для проверки exit IP (если оба упали,
+# но реальные сервисы работают → всё равно ALIVE).
+#
+# Почему ПАРАЛЛЕЛЬНО: в v74 api.ipify.org был ЖЁСТКИМ ГЕЙТОМ — если curl
+# не мог установить SOCKS5-соединение (TLS handshake fail на Azure US для
+# vless+reality с устаревшим pbk/sid/sni), узел сразу помечался DEAD
+# без проверки Instagram/YouTube. Это убивало реальные рабочие конфиги
+# (e.g. hysteria2 — рабочий, но если бы ipify не отвечал, был бы убит).
+#
+#Latency = MIN(успешных сервисов) — отражает реальную скорость прокси.
+_TEST_SPECS = [
+    # (key, url, return_body)
+    ("ipify",      "https://api.ipify.org",       True),   # exit IP (primary)
+    ("ifconfig",   "https://ifconfig.me/ip",     True),   # exit IP (fallback)
+    ("instagram",  "https://www.instagram.com/", False),  # заблокирован в РФ
+    ("youtube",    "https://www.youtube.com/",   False),  # замедлен в РФ
+    ("telegram",   "https://api.telegram.org/",  False),  # заблокирован в РФ
 ]
+
+_IPV4_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+
+# v75: ASN организация → класс exit IP. Если выход через облако (AWS/Azure/GCP)
+# → скорее всего будет мёртв на РФ мобилке (облачные IP часто блокируются TSPU
+# или не имеют нужных SNI-трюков). Если через хостинг (Hetzner/OVH/M247) →
+# скорее работает. Эта информация НЕ убивает узел — только помечается в отчёте.
+_ASN_BAD_PATTERNS = (
+    "amazon", "aws", "microsoft", "azure", "google", "gcp", "cloudflare",
+    "digitalocean", "linode", "vultr", "oracle",
+)
+_ASN_GOOD_PATTERNS = (
+    "hetzner", "ovh", "m247", "leaseweb", "contabo", "scaleway",
+    "pq", "hosting", "datacenter",
+)
 
 _PORT_POOL = list(range(11001, 11201))
 _PORT_INDEX = 0
@@ -160,17 +185,114 @@ def _build_xray_config(node: XrayNode, listen_port: int) -> tuple[dict | None, s
     return config, None
 
 
+def _curl_one(listen_port: int, svc_name: str, url: str,
+               return_body: bool, head_timeout: float) -> tuple[str, dict]:
+    """Запустить один curl через SOCKS5. Возвращает (svc_name, result_dict).
+
+    result_dict = {ok: bool, code: int, body: str, ms: float, error: str}.
+    """
+    t_start = time.monotonic()
+    try:
+        cmd = ["curl", "-sS", "-L", "--socks5-hostname", f"127.0.0.1:{listen_port}",
+               "--max-time", str(head_timeout)]
+        if return_body:
+            # body + newline + http_code (последняя строка).
+            cmd += ["-w", "\n%{http_code}"]
+        else:
+            cmd += ["-o", "/dev/null", "-w", "%{http_code}"]
+        cmd.append(url)
+
+        curl = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=head_timeout + 5)
+        elapsed_ms = (time.monotonic() - t_start) * 1000.0
+
+        if curl.returncode != 0:
+            err = curl.stderr.strip()[:80] or f"curl rc={curl.returncode}"
+            return svc_name, {"ok": False, "error": err, "ms": elapsed_ms}
+
+        if return_body:
+            output = curl.stdout
+            if "\n" in output:
+                body, code_str = output.rsplit("\n", 1)
+            else:
+                body, code_str = "", output
+            body = body.strip()
+        else:
+            body = ""
+            code_str = curl.stdout.strip()
+
+        try:
+            code = int(code_str)
+        except ValueError:
+            code = 0
+
+        ok = code in (200, 204, 301, 302, 303, 307, 308)
+        return svc_name, {"ok": ok, "code": code, "body": body, "ms": elapsed_ms}
+    except subprocess.TimeoutExpired:
+        elapsed_ms = (time.monotonic() - t_start) * 1000.0
+        return svc_name, {"ok": False, "error": "timeout", "ms": elapsed_ms}
+    except Exception as exc:
+        elapsed_ms = (time.monotonic() - t_start) * 1000.0
+        return svc_name, {"ok": False, "error": str(exc)[:60], "ms": elapsed_ms}
+
+
+def _lookup_asn(exit_ip: str, timeout: float = 4.0) -> dict:
+    """v75: Получить ASN/org/geo для exit IP через api.ip.sb/geoip/<ip>.
+
+    Возвращает {asn_org: str, country: str, cloud_exit: bool, hosting_exit: bool}.
+    cloud_exit=True → AWS/Azure/GCP (likely dead на РФ).
+    hosting_exit=True → Hetzner/OVH/M247 (likely working).
+    """
+    out = {"asn_org": "", "country": "", "cloud_exit": False, "hosting_exit": False}
+    try:
+        curl = subprocess.run(
+            ["curl", "-sS", "--max-time", str(timeout),
+             f"https://api.ip.sb/geoip/{exit_ip}"],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        if curl.returncode != 0:
+            return out
+        data = json.loads(curl.stdout)
+        org = (data.get("organization") or data.get("asn_organization")
+               or data.get("isp") or "")
+        country = data.get("country", "")
+        org_lower = org.lower()
+        out["asn_org"] = org
+        out["country"] = country
+        out["cloud_exit"] = any(p in org_lower for p in _ASN_BAD_PATTERNS)
+        out["hosting_exit"] = any(p in org_lower for p in _ASN_GOOD_PATTERNS)
+    except Exception:
+        pass
+    return out
+
+
 def _test_node(node: XrayNode, singbox_bin: Path,
                xray_bin: Path | None = None, *,
                head_timeout: float = 8.0, startup_timeout: float = 5.0,
                max_latency_ms: float = 2000,
-               runner_ip: str = "") -> dict:
-    """v74: IP verification + multi-service test.
-    1. Get runner IP (before proxy).
-    2. Through proxy: get exit IP (ipify.org).
-    3. Through proxy: test Instagram, YouTube, Telegram.
-    4. If exit_ip == runner_ip → proxy NOT working (leaking).
-    5. If Instagram/YouTube/TG all timeout → proxy overloaded.
+               runner_ip: str = "",
+               check_asn: bool = False) -> dict:
+    """v75: Параллельный multi-service тест.
+
+    Тестирует 5 сервисов ОДНОВРЕМЕННО через ThreadPoolExecutor:
+      - api.ipify.org (exit IP primary)
+      - ifconfig.me/ip (exit IP fallback)
+      - Instagram
+      - YouTube
+      - Telegram
+
+    Узел ALIVE если:
+      - Exit IP ≠ runner IP И (Instagram ИЛИ YouTube ИЛИ Telegram) ответил 2xx/3xx, ИЛИ
+      - Exit IP ≠ runner IP (прокси работает), даже если все 3 сайта не открылись
+        (например Cloudflare WAF на exit IP блокирует IG/YT/TG — на РФ мобилке может работать)
+      - Instagram ИЛИ YouTube ИЛИ Telegram ответил 2xx/3xx (даже если ipify/ifconfig упали —
+        ipify может быть недоступен с exit IP, но прокси работает)
+
+    Узел DEAD если:
+      - Все 5 сервисов упали, ИЛИ
+      - Exit IP == runner IP (прокси НЕ работает — трафик идёт напрямую)
+
+    Latency = MIN(успешных сервисов). Threshold применяется к min (быстрейший сервис).
     """
     result = {
         "host": node.host, "port": node.port, "protocol": node.protocol,
@@ -178,6 +300,8 @@ def _test_node(node: XrayNode, singbox_bin: Path,
         "http_code": None, "error": None, "latency_ms": None, "dns_ms": None,
         "exit_ip": None, "ip_changed": None,
         "instagram": None, "youtube": None, "telegram": None,
+        "ipify": None, "ifconfig": None,
+        "asn_org": None, "country": None, "cloud_exit": None, "hosting_exit": None,
     }
 
     listen_port = _find_free_port()
@@ -236,95 +360,111 @@ def _test_node(node: XrayNode, singbox_bin: Path,
 
         t0 = time.monotonic()
 
-        # v74: ШАГ 1 — Проверка IP (выходим через прокси или нет?)
-        try:
-            curl_ip = subprocess.run(
-                ["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{listen_port}",
-                 "--max-time", str(head_timeout),
-                 "https://api.ipify.org"],
-                capture_output=True, text=True, timeout=head_timeout + 5,
-            )
-        except subprocess.TimeoutExpired:
-            result["status"] = "dead"
-            result["error"] = "ipify timeout"
-            return result
+        # v75: ПАРАЛЛЕЛЬНЫЙ тест 5 сервисов. Никаких жёстких гейтов.
+        test_results: dict[str, dict] = {}
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="curl") as ex:
+            futures = [ex.submit(_curl_one, listen_port, name, url, ret, head_timeout)
+                       for name, url, ret in _TEST_SPECS]
+            for fut in as_completed(futures):
+                name, res = fut.result()
+                test_results[name] = res
 
-        if curl_ip.returncode != 0:
-            result["status"] = "dead"
-            result["error"] = f"ipify: {curl_ip.stderr.strip()[:100]}"
-            return result
+        total_time_ms = (time.monotonic() - t0) * 1000.0
 
-        exit_ip = curl_ip.stdout.strip()
-        result["exit_ip"] = exit_ip
+        # Сохраняем индивидуальные результаты в result.
+        for name in ("ipify", "ifconfig", "instagram", "youtube", "telegram"):
+            if name in test_results:
+                res = test_results[name]
+                if res.get("ok"):
+                    result[name] = res.get("code")
+                else:
+                    result[name] = res.get("error", "fail")
 
-        if runner_ip and exit_ip and exit_ip == runner_ip:
-            # IP не изменился — прокси НЕ работает, трафик идёт напрямую!
+        # Получаем exit IP из ipify или ifconfig (первый, кто вернул валидный IPv4).
+        exit_ip = ""
+        for ip_svc in ("ipify", "ifconfig"):
+            res = test_results.get(ip_svc, {})
+            if res.get("ok"):
+                body = res.get("body", "")
+                if body and _IPV4_RE.match(body):
+                    exit_ip = body
+                    break
+                # ifconfig.me может вернуть IP с trailing-мусором.
+                m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", body)
+                if m:
+                    exit_ip = m.group(1)
+                    break
+
+        if exit_ip:
+            result["exit_ip"] = exit_ip
+            if runner_ip:
+                result["ip_changed"] = (exit_ip != runner_ip)
+
+            # v75: ASN lookup (опционально) — неблокирующая информация.
+            if check_asn:
+                asn = _lookup_asn(exit_ip)
+                result["asn_org"] = asn.get("asn_org")
+                result["country"] = asn.get("country")
+                result["cloud_exit"] = asn.get("cloud_exit")
+                result["hosting_exit"] = asn.get("hosting_exit")
+
+        # v75: ШАГ 1 — Проверка утечки IP (если exit IP == runner IP → прокси НЕ работает).
+        if exit_ip and runner_ip and exit_ip == runner_ip:
             result["status"] = "dead"
             result["ip_changed"] = False
-            result["error"] = f"IP leaked: exit={exit_ip} == runner={runner_ip}"
+            result["latency_ms"] = total_time_ms
+            result["error"] = f"IP leak: exit={exit_ip} == runner={runner_ip}"
             return result
 
-        result["ip_changed"] = True
-        latency = (time.monotonic() - t0) * 1000.0
-        result["latency_ms"] = latency
-
-        # v72: latency > max → dead.
-        if max_latency_ms > 0 and latency > max_latency_ms:
-            result["status"] = "dead"
-            result["error"] = f"latency {latency:.0f}ms (>{max_latency_ms:.0f}ms)"
-            return result
-
-        # v74: ШАГ 2 — Multi-service test (Instagram, YouTube, Telegram).
-        # Проверяем может ли прокси открыть ЗАБЛОКИРОВАННЫЕ сайты.
-        services = {
-            "instagram": "https://www.instagram.com/",
-            "youtube": "https://www.youtube.com/",
-            "telegram": "https://api.telegram.org/",
-        }
-        service_ok = 0
-        service_results = {}
-        for svc_name, svc_url in services.items():
-            try:
-                curl_svc = subprocess.run(
-                    ["curl", "-sS", "-L", "--socks5-hostname", f"127.0.0.1:{listen_port}",
-                     "--max-time", str(head_timeout),
-                     "-o", "/dev/null",
-                     "-w", "%{http_code}",
-                     svc_url],
-                    capture_output=True, text=True, timeout=head_timeout + 5,
-                )
-                if curl_svc.returncode == 0:
-                    try:
-                        code = int(curl_svc.stdout.strip())
-                    except ValueError:
-                        code = 0
-                    service_results[svc_name] = code
-                    result[svc_name] = code
-                    if code in (200, 204, 301, 302, 303, 307, 308):
-                        service_ok += 1
-                    else:
-                        service_results[svc_name] = f"HTTP {code}"
-                else:
-                    service_results[svc_name] = "timeout"
-                    result[svc_name] = "timeout"
-            except subprocess.TimeoutExpired:
-                service_results[svc_name] = "timeout"
-                result[svc_name] = "timeout"
-
-        # v74: Если хотя бы 1 сервис работает → alive.
-        # Если все 3 timeout → "overloaded" (IP changed, но трафик не идёт).
-        if service_ok > 0:
-            total_latency = (time.monotonic() - t0) * 1000.0
-            result["latency_ms"] = total_latency
-            result["http_code"] = 200
-            result["status"] = "alive"
-            return result
+        # Вычисляем latency = MIN(успешных сервисов) — реальная скорость прокси.
+        success_times = [res["ms"] for res in test_results.values() if res.get("ok")]
+        if success_times:
+            result["latency_ms"] = min(success_times)
         else:
-            total_latency = (time.monotonic() - t0) * 1000.0
-            result["latency_ms"] = total_latency
+            result["latency_ms"] = total_time_ms
+
+        # v72: latency threshold — к MIN успешного сервиса.
+        # (Если все 5 упали, success_times пустой → проверка пропускается,
+        # узел всё равно DEAD по числу успешных сервисов ниже.)
+        if max_latency_ms > 0 and success_times and min(success_times) > max_latency_ms:
             result["status"] = "dead"
-            result["error"] = f"ip_changed={exit_ip[:20]} but all services timeout"
+            result["error"] = (f"latency {min(success_times):.0f}ms "
+                                f"(>{max_latency_ms:.0f}ms on fastest service)")
             return result
+
+        # v75: ШАГ 2 — Считаем реальные успехи (Instagram/YouTube/Telegram).
+        real_services = ("instagram", "youtube", "telegram")
+        real_ok_count = sum(1 for s in real_services
+                            if test_results.get(s, {}).get("ok"))
+
+        # ALIVE если хотя бы 1 реальный сервис работает.
+        if real_ok_count > 0:
+            result["status"] = "alive"
+            result["http_code"] = 200
+            return result
+
+        # Все реальные сервисы упали, но exit IP ≠ runner IP → прокси работает,
+        # сайты заблокированы с exit IP (например Cloudflare WAF на AWS IP).
+        # На РФ мобилке может работать (другой путь).
+        if exit_ip and (not runner_ip or exit_ip != runner_ip):
+            result["status"] = "alive"
+            result["http_code"] = 200
+            asn_note = ""
+            if result.get("asn_org"):
+                asn_note = f" [{result['asn_org']}]"
+            result["error"] = (f"exit IP {exit_ip} works but IG/YT/TG blocked"
+                               f"{asn_note}")
+            return result
+
+        # Все 5 сервисов упали.
+        # Возьмём первую ошибку для диагностики.
+        first_err = next((test_results[s].get("error", "")
+                          for s in ("ipify", "ifconfig", "instagram",
+                                    "youtube", "telegram")
+                          if test_results.get(s, {}).get("error")), "all failed")
+        result["status"] = "dead"
+        result["error"] = f"all 5 services failed: {first_err[:60]}"
+        return result
 
     finally:
         if sb_proc is not None and sb_proc.poll() is None:
@@ -363,6 +503,13 @@ def main(argv: list[str]) -> int:
                         "отвечают дольше чем gstatic.")
     p.add_argument("--startup-timeout", type=float, default=5.0,
                    help="Таймаут запуска sing-box, сек (default: 5.0).")
+    # v75: --check-asn — lookup ASN организации exit IP (api.ip.sb/geoip).
+    # Помечает cloud_exit (AWS/Azure → likely dead на РФ) или hosting_exit
+    # (Hetzner/OVH → likely working). НЕ убивает узел — только информация.
+    p.add_argument("--check-asn", action="store_true", default=False,
+                   help="Опционально: lookup ASN exit IP через api.ip.sb/geoip. "
+                        "Помечает cloud_exit (AWS/Azure) / hosting_exit (Hetzner/OVH). "
+                        "НЕ убивает узел — только для отчёта.")
     # v72: max latency — alive конфиги с latency > X ms → dead (reject).
     p.add_argument("--max-latency-ms", type=float, default=2000,
                    help="Максимальная latency (через прокси) в ms. "
@@ -453,7 +600,8 @@ def main(argv: list[str]) -> int:
                              head_timeout=args.head_timeout,
                              startup_timeout=args.startup_timeout,
                              max_latency_ms=args.max_latency_ms,
-                             runner_ip=runner_ip): (n, url)
+                             runner_ip=runner_ip,
+                             check_asn=args.check_asn): (n, url)
                    for n, url in nodes}
         for fut in as_completed(futures):
             node, url = futures[fut]
@@ -475,8 +623,12 @@ def main(argv: list[str]) -> int:
             latency_str = f"{r.get('latency_ms', 0):.0f}ms" if r.get("latency_ms") else "—"
             ip_str = f"ip={r.get('exit_ip', '?')[:15]}" if r.get("exit_ip") else ""
             svc_str = f"ig={r.get('instagram','?')} yt={r.get('youtube','?')} tg={r.get('telegram','?')}"
+            asn_str = ""
+            if r.get("asn_org"):
+                tag = "☁" if r.get("cloud_exit") else ("🖥" if r.get("hosting_exit") else "·")
+                asn_str = f" {tag} {r.get('asn_org', '')[:20]}"
             log(f"[alive] {done}/{len(nodes)}: {r['host']}:{r['port']} "
-                f"({r['protocol']}) = {r['status']} {latency_str} {ip_str} {svc_str}"
+                f"({r['protocol']}) = {r['status']} {latency_str} {ip_str} {svc_str}{asn_str}"
                 + (f" {r.get('error', '')[:60]}" if r.get("error") else ""))
 
     log(f"[alive] done: {alive_count} alive, {dead_count} dead")
@@ -524,12 +676,26 @@ def main(argv: list[str]) -> int:
             f.write(url + "\n")
     log(f"[alive] wrote {alive_count} alive nodes to {args.output}")
 
+    # v75: Финальная сводка по ASN exit IP (если был --check-asn).
+    cloud_exits = sum(1 for r in results if r.get("cloud_exit"))
+    hosting_exits = sum(1 for r in results if r.get("hosting_exit"))
+    if args.check_asn and alive_count > 0:
+        log(f"[alive] ASN summary (alive nodes): "
+            f"☁ cloud-exit (AWS/Azure/etc) = {cloud_exits}, "
+            f"🖥 hosting-exit (Hetzner/OVH/etc) = {hosting_exits}, "
+            f"other = {alive_count - cloud_exits - hosting_exits}")
+
     # JSON-отчёт.
     report = {
         "timestamp": int(time.time()),
         "total_tested": len(nodes),
         "alive": alive_count,
         "dead": dead_count,
+        "runner_ip": runner_ip,
+        "asn_summary": {
+            "cloud_exit": cloud_exits,
+            "hosting_exit": hosting_exits,
+        } if args.check_asn else None,
         "results": results,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)

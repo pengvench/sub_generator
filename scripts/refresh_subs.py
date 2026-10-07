@@ -1761,14 +1761,31 @@ def main(argv: list[str]) -> int:
     bs_nodes: list[XrayNode] = []
     chs_nodes: list[XrayNode] = []
     if args.split_bs_chs:
+        # v68b: БС = vless+reality/tls (с SNI) + hy2/tuic (БЕЗ требования SNI).
+        # У UDP-протоколов (hy2/tuic) SNI опционален — не требуем его.
         for n in nodes:
-            tag = (n.extra or {}).get("bs_chs", "mixed")
-            if tag == "chs":
+            proto = (n.protocol or "").lower()
+            security = (n.query.get("security") or "").lower()
+            sni = (n.query.get("sni") or n.query.get("host") or "").strip()
+            is_vless_encrypted = proto == "vless" and security in ("reality", "tls")
+            is_udp_proto = proto in ("hysteria2", "hy2", "tuic")
+            if is_vless_encrypted and sni:
+                bs_nodes.append(n)    # vless+reality/tls WITH SNI
+            elif is_udp_proto:
+                bs_nodes.append(n)    # hy2/tuic — SNI не требуется
+            else:
                 chs_nodes.append(n)
-            else:  # "bs" или "mixed" → БС (по умолчанию)
-                bs_nodes.append(n)
         log(f"[gha] SPLIT (before max-servers): BS={len(bs_nodes)}, "
             f"ChS={len(chs_nodes)}, total={len(nodes)}")
+        # v66: Дедупликация между БС и ЧС — если узел (host, port, protocol)
+        # уже в БС, убираем из ЧС. БС приоритет (мобилка РФ важнее WiFi).
+        bs_keys = {(n.host, str(n.port), n.protocol) for n in bs_nodes}
+        chs_before = len(chs_nodes)
+        chs_nodes = [n for n in chs_nodes
+                     if (n.host, str(n.port), n.protocol) not in bs_keys]
+        chs_dedup = chs_before - len(chs_nodes)
+        if chs_dedup:
+            log(f"[gha] cross-dedup BS↔ChS: removed {chs_dedup} duplicates from ChS")
         # v62: --max-servers применяется к ОБАМ спискам (БС и ЧС) независимо.
         # Раньше ЧС не обрезался → в финале 387 ЧС узлов при 200 БС.
         if args.max_servers > 0 and len(bs_nodes) > args.max_servers:

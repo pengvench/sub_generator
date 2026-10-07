@@ -115,10 +115,9 @@ jobs:
           echo "=== data/tg_subs.txt ==="
           cat data/tg_subs.txt 2>/dev/null || echo "(not generated — see logs above)"
 
-      - name: Download sing-box Linux binary (v64)
-        # v64: sing-box нужен для alive_test.py — быстрый alive-test
-        # (HTTP HEAD через SOCKS5 к gstatic.com/generate_204).
-        # Отбрасывает CDN/Railway/Vercel/фейк — оставляет только РЕАЛЬНЫЕ VPN.
+      - name: Download sing-box + xray Linux binaries (v69)
+        # v64: sing-box нужен для alive_test.py
+        # v69: xray тоже — для raw/xhttp транспорта (sing-box не поддерживает)
         run: |
           mkdir -p bin
           echo "=== Downloading sing-box-linux-64 ==="
@@ -133,6 +132,13 @@ jobs:
           cp /tmp/sing-box-*/sing-box bin/sing-box
           chmod +x bin/sing-box
           bin/sing-box version
+          echo "=== Downloading xray-linux-64 ==="
+          XRAY_VERSION=v26.3.27
+          curl -sSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/xray-linux-64.zip"
+          unzip -o /tmp/xray.zip -d /tmp/xray
+          cp /tmp/xray/xray bin/xray
+          chmod +x bin/xray
+          bin/xray version
 
       - name: Refresh subs (fetch + parse + dedup + ping + canonical-stack + geo-rename + split БС/ЧС)
         # v49: Упростил как у Pizduk/Aetris/Mifa — НЕТ pattern-score.
@@ -185,11 +191,11 @@ jobs:
             --output data/preload_alive.txt \
             --report data/alive_test_report.json \
             --singbox-bin bin/sing-box \
+            --xray-bin bin/xray \
             --max-nodes 0 \
             --workers 16 \
             --head-timeout 5 \
-            --startup-timeout 5 \
-            --final-limit 200
+            --startup-timeout 5
           if [ -s data/preload_alive.txt ]; then
             ALIVE_COUNT=$(($(wc -l < data/preload_alive.txt) - 1))
             echo "[gha] alive-test BS: $ALIVE_COUNT alive — replacing preload_bs.txt"
@@ -203,11 +209,11 @@ jobs:
               --output data/preload_chs_alive.txt \
               --report data/alive_test_chs_report.json \
               --singbox-bin bin/sing-box \
+              --xray-bin bin/xray \
               --max-nodes 0 \
               --workers 16 \
               --head-timeout 5 \
-              --startup-timeout 5 \
-              --final-limit 200
+              --startup-timeout 5
             if [ -s data/preload_chs_alive.txt ]; then
               cp data/preload_chs_alive.txt data/preload_chs.txt
             fi
@@ -264,6 +270,26 @@ jobs:
             fi
           done
           echo "[gha] force-added data/ files (bypass .gitignore data/* rule)"
+
+      - name: Upload logs as artifacts (v67b)
+        # v67b: Сохраняем ВСЕ логи/отчёты как GHA artifact — можно скачать
+        # из Actions → Run → Artifacts section. Хранится 90 дней.
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gha-logs-${{ github.run_id }}
+          path: |
+            data/preload.txt
+            data/preload_bs.txt
+            data/preload_chs.txt
+            data/preload_report.json
+            data/alive_test_report.json
+            data/alive_test_chs_report.json
+            data/tg_subs.txt
+            data/sni_whitelist.txt
+            data/cidr_whitelist.txt
+            subs.txt
+            subs_chs.txt
 
       - name: Commit & push if changed
         uses: stefanzweifel/git-auto-commit-action@v5

@@ -47,11 +47,16 @@ from runtime.parse import parse_node_link, _node_links_from_text
 from runtime.types import XrayNode
 from singbox_convert import sing_box_full_config
 
-# v69: Multiple test URLs — если первый blocked/rate-limited, пробуем следующий.
+# v73: Тестовые URL — ЗАБЛОКИРОВАННЫЕ в РФ сайты.
+# Если прокси может открыть Instagram/YouTube/TG → реально рабочий.
+# gstatic.com/cloudflare слишком лёгкие (0 bytes HEAD) — проходят даже
+# перегруженные/полумёртвые серверы. Реальные сайты требуют полный TLS +
+# HTTP response → отсеивает "handshake OK но traffic dead".
 _TEST_URLS = [
-    "https://www.gstatic.com/generate_204",    # Google 204
-    "https://cloudflare.com/cdn-cgi/trace",    # Cloudflare trace
-    "https://1.1.1.1/",                        # Cloudflare DNS homepage
+    "https://www.instagram.com/",           # Instagram — заблокирован в РФ
+    "https://www.youtube.com/",             # YouTube — замедлен в РФ
+    "https://api.telegram.org/",            # Telegram API — заблокирован в РФ
+    "https://www.gstatic.com/generate_204",  # Fallback (лёгкий, если все тяжёлые упали)
 ]
 
 _PORT_POOL = list(range(11001, 11201))
@@ -157,15 +162,22 @@ def _build_xray_config(node: XrayNode, listen_port: int) -> tuple[dict | None, s
 
 def _test_node(node: XrayNode, singbox_bin: Path,
                xray_bin: Path | None = None, *,
-               head_timeout: float = 5.0, startup_timeout: float = 5.0,
-               max_latency_ms: float = 2000) -> dict:
-    """v69: Try sing-box first, then xray for unsupported transports.
-    Multiple test URLs. DNS > 1000ms → dead (reject).
+               head_timeout: float = 8.0, startup_timeout: float = 5.0,
+               max_latency_ms: float = 2000,
+               runner_ip: str = "") -> dict:
+    """v74: IP verification + multi-service test.
+    1. Get runner IP (before proxy).
+    2. Through proxy: get exit IP (ipify.org).
+    3. Through proxy: test Instagram, YouTube, Telegram.
+    4. If exit_ip == runner_ip → proxy NOT working (leaking).
+    5. If Instagram/YouTube/TG all timeout → proxy overloaded.
     """
     result = {
         "host": node.host, "port": node.port, "protocol": node.protocol,
         "name": node.name, "status": "unknown",
         "http_code": None, "error": None, "latency_ms": None, "dns_ms": None,
+        "exit_ip": None, "ip_changed": None,
+        "instagram": None, "youtube": None, "telegram": None,
     }
 
     listen_port = _find_free_port()
@@ -224,64 +236,95 @@ def _test_node(node: XrayNode, singbox_bin: Path,
 
         t0 = time.monotonic()
 
-        # v69: Multiple test URLs — пробуем каждый, пока один не даст 200/204.
-        alive = False
-        last_error = ""
-        for test_url in _TEST_URLS:
-            try:
-                curl = subprocess.run(
-                    ["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{listen_port}",
-                     "--max-time", str(head_timeout),
-                     "-o", "/dev/null",
-                     "-w", "%{http_code}\t%{time_namelookup}\t%{time_total}",
-                     test_url],
-                    capture_output=True, text=True, timeout=head_timeout + 5,
-                )
-            except subprocess.TimeoutExpired:
-                last_error = f"timeout ({test_url[:30]})"
-                continue
+        # v74: ШАГ 1 — Проверка IP (выходим через прокси или нет?)
+        try:
+            curl_ip = subprocess.run(
+                ["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{listen_port}",
+                 "--max-time", str(head_timeout),
+                 "https://api.ipify.org"],
+                capture_output=True, text=True, timeout=head_timeout + 5,
+            )
+        except subprocess.TimeoutExpired:
+            result["status"] = "dead"
+            result["error"] = "ipify timeout"
+            return result
 
-            if curl.returncode != 0:
-                last_error = curl.stderr.strip()[:100] or f"curl exit {curl.returncode}"
-                continue
+        if curl_ip.returncode != 0:
+            result["status"] = "dead"
+            result["error"] = f"ipify: {curl_ip.stderr.strip()[:100]}"
+            return result
 
-            try:
-                http_code_str, dns_time_str, time_total_str = curl.stdout.strip().split("\t")
-                http_code = int(http_code_str)
-                dns_time = float(dns_time_str)
-            except (ValueError, IndexError):
-                last_error = f"curl parse: {curl.stdout[:80]}"
-                continue
+        exit_ip = curl_ip.stdout.strip()
+        result["exit_ip"] = exit_ip
 
-            if http_code in (200, 204):
-                latency = (time.monotonic() - t0) * 1000.0
-                result["latency_ms"] = latency
-                result["http_code"] = http_code
-                result["dns_ms"] = dns_time * 1000.0
+        if runner_ip and exit_ip and exit_ip == runner_ip:
+            # IP не изменился — прокси НЕ работает, трафик идёт напрямую!
+            result["status"] = "dead"
+            result["ip_changed"] = False
+            result["error"] = f"IP leaked: exit={exit_ip} == runner={runner_ip}"
+            return result
 
-                # v69: DNS > 1000ms → DEAD (reject).
-                if dns_time > 1.0:
-                    result["status"] = "dead"
-                    result["error"] = f"FakeDNS {dns_time*1000:.0f}ms (>1000ms) — rejected"
-                    return result
-
-                # v72: latency > max_latency_ms → DEAD (reject).
-                if max_latency_ms > 0 and latency > max_latency_ms:
-                    result["status"] = "dead"
-                    result["error"] = f"latency {latency:.0f}ms (>{max_latency_ms:.0f}ms) — rejected"
-                    return result
-
-                result["status"] = "alive"
-                return result
-
-            last_error = f"HTTP {http_code} ({test_url[:30]})"
-
-        # All test URLs failed.
+        result["ip_changed"] = True
         latency = (time.monotonic() - t0) * 1000.0
         result["latency_ms"] = latency
-        result["status"] = "dead"
-        result["error"] = last_error[:150]
-        return result
+
+        # v72: latency > max → dead.
+        if max_latency_ms > 0 and latency > max_latency_ms:
+            result["status"] = "dead"
+            result["error"] = f"latency {latency:.0f}ms (>{max_latency_ms:.0f}ms)"
+            return result
+
+        # v74: ШАГ 2 — Multi-service test (Instagram, YouTube, Telegram).
+        # Проверяем может ли прокси открыть ЗАБЛОКИРОВАННЫЕ сайты.
+        services = {
+            "instagram": "https://www.instagram.com/",
+            "youtube": "https://www.youtube.com/",
+            "telegram": "https://api.telegram.org/",
+        }
+        service_ok = 0
+        service_results = {}
+        for svc_name, svc_url in services.items():
+            try:
+                curl_svc = subprocess.run(
+                    ["curl", "-sS", "-L", "--socks5-hostname", f"127.0.0.1:{listen_port}",
+                     "--max-time", str(head_timeout),
+                     "-o", "/dev/null",
+                     "-w", "%{http_code}",
+                     svc_url],
+                    capture_output=True, text=True, timeout=head_timeout + 5,
+                )
+                if curl_svc.returncode == 0:
+                    try:
+                        code = int(curl_svc.stdout.strip())
+                    except ValueError:
+                        code = 0
+                    service_results[svc_name] = code
+                    result[svc_name] = code
+                    if code in (200, 204, 301, 302, 303, 307, 308):
+                        service_ok += 1
+                    else:
+                        service_results[svc_name] = f"HTTP {code}"
+                else:
+                    service_results[svc_name] = "timeout"
+                    result[svc_name] = "timeout"
+            except subprocess.TimeoutExpired:
+                service_results[svc_name] = "timeout"
+                result[svc_name] = "timeout"
+
+        # v74: Если хотя бы 1 сервис работает → alive.
+        # Если все 3 timeout → "overloaded" (IP changed, но трафик не идёт).
+        if service_ok > 0:
+            total_latency = (time.monotonic() - t0) * 1000.0
+            result["latency_ms"] = total_latency
+            result["http_code"] = 200
+            result["status"] = "alive"
+            return result
+        else:
+            total_latency = (time.monotonic() - t0) * 1000.0
+            result["latency_ms"] = total_latency
+            result["status"] = "dead"
+            result["error"] = f"ip_changed={exit_ip[:20]} but all services timeout"
+            return result
 
     finally:
         if sb_proc is not None and sb_proc.poll() is None:
@@ -314,8 +357,10 @@ def main(argv: list[str]) -> int:
                    help="Лимит числа узлов для тестирования (default: 200).")
     p.add_argument("--workers", type=int, default=8,
                    help="Параллелизм (default: 8).")
-    p.add_argument("--head-timeout", type=float, default=5.0,
-                   help="Таймаут HTTP HEAD, сек (default: 5.0).")
+    p.add_argument("--head-timeout", type=float, default=8.0,
+                   help="Таймаут HTTP запроса, сек (default: 8.0). "
+                        "v73: увеличен с 5 до 8 — реальные сайты (Instagram/YouTube) "
+                        "отвечают дольше чем gstatic.")
     p.add_argument("--startup-timeout", type=float, default=5.0,
                    help="Таймаут запуска sing-box, сек (default: 5.0).")
     # v72: max latency — alive конфиги с latency > X ms → dead (reject).
@@ -378,8 +423,22 @@ def main(argv: list[str]) -> int:
     elif args.max_nodes == 0:
         log(f"[alive] --max-nodes 0 = NO LIMIT, testing ALL {len(nodes)} nodes")
 
+    # v74: Получаем IP runner'а для проверки утечки.
+    runner_ip = ""
+    try:
+        ip_result = subprocess.run(
+            ["curl", "-sS", "--max-time", "5", "https://api.ipify.org"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if ip_result.returncode == 0:
+            runner_ip = ip_result.stdout.strip()
+            log(f"[alive] runner IP: {runner_ip}")
+    except Exception:
+        log("[alive] WARNING: could not get runner IP")
+
     log(f"[alive] testing {len(nodes)} nodes with {args.workers} workers "
-        f"(head_timeout={args.head_timeout}s, startup={args.startup_timeout}s)")
+        f"(head_timeout={args.head_timeout}s, startup={args.startup_timeout}s, "
+        f"runner_ip={runner_ip or 'unknown'})")
 
     results: list[dict] = []
     alive_urls: list[str] = []
@@ -393,7 +452,8 @@ def main(argv: list[str]) -> int:
                              args.xray_bin if args.xray_bin else None,
                              head_timeout=args.head_timeout,
                              startup_timeout=args.startup_timeout,
-                             max_latency_ms=args.max_latency_ms): (n, url)
+                             max_latency_ms=args.max_latency_ms,
+                             runner_ip=runner_ip): (n, url)
                    for n, url in nodes}
         for fut in as_completed(futures):
             node, url = futures[fut]
@@ -413,11 +473,11 @@ def main(argv: list[str]) -> int:
                     dead_count += 1
 
             latency_str = f"{r.get('latency_ms', 0):.0f}ms" if r.get("latency_ms") else "—"
-            dns_str = f"DNS={r.get('dns_ms', 0):.0f}ms" if r.get("dns_ms") else ""
+            ip_str = f"ip={r.get('exit_ip', '?')[:15]}" if r.get("exit_ip") else ""
+            svc_str = f"ig={r.get('instagram','?')} yt={r.get('youtube','?')} tg={r.get('telegram','?')}"
             log(f"[alive] {done}/{len(nodes)}: {r['host']}:{r['port']} "
-                f"({r['protocol']}) = {r['status']} "
-                f"[HTTP {r.get('http_code', '?')}] {latency_str} {dns_str}"
-                + (f" {r.get('error', '')[:80]}" if r.get("error") else ""))
+                f"({r['protocol']}) = {r['status']} {latency_str} {ip_str} {svc_str}"
+                + (f" {r.get('error', '')[:60]}" if r.get("error") else ""))
 
     log(f"[alive] done: {alive_count} alive, {dead_count} dead")
 

@@ -195,8 +195,9 @@ jobs:
             --source-map data/source_map.json \
             --max-nodes 0 \
             --workers 16 \
-            --head-timeout 5 \
-            --startup-timeout 5
+            --head-timeout 8 \
+            --startup-timeout 5 \
+            --max-latency-ms 2000
           if [ -s data/preload_alive.txt ]; then
             ALIVE_COUNT=$(($(wc -l < data/preload_alive.txt) - 1))
             echo "[gha] alive-test BS: $ALIVE_COUNT alive — replacing preload_bs.txt"
@@ -214,8 +215,9 @@ jobs:
               --source-map data/source_map.json \
               --max-nodes 0 \
               --workers 16 \
-              --head-timeout 5 \
-              --startup-timeout 5
+              --head-timeout 8 \
+              --startup-timeout 5 \
+              --max-latency-ms 2000
             if [ -s data/preload_chs_alive.txt ]; then
               cp data/preload_chs_alive.txt data/preload_chs.txt
             fi

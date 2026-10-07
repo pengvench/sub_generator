@@ -157,7 +157,8 @@ def _build_xray_config(node: XrayNode, listen_port: int) -> tuple[dict | None, s
 
 def _test_node(node: XrayNode, singbox_bin: Path,
                xray_bin: Path | None = None, *,
-               head_timeout: float = 5.0, startup_timeout: float = 5.0) -> dict:
+               head_timeout: float = 5.0, startup_timeout: float = 5.0,
+               max_latency_ms: float = 2000) -> dict:
     """v69: Try sing-box first, then xray for unsupported transports.
     Multiple test URLs. DNS > 1000ms → dead (reject).
     """
@@ -258,10 +259,16 @@ def _test_node(node: XrayNode, singbox_bin: Path,
                 result["http_code"] = http_code
                 result["dns_ms"] = dns_time * 1000.0
 
-                # v69: DNS > 1000ms → DEAD (reject, user said "убираем нахуй").
+                # v69: DNS > 1000ms → DEAD (reject).
                 if dns_time > 1.0:
                     result["status"] = "dead"
                     result["error"] = f"FakeDNS {dns_time*1000:.0f}ms (>1000ms) — rejected"
+                    return result
+
+                # v72: latency > max_latency_ms → DEAD (reject).
+                if max_latency_ms > 0 and latency > max_latency_ms:
+                    result["status"] = "dead"
+                    result["error"] = f"latency {latency:.0f}ms (>{max_latency_ms:.0f}ms) — rejected"
                     return result
 
                 result["status"] = "alive"
@@ -311,6 +318,12 @@ def main(argv: list[str]) -> int:
                    help="Таймаут HTTP HEAD, сек (default: 5.0).")
     p.add_argument("--startup-timeout", type=float, default=5.0,
                    help="Таймаут запуска sing-box, сек (default: 5.0).")
+    # v72: max latency — alive конфиги с latency > X ms → dead (reject).
+    p.add_argument("--max-latency-ms", type=float, default=2000,
+                   help="Максимальная latency (через прокси) в ms. "
+                        "Alive с latency > X → dead (reject). "
+                        "Default: 2000. 1000 = строже (только быстрые). "
+                        "User: 'какого хрена проходят конфиги с 5к пинга'.")
     # v65: --final-limit — обрез ПОСЛЕ alive-test (не ДО!).
     # Раньше refresh_subs обрезал до 200 ДО alive-test → из 200 выживало 11.
     # Теперь: refresh_subs даёт 1000, alive-test проверяет 1000,
@@ -379,7 +392,8 @@ def main(argv: list[str]) -> int:
         futures = {ex.submit(_test_node, n, args.singbox_bin,
                              args.xray_bin if args.xray_bin else None,
                              head_timeout=args.head_timeout,
-                             startup_timeout=args.startup_timeout): (n, url)
+                             startup_timeout=args.startup_timeout,
+                             max_latency_ms=args.max_latency_ms): (n, url)
                    for n, url in nodes}
         for fut in as_completed(futures):
             node, url = futures[fut]

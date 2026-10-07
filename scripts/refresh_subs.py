@@ -105,12 +105,14 @@ def _read_sources(sources_file: Path, extra: list[str],
             # v60: Парсер секций. Когда видим "# === БС ===" — переключаемся.
             if stripped.startswith("# ==="):
                 upper = stripped.upper()
-                if "БС" in upper or "БЕЛЫЙ" in upper or "BS" in upper or "WHITE" in upper:
+                # v72d: Проверяем MIXED ПЕРВЫМ — заголовок MIXED содержит "БС"
+                # в описании "по умолчанию БС", что ломает проверку.
+                if "MIXED" in upper:
+                    current_section = "mixed"
+                elif "БС" in upper or "БЕЛЫЙ" in upper or "BS" in upper or "WHITE" in upper:
                     current_section = "bs"
                 elif "ЧС" in upper or "ЧЁРНЫЙ" in upper or "CHS" in upper or "BLACK" in upper:
                     current_section = "chs"
-                elif "MIXED" in upper:
-                    current_section = "mixed"
                 # Строку-разделитель пропускаем (не URL).
                 continue
             # v62: Также проверяем сам URL на ключевые слова wl/bl/alive_bs.
@@ -1785,18 +1787,24 @@ def main(argv: list[str]) -> int:
     bs_nodes: list[XrayNode] = []
     chs_nodes: list[XrayNode] = []
     if args.split_bs_chs:
-        # v68b: БС = vless+reality/tls (с SNI) + hy2/tuic (БЕЗ требования SNI).
-        # У UDP-протоколов (hy2/tuic) SNI опционален — не требуем его.
+        # v72b: SPLIT по source_tag + протоколу.
+        # БС = только из явных БС-источников (WHITE*/бс) + vless+reality/tls/hy2/tuic.
+        # MIXED = ЧС (не доверяем — пусть юзер на WiFi тестит).
+        # ЧС-источники = ЧС.
         for n in nodes:
             proto = (n.protocol or "").lower()
             security = (n.query.get("security") or "").lower()
             sni = (n.query.get("sni") or n.query.get("host") or "").strip()
+            tag = (n.extra or {}).get("bs_chs", "mixed")
+            
             is_vless_encrypted = proto == "vless" and security in ("reality", "tls")
             is_udp_proto = proto in ("hysteria2", "hy2", "tuic")
-            if is_vless_encrypted and sni:
-                bs_nodes.append(n)    # vless+reality/tls WITH SNI
-            elif is_udp_proto:
-                bs_nodes.append(n)    # hy2/tuic — SNI не требуется
+            is_bs_protocol = (is_vless_encrypted and sni) or is_udp_proto
+            
+            # БС = явный БС-источник AND БС-протокол.
+            # MIXED → ЧС (не пихать тысячи мусорных конфигов в БС).
+            if tag == "bs" and is_bs_protocol:
+                bs_nodes.append(n)
             else:
                 chs_nodes.append(n)
         log(f"[gha] SPLIT (before max-servers): BS={len(bs_nodes)}, "

@@ -192,6 +192,7 @@ jobs:
             --report data/alive_test_report.json \
             --singbox-bin bin/sing-box \
             --xray-bin bin/xray \
+            --source-map data/source_map.json \
             --max-nodes 0 \
             --workers 16 \
             --head-timeout 5 \
@@ -210,6 +211,7 @@ jobs:
               --report data/alive_test_chs_report.json \
               --singbox-bin bin/sing-box \
               --xray-bin bin/xray \
+              --source-map data/source_map.json \
               --max-nodes 0 \
               --workers 16 \
               --head-timeout 5 \
@@ -262,6 +264,8 @@ jobs:
           # git-auto-commit НЕ видит preload_bs.txt, preload_chs.txt, tg_subs.txt.
           for f in data/tg_subs.txt data/preload_bs.txt data/preload_chs.txt \
                    data/preload.txt data/preload_report.json \
+                   data/alive_test_report.json data/alive_test_chs_report.json \
+                   data/source_map.json \
                    data/sni_whitelist.txt data/cidr_whitelist.txt \
                    data/sni_whitelist_custom.txt data/known_good.txt \
                    data/sources.txt; do

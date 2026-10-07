@@ -266,6 +266,20 @@ _NON_VPN_DOMAINS: frozenset[str] = frozenset({
     "www.cloudflare.com",  # но IP 1.1.1.1 в blacklist
     # AdGuard
     "adguard.com",
+    # v69b: Хостинг-платформы (workers.dev/vercel/railway/render) — НЕ VPN!
+    # 85 конфигов с этими доменами в BS — все мёртвые в v2rayN.
+    "workers.dev",  # Cloudflare Workers
+    "vercel.app",   # Vercel
+    "up.railway.app",  # Railway.app
+    "railway.app",
+    "render.com",   # Render.com
+    "onrender.com",
+    "fly.dev",      # Fly.io
+    "deno.dev",     # Deno Deploy
+    "netlify.app",  # Netlify
+    "herokuapp.com", # Heroku
+    "glitch.me",    # Glitch
+    "repl.co",      # Replit
 })
 
 
@@ -1395,6 +1409,16 @@ def main(argv: list[str]) -> int:
                    help="Выключить multi-track. Только known_good match "
                         "(score >= --pattern-score-min). Строго — отсечёт "
                         "AetrisVPN WS+TLS конфиги.")
+    # v71: Дедупликация по серверу (host:port:pbk:sid:sni).
+    # Оставляет только fp=chrome и fp=firefox на каждый уникальный сервер.
+    # 2748 → ~963 уникальных × 2 fp ≈ 1200 (вместо 2748).
+    p.add_argument("--dedup-by-server", action="store_true", default=True,
+                   help="Дедуплицировать по host:port:pbk:sid:sni. "
+                        "Оставлять только fp=chrome и fp=firefox на сервер. "
+                        "Default: ON. Убирает 65% дубликатов.")
+    p.add_argument("--no-dedup-by-server", dest="dedup_by_server",
+                   action="store_false",
+                   help="НЕ дедуплицировать (все fp остаются).")
     # v49: Разделение финала на БС (мобилка РФ) и ЧС (WiFi / не-RU).
     # На мобильной сети РФ ТСПУ блокирует ЧС-SNI (instagram, chatgpt, ...).
     # На WiFi / вне РФ — ЧС-SNI работает (нет ТСПУ). Поэтому делим финал:
@@ -1670,7 +1694,7 @@ def main(argv: list[str]) -> int:
     #    обрезает уже отсортированный список, если их слишком много.
     if args.with_ping and nodes:
         log(f"[gha] TCP-ping {len(nodes)} nodes (workers={args.ping_workers}, "
-            f"timeout={args.ping_timeout}s"
+            f"timeout={args.ping_timeout}s, min_latency=80ms"
             + (f", max_nodes={args.max_ping_nodes}" if args.max_ping_nodes > 0 else "")
             + (f", max_ping={args.max_ping_ms}ms" if args.max_ping_ms > 0 else "")
             + ")")
@@ -1777,6 +1801,41 @@ def main(argv: list[str]) -> int:
                 chs_nodes.append(n)
         log(f"[gha] SPLIT (before max-servers): BS={len(bs_nodes)}, "
             f"ChS={len(chs_nodes)}, total={len(nodes)}")
+
+        # v71: Дедупликация по серверу (host:port:pbk:sid:sni).
+        # Один сервер с 5-49 разными fp — оставляем только chrome + firefox.
+        if args.dedup_by_server:
+            for label, node_list in [("BS", bs_nodes), ("ChS", chs_nodes)]:
+                before = len(node_list)
+                # Группируем по server_key
+                groups: dict[str, list[XrayNode]] = {}
+                for n in node_list:
+                    key = f"{n.host}:{n.port}:{n.query.get('pbk','')}:{n.query.get('sid','')}:{n.query.get('sni','')}"
+                    groups.setdefault(key, []).append(n)
+
+                # Из каждой группы — оставляем только chrome и firefox.
+                # Если нет chrome/firefox — оставляем random.
+                deduped: list[XrayNode] = []
+                for key, group in groups.items():
+                    chrome = [n for n in group if (n.query.get("fp") or "").lower() == "chrome"]
+                    firefox = [n for n in group if (n.query.get("fp") or "").lower() == "firefox"]
+                    kept = []
+                    if chrome:
+                        kept.append(chrome[0])  # первый chrome
+                    if firefox:
+                        kept.append(firefox[0])  # первый firefox
+                    if not kept:
+                        # Нет chrome/firefox — оставляем первый (random/qq/safari)
+                        kept = [group[0]]
+                    deduped.extend(kept)
+
+                if label == "BS":
+                    bs_nodes = deduped
+                else:
+                    chs_nodes = deduped
+                log(f"[gha] {label} dedup: {before} → {len(deduped)} "
+                    f"({before - len(deduped)} duplicates removed, kept chrome+firefox per server)")
+
         # v66: Дедупликация между БС и ЧС — если узел (host, port, protocol)
         # уже в БС, убираем из ЧС. БС приоритет (мобилка РФ важнее WiFi).
         bs_keys = {(n.host, str(n.port), n.protocol) for n in bs_nodes}
@@ -1838,6 +1897,19 @@ def main(argv: list[str]) -> int:
             chs_path.write_text("", encoding="utf-8")  # ПУСТОЙ — fix v2rayN
         log(f"[gha] SPLIT files: BS={len(bs_nodes)} ({bs_path.name}) + "
             f"ChS={len(chs_nodes)} ({chs_path.name})")
+
+        # v70: Записать source_map.json — маппинг URL → source_url.
+        # alive_test.py использует это для статистики alive/dead по источникам.
+        source_map: dict[str, str] = {}
+        for n in bs_nodes + chs_nodes:
+            src = n.source_url or "?"
+            short = src.split("/")[-1] if "/" in src else src[:40]
+            source_map[n.raw_url] = short
+        sm_path = args.output.parent / "source_map.json"
+        sm_path.write_text(json.dumps(source_map, ensure_ascii=False),
+                            encoding="utf-8")
+        log(f"[gha] wrote source_map.json ({len(source_map)} entries) "
+            f"for alive_test source tracking")
 
         # v62: ФИНАЛЬНЫЕ source stats — кто дожил до финала (после всех фильтров).
         # Это показывает, какие источники реально вкладывают рабочие конфиги.

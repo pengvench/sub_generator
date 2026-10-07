@@ -46,6 +46,9 @@ data/happ_keys/*
 !data/preload_bs.txt
 !data/preload_chs.txt
 !data/preload_report.json
+!data/alive_test_report.json
+!data/alive_test_chs_report.json
+!data/source_map.json
 !data/sources.txt
 !data/known_good.txt
 !data/sni_whitelist.txt

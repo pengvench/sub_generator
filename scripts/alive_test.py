@@ -301,6 +301,8 @@ def main(argv: list[str]) -> int:
                    help="Путь к sing-box binary.")
     p.add_argument("--xray-bin", type=Path, default=None,
                    help="Путь к xray binary (v69: для raw/xhttp транспорта).")
+    p.add_argument("--source-map", type=Path, default=None,
+                   help="JSON маппинг URL → source (v70: для статистики alive/dead по источникам).")
     p.add_argument("--max-nodes", type=int, default=200,
                    help="Лимит числа узлов для тестирования (default: 200).")
     p.add_argument("--workers", type=int, default=8,
@@ -345,6 +347,17 @@ def main(argv: list[str]) -> int:
     if not nodes:
         log("[alive] FATAL: 0 valid nodes")
         return 1
+
+    # v70: Загрузить source_map для статистики alive/dead по источникам.
+    source_map: dict[str, str] = {}
+    if args.source_map and args.source_map.exists():
+        try:
+            source_map = json.loads(args.source_map.read_text(encoding="utf-8"))
+            log(f"[alive] loaded source_map: {len(source_map)} entries")
+        except Exception as exc:
+            log(f"[alive] source_map load failed: {exc}")
+    else:
+        log("[alive] no source_map — source stats will be unavailable")
 
     if args.max_nodes > 0 and len(nodes) > args.max_nodes:
         log(f"[alive] truncating to {args.max_nodes} (--max-nodes)")
@@ -393,6 +406,28 @@ def main(argv: list[str]) -> int:
                 + (f" {r.get('error', '')[:80]}" if r.get("error") else ""))
 
     log(f"[alive] done: {alive_count} alive, {dead_count} dead")
+
+    # v70: Source stats — alive/dead по источникам.
+    if source_map:
+        src_alive: dict[str, int] = {}
+        src_dead: dict[str, int] = {}
+        src_total: dict[str, int] = {}
+        for n, url in nodes:
+            src = source_map.get(url, source_map.get(url.split("#")[0], "?"))
+            src_total[src] = src_total.get(src, 0) + 1
+        for url in alive_urls:
+            src = source_map.get(url, source_map.get(url.split("#")[0], "?"))
+            src_alive[src] = src_alive.get(src, 0) + 1
+        for src in src_total:
+            src_dead[src] = src_total[src] - src_alive.get(src, 0)
+
+        log(f"[alive] source stats (alive/dead/total):")
+        for src in sorted(src_total.keys(), key=lambda s: -src_alive.get(s, 0)):
+            a = src_alive.get(src, 0)
+            d = src_dead.get(src, 0)
+            t = src_total[src]
+            pct = (a / t * 100) if t > 0 else 0
+            log(f"[alive]   {a:4d}/{t:4d} ({pct:5.1f}%) alive  ← {src}")
 
     # v65: --final-limit — обрез ПОСЛЕ alive-test, по latency (быстрые первыми).
     # Сортируем alive по latency, берём топ-N.

@@ -1,30 +1,36 @@
 # GitHub Actions: авто-обновление подписок по cron'у.
 #
-# АРХИТЕКТУРА v9 — 4 ПАРАЛЛЕЛЬНЫХ JOB, ПОЛНЫЙ ПАЙПЛАЙН НА GITHUB:
+# АРХИТЕКТУРА v11 — 5 JOB: GEO ВЫНЕСЕН В ОТДЕЛЬНЫЙ JOB,
+# БЕЗ ИСКУССТВЕННЫХ ТАЙМАУТОВ (убраны по требованию владельца):
 #
-#   refresh ──→ alive-bs ──┐
-#        │                 ├──→ publish (merge + fallback'и + коммит)
-#        └──→ alive-chs ──┘
+#   refresh ──→ geo ──→ alive-bs ──┐
+#        │                ├──→ publish (merge + fallback'и + коммит)
+#        └────────────→ alive-chs ┘ (needs: geo)
 #
-#   1. refresh  — sync SNI → fetch TG → refresh_subs.py:
-#      fetch -> parse -> dedup по node.key -> ДЕДУП ПО СЕРВЕРУ (в начале,
-#      до пинга: fp-варианты одного сервера живут на одном host:port,
-#      TCP-результат идентичен — замер: 197020 конфигов → 97313 серверов)
-#      -> SNI-сортировка -> TCP-ping по УНИКАЛЬНЫМ host:port (endpoint-dedup;
-#      успешные подключения захватывают IP через getpeername)
-#      -> known_good append -> geo-rename (DNS-resolve только для хостов
-#      без захваченного IP) -> split БС/ЧС -> artifact stage-pool.
-#   2. alive-bs / alive-chs — ПАРАЛЛЕЛЬНО: sing-box/xray SOCKS5 + HTTP-пробы
-#      через прокси (exit-IP api.ipify.org + ig/yt/tg; порог --max-latency-ms
-#      на TTFB пробы exit-IP). Раньше шли последовательно в одном job
-#      (26 мин); параллельно — ~10-15 мин на job.
-#   3. publish — merge результатов, fallback'и, base64 → subs.txt /
+#   1. refresh — sync SNI → fetch TG → refresh_subs.py: fetch -> dedup
+#      по серверу (В НАЧАЛЕ, до пинга) -> SNI-сорт -> TCP-ping по
+#      уникальным host:port (endpoint-dedup; IP захватываются через
+#      getpeername и пишутся в data/ping_host_ips.json) -> known_good
+#      -> split БС/ЧС. БЕЗ ГЕО — оно переехало в отдельный job.
+#   2. geo — geo_stage.py: rename «🇩🇪 DE peppo» (цепочка ip.sb→ip-api→
+#      ipwho) + drop «🌐 peppo» + персистентный кеш data/geo_cache.json.
+#      IP-хосты берёт из ping_host_ips.json (без повторного DNS).
+#   3. alive-bs / alive-chs — ПАРАЛЛЕЛЬНО после geo: sing-box/xray
+#      SOCKS5 + HTTP-пробы через прокси (exit-IP api.ipify.org +
+#      ig/yt/tg; порог --max-latency-ms на TTFB пробы exit-IP).
+#   4. publish — merge результатов, fallback'и, base64 → subs.txt /
 #      subs_chs.txt, коммит в main (git-auto-commit).
 #
-# GITVERSE (v9) — ОТДЕЛЬНЫЙ репозиторий sub_generator_alive (второй архив):
+# ТАЙМАУТЫ НА JOB'Ы УБРАНЫ (v11): в v9 при разбивке монолита я проставил
+# timeout-minutes 45/30/15 — их никто не просил, и refresh валился на
+# них (инцидент 2026-10-09: 45:00, geoip 7600/8132). Теперь job'ы
+# работают без моих ограничений — до платформенного предела GHA
+# (360 мин/job, значение GitHub по умолчанию, не моё).
+#
+# GITVERSE — ОТДЕЛЬНЫЙ репозиторий sub_generator_alive (второй архив):
 # там работает ТОЛЬКО alive-test из РФ-датацентра (РФ-vantage), пулы он
-# берёт по публичному raw-ссылкам ЭТОГО репо (data/preload_bs.txt /
-# data/preload_chs.txt коммитятся ниже в main). Никакого mirror-push и
+# берёт по публичному raw ЭТОГО репо (data/pool_bs.txt /
+# data/pool_chs.txt коммитятся ниже в main). Никакого mirror-push и
 # GITVERSE_TOKEN здесь НЕТ и не нужно. Подробности: docs/GHA_REFRESH.md,
 # раздел «GitVerse: отдельный репо alive-test».
 #
@@ -34,7 +40,7 @@
 # тяжёлые job'ы там скипнутся и не сожгут квоту (30 мин/задача,
 # ~1000 мин/мес public).
 #
-# ВАЖНОЕ (накоплено v5-v9):
+# ВАЖНОЕ (накоплено v5-v10):
 #   - Отчёты alive_test_report.json / alive_test_chs_report.json в git
 #     БОЛЬШЕ НЕ КОММИТЯТСЯ (инцидент 2026-10-09: 148 МБ + 931 МБ — push
 #     отклонён лимитом GitHub 100 МБ/файл). С v8 в отчётах вообще НЕТ тел
@@ -46,12 +52,20 @@
 #   - Порог TCP-ping --max-ping-ms: 2000 (владелец: 1000 слишком жёстко;
 #     замер GHA: p50=173ms p95=424ms max=997ms у живых). --ping-timeout 2.5
 #     поднят с 1.5 — иначе порог 2000 мёртв (timeout убивает connect раньше).
-#   - Гео: цепочка api.ip.sb → ip-api.com → ipwho.is (метаданные, НЕ критерий
-#     жизни). Узлы «🌐 peppo» отбрасываются (drop-geo-fallback).
+#   - Гео (job geo): цепочка api.ip.sb → ip-api.com → ipwho.is (метаданные,
+#     НЕ критерий жизни). Узлы «🌐 peppo» отбрасываются (инпут
+#     drop_geo_fallback; выключить — Run workflow → drop_geo_fallback=false).
 #   - Антифейк: --min-ping-ms 80 и --drop-cdn-ips — ВКЛЮЧЕНЫ.
 #   - Классификация БС/ЧС: гадайка по ключевым словам — ВКЛЮЧЕНА.
 #   - User-Agent (v6): феч подписок = v2rayNG/1.10.8; пробы = Chrome 141.
 #   - Недоказанные эвристики (cross-dedup) — ВЫКЛЮЧЕНЫ (см. --help).
+#   - v10 (инцидент 2026-10-09: job refresh убит на 45:00, geoip 7600/8132):
+#     geoip-лукапы шли с 8 воркерами и кеш был только in-memory (один ран).
+#     Фикс: персистентный кеш data/geo_cache.json (грузится ДО rename,
+#     мержится ПОСЛЕ, коммитится в main). Неудачи цепочки в кеш НЕ
+#     пишутся. v11 — кеш кормит ОТДЕЛЬНЫЙ geo-job (geo_stage.py).
+#   - ГИСТОРИЯ ТАЙМАУТОВ: v9 ставил 45/30/15 при разбивке на jobs —
+#     v11 убрал их все (см. шапку).
 name: Refresh subs
 
 on:
@@ -102,9 +116,10 @@ jobs:
     runs-on: ubuntu-24.04
     # Страховка от случайного зеркала (на GitHub всегда true, см. шапку).
     if: github.server_url == 'https://github.com'
-    # 45 минут: ping ~90k уникальных endpoint'ов с 256 воркерами (~10-15 мин)
-    # + fetch источников (~5-10 мин) + geo (~3-5 мин). Запас на рост списков.
-    timeout-minutes: 45
+    # БЕЗ таймаута (v11: убраны — см. шапку). Профиль: fetch ~3-6 мин +
+    # ping ~90k endpoint'ов с 256 воркерами ~10-15 мин. ГЕО ЗДЕСЬ
+    # БОЛЬШЕ НЕТ (отдельный job). Дальше — платформенный предел GHA
+    # (360 мин/job — дефолт GitHub, не моя строка).
 
     steps:
       - name: Checkout
@@ -144,14 +159,17 @@ jobs:
           echo "=== data/tg_subs.txt ==="
           cat data/tg_subs.txt 2>/dev/null || echo "(not generated — see logs above)"
 
-      - name: Refresh subs (fetch + server-dedup + ping endpoints + geo + split)
+      - name: Refresh subs (fetch + server-dedup + ping endpoints + split)
         # Порядок: collect -> ДЕДУП ПО СЕРВЕРУ (до пинга!) -> SNI-сорт ->
-        # ping по уникальным host:port (IP захватываются для geo) ->
-        # known_good -> geo-rename (без повторного DNS) -> split БС/ЧС.
+        # ping по уникальным host:port (IP пишутся в ping_host_ips.json) ->
+        # known_good -> split БС/ЧС. ГЕО ЗДЕСЬ НЕТ — отдельный job geo.
         # --ping-timeout 2.5 поднят с 1.5: порог --max-ping-ms 2000 должен
         # успеть сработать (timeout убивает connect раньше фильтра).
         # --ping-workers 256: TCP-ping IO-bound, 128 → ~20 мин на 90k,
         # 256 → ~10-12 мин (раннер 4 vCPU держит спокойно).
+        # --ping-ips-out: host→ip с пинга — их читает geo-job (без DNS).
+        # ГЕО ФЛАГОВ ЗДЕСЬ БОЛЬШЕ НЕТ: --geo-rename уехал в job geo
+        # (scripts/geo_stage.py; см. шапку).
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -171,20 +189,19 @@ jobs:
             --guess-source-type \
             --fetch-timeout 25.0 \
             --sort-by-sni \
-            --geo-rename \
-            --geo-rename-workers 8 \
-            --geo-rename-timeout 8.0 \
             --known-good data/known_good.txt \
             --known-good-mode none \
             --split-bs-chs \
+            --ping-ips-out data/ping_host_ips.json \
             ${{ inputs.vless_only == true && '--vless-only' || '' }} \
-            ${{ inputs.drop_geo_fallback != false && '--drop-geo-fallback' || '--no-drop-geo-fallback' }} \
             --max-servers 0
 
       - name: Upload stage-pool artifact
-        # Прелоад-файлы для alive-jobs и publish (артефакт = замена общего
-        # диска между job'ами). Пулы в main коммитит publish; сырые пулы
-        # по raw-ссылкам отсюда же забирает GitVerse-репо sub_generator_alive.
+        # Прелоад-файлы для geo/alive/publish (артефакт = замена общего
+        # диска между job'ами). Вход geo-job: пулы + geo_cache.json (seed)
+        # + ping_host_ips.json (IP с пинга, без повторного DNS).
+        # Пулы в main коммитит publish; сырые пулы по raw-ссылкам отсюда
+        # же забирает GitVerse-репо sub_generator_alive.
         uses: actions/upload-artifact@v4
         with:
           name: stage-pool
@@ -193,6 +210,8 @@ jobs:
             data/preload_bs.txt
             data/preload_chs.txt
             data/preload_report.json
+            data/geo_cache.json
+            data/ping_host_ips.json
             data/source_map.json
             data/tg_subs.txt
             data/sni_whitelist.txt
@@ -200,16 +219,66 @@ jobs:
           if-no-files-found: error
 
   # ==========================================================================
-  # JOB 2/4: alive-test БС (мобилка РФ). Параллелен alive-chs.
+  # JOB 2/5: GEO — переименование + дроп «🌐 peppo» (ОТДЕЛЬНЫЙ job, v11).
+  # ==========================================================================
+  geo:
+    runs-on: ubuntu-24.04
+    needs: refresh
+    # Страховка от случайного зеркала (на GitHub всегда true).
+    if: github.server_url == 'https://github.com'
+    # БЕЗ моего таймаута (v11; платформенный предел 360 сам по себе).
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Python-степ не нужен: geo_stage.py + refresh_subs.py — stdlib.
+      - name: Download stage-pool
+        uses: actions/download-artifact@v5
+        with:
+          name: stage-pool
+          path: data
+
+      - name: Geo rename + drop unknown (geo_stage.py)
+        # Пулы переименовываются «🇩🇪 DE peppo» (цепочка ip.sb→ip-api→ipwho,
+        # кеш data/geo_cache.json) и «🌐 peppo» выбрасывается (кроме
+        # --keep-unknown; инпут drop_geo_fallback как раньше).
+        # IP-хосты — из ping_host_ips.json (захвачены пингом, без DNS).
+        run: |
+          python3 scripts/geo_stage.py \
+            --pool data/preload_bs.txt \
+            --pool data/preload_chs.txt \
+            --pool data/preload.txt \
+            --geo-cache data/geo_cache.json \
+            --known-ips data/ping_host_ips.json \
+            --workers 32 \
+            --timeout 8.0 \
+            ${{ inputs.drop_geo_fallback != false && '' || '--keep-unknown' }}
+          echo "=== preload_bs.txt (first 3) ==="
+          head -n 3 data/preload_bs.txt 2>/dev/null || true
+
+      - name: Upload stage-geo artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-geo
+          path: |
+            data/preload.txt
+            data/preload_bs.txt
+            data/preload_chs.txt
+            data/geo_cache.json
+          retention-days: 3
+          if-no-files-found: warn
+
+  # ==========================================================================
+  # JOB 3/5: alive-test БС (мобилка РФ). Параллелен alive-chs; идёт ПОСЛЕ geo.
   # ==========================================================================
   alive-bs:
     runs-on: ubuntu-24.04
-    needs: refresh
-    # Страховка от случайного зеркала (на GitHub всегда true, см. шапку).
+    needs: geo
+    # Страховка от случайного зеркала (на GitHub всегда true).
     if: github.server_url == 'https://github.com'
-    # ~7 мин на 4.7k узлов с 32 воркерами (замер v7-разбивки: 9.1k узлов
-    # двумя последовательными прогонами = 26 мин; теперь параллельно).
-    timeout-minutes: 30
+    # ~7 мин на 4.7k узлов с 32 воркерами. БЕЗ моего таймаута (v11).
 
     steps:
       - name: Checkout
@@ -219,13 +288,15 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          # pip install НЕ нужен: alive_test.py — чистый stdlib
-          # (cryptography нужен только фечу happ:// в refresh).
+          # pip install НЕ нужен: alive_test.py — чистый stdlib.
 
-      - name: Download stage-pool
+      - name: Download stage-geo
+        # Пулы УЖЕ переименованы и очишены от «🌐 peppo» (job geo).
+        # Если geo упал — этот job не стартует (needs); publish подхватит
+        # stage-pool и застрахуется fallback'ами.
         uses: actions/download-artifact@v5
         with:
-          name: stage-pool
+          name: stage-geo
           path: data
 
       - name: Download sing-box + xray Linux binaries
@@ -290,14 +361,14 @@ jobs:
           if-no-files-found: warn
 
   # ==========================================================================
-  # JOB 3/4: alive-test ЧС (WiFi / не-РФ). Параллелен alive-bs.
+  # JOB 4/5: alive-test ЧС (WiFi / не-РФ). Параллелен alive-bs; после geo.
   # ==========================================================================
   alive-chs:
     runs-on: ubuntu-24.04
-    needs: refresh
-    # Страховка от случайного зеркала (на GitHub всегда true, см. шапку).
+    needs: geo
+    # Страховка от случайного зеркала (на GitHub всегда true).
     if: github.server_url == 'https://github.com'
-    timeout-minutes: 30
+    # БЕЗ моего таймаута (v11).
 
     steps:
       - name: Checkout
@@ -308,10 +379,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Download stage-pool
+      - name: Download stage-geo
         uses: actions/download-artifact@v5
         with:
-          name: stage-pool
+          name: stage-geo
           path: data
 
       - name: Download sing-box + xray Linux binaries
@@ -374,16 +445,16 @@ jobs:
           if-no-files-found: warn
 
   # ==========================================================================
-  # JOB 4/4: merge результатов, fallback'и, base64, коммит в main.
+  # JOB 5/5: merge результатов, fallback'и, base64, коммит в main.
   # ==========================================================================
   publish:
     runs-on: ubuntu-24.04
-    needs: [refresh, alive-bs, alive-chs]
-    # always() — publish живёт даже если alive-job упал (тогда остаются
+    needs: [refresh, geo, alive-bs, alive-chs]
+    # always() — publish живёт даже если geo/alive упали (тогда остаются
     # пингованные списки из stage-pool). Но если упал refresh — публиковать
     # нечего, пропускаем. Страховка от случайного зеркала — как у всех.
     if: always() && github.server_url == 'https://github.com' && needs.refresh.result == 'success'
-    timeout-minutes: 15
+    # БЕЗ моего таймаута (v11).
 
     steps:
       - name: Checkout
@@ -392,10 +463,21 @@ jobs:
           fetch-depth: 1
 
       - name: Download stage-pool
+        # База: пингованные пулы + source_map + geo_cache-заготовка.
         uses: actions/download-artifact@v5
         with:
           name: stage-pool
           path: data
+
+      - name: Download stage-geo (поверх)
+        # Пулы ПЕРЕИМЕНОВАННЫЕ и без «🌐 peppo». continue-on-error: geo
+        # упал → работаем с сырыми пинг-пулами из stage-pool (без rename
+        # и без drop peppo — лучше нечего, чем пусто).
+        uses: actions/download-artifact@v5
+        with:
+          name: stage-geo
+          path: data
+        continue-on-error: true
 
       - name: Download alive-bs result
         # continue-on-error: если alive-bs упал/артефакт не создан —
@@ -506,7 +588,7 @@ jobs:
           # git-auto-commit НЕ видит новые файлы. Отчёты сознательно НЕ
           # добавляем (см. выше).
           for f in data/tg_subs.txt data/preload_bs.txt data/preload_chs.txt \
-                   data/pool_bs.txt data/pool_chs.txt \
+                   data/pool_bs.txt data/pool_chs.txt data/geo_cache.json \
                    data/preload.txt data/preload_report.json \
                    data/source_map.json \
                    data/sni_whitelist.txt \

@@ -652,6 +652,77 @@ def _geoip_lookup_ip(ip: str, timeout: float = 8.0) -> tuple[str, str]:
         _geo_cache[ip] = (code, flag)
     return code, flag
 
+
+
+def _geo_cache_seed_and_load(path: Path, log_sink) -> int:
+    """Загрузить персистентный кеш гео и посеять в оба in-memory кеша.
+
+    Формат — как у subgen.geo.load_geo_cache: {ip: [код, флаг]}.
+    Возвращает число загруженных записей (0 = нет файла/пустой/битый).
+    """
+    loaded: dict[str, tuple[str, str]] = {}
+    try:
+        from subgen.geo import load_geo_cache
+        try:
+            loaded = load_geo_cache(path)
+        except Exception as exc:
+            log_sink(f"[gha] geo-cache: load failed ({type(exc).__name__}: {exc}) — cold start")
+            loaded = {}
+    except ImportError:
+        pass
+    # Фолбэк-парсер (тот же формат), если subgen.geo недоступен.
+    if not loaded and path and path.is_file():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for ip, pair in raw.items():
+                    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                        loaded[str(ip)] = (str(pair[0]), str(pair[1]))
+        except Exception:
+            pass
+    if not loaded:
+        return 0
+    # Не сеем записи-неудачи ("🌐"/"??") — транзиентный отказ цепочки
+    # не должен замораживаться в персистентном кеше (в сети их перерешат).
+    loaded = {ip: cf for ip, cf in loaded.items() if cf[0] not in ("??", "🌐")}
+    if not loaded:
+        return 0
+    with _geo_cache_lock:
+        _geo_cache.update(loaded)
+    try:
+        from subgen import geo as _geo_mod
+        _geo_mod._geo_cache.update(loaded)
+    except ImportError:
+        pass
+    return len(loaded)
+
+
+def _geo_cache_flush(path: Path, loaded_at_start: int, log_sink) -> None:
+    """Мержит оба in-memory кеша, пишет файл, логирует прирост."""
+    merged: dict[str, tuple[str, str]] = {}
+    try:
+        from subgen import geo as _geo_mod
+        merged.update(_geo_mod._geo_cache)
+    except ImportError:
+        pass
+    with _geo_cache_lock:
+        merged.update(_geo_cache)
+    if not merged:
+        return
+    # Не пишем записи-неудачи: "🌐"/"??" = цепочка не смогла СЕЙЧАС
+    # (rate-limit и т.п.) — в следующий ран их перерешат по-нормальному.
+    merged = {ip: cf for ip, cf in merged.items() if cf[0] not in ("??", "🌐")}
+    if not merged:
+        return
+    payload = {ip: [code, flag] for ip, (code, flag) in merged.items()}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        encoding="utf-8")
+        log_sink(f"[gha] geo-cache: saved {path} — {len(payload)} entries "
+                 f"(+{max(0, len(payload) - loaded_at_start)} new this run)")
+    except Exception as exc:
+        log_sink(f"[gha] geo-cache: save failed ({type(exc).__name__}: {exc}) — NOT persisted")
 def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
                       log_sink, known_ips: dict[str, str] | None = None) -> None:
     """Переименовать узлы как основное приложение: «<флаг> <ISO> peppo».
@@ -731,9 +802,10 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
     log_sink(f"[gha] --geo-rename: looking up {len(unique_ips)} unique IPs")
 
     # Для каждого IP — запрос к цепочке провайдеров (см. _geoip_lookup_ip).
-    # Лимит параллелизма — 8 (api.ip.sb может rate-limit'ить; отказ провайдера
-    # уходит следующему по цепочке).
-    # Кеш внутри geoip_lookup() — повторные IP берутся из кеша мгновенно.
+    # Параллелизм задаётся --geo-rename-workers (GHA: 32). ip.sb при
+    # rate-limit'е отдаёт отказ следующему по цепочке (ip-api → ipwho),
+    # поэтому больше воркеров = быстрее без потери результата. Хиты
+    # персистентного кеша (--geo-cache) не ходят в сеть вообще.
     geo_done = 0
     geo_failed = 0
     with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="geoip") as ex:
@@ -1091,6 +1163,18 @@ def main(argv: list[str]) -> int:
                         "Больше — быстрее; отказ провайдера уходит следующему по цепочке.")
     p.add_argument("--geo-rename-timeout", type=float, default=8.0,
                    help="Таймаут одного geo-запроса, сек (по умолчанию: 8.0).")
+    p.add_argument("--geo-cache", type=Path, default=None,
+                   help="Персистентный кеш гео {ip: [код, флаг]}, json. "
+                        "Грузится ДО geo-rename, мержится и пишется ПОСЛЕ. "
+                        "Хиты кеша = 0 запросов к провайдерам: гео IP не "
+                        "меняется месяцами, со второго прогона geoip-стадия "
+                        "почти мгновенная. GHA: data/geo_cache.json "
+                        "(коммитится, см. refresh-subs.yml).")
+    p.add_argument("--ping-ips-out", type=Path, default=None,
+                   help="Сохранить host→ipv4, захваченные при TCP-ping "
+                        "(getpeername), в json. Читает отдельный geo-job "
+                        "(geo_stage.py --known-ips) — чтобы не делать "
+                        "DNS-resolve повторно. Пишется ПОСЛЕ пинга.")
     # known-good patterns — фильтр по проверенным на мобилке конфигам.
     # РЕАЛЬНО работают на его мобильной сети (TSPU). Workflow:
     #   1. Извлекает из known_good.txt паттерны: set of SNIs + set of /24 IP-subnets.
@@ -1452,6 +1536,19 @@ def main(argv: list[str]) -> int:
             f"({len(ping_host_ips)} host IPs captured для geo-rename)")
         nodes = alive
 
+        # v11: IP, захваченные пингом (getpeername), — в файл. Их читает
+        # ОТДЕЛЬНЫЙ geo-job (scripts/geo_stage.py --known-ips): без этого
+        # он делал бы DNS-resolve заново по всем доменным хостам.
+        if args.ping_ips_out and ping_host_ips:
+            try:
+                Path(args.ping_ips_out).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.ping_ips_out).write_text(
+                    json.dumps(ping_host_ips, sort_keys=True), encoding="utf-8")
+                log(f"[gha] ping IPs saved to {args.ping_ips_out} "
+                    f"({len(ping_host_ips)} hosts — для geo_stage)")
+            except Exception as exc:
+                log(f"[gha] ping IPs save failed ({type(exc).__name__}: {exc})")
+
     # 5) --max-servers применяется в самом конце (после geo-rename и сплита).
 
     # 5b) known-good: append проверенных вручную конфигов в финал.
@@ -1483,6 +1580,16 @@ def main(argv: list[str]) -> int:
     #    приложении (subgen.geo.serialize_working). Гео — цепочка провайдеров
     #    (api.ip.sb → ip-api.com → ipwho.is). Запрос идёт ИЗ GHA
     #    (не через прокси узла), для доменных host'ов делается DNS-resolve.
+    # Персистентный кеш гео (v10): грузим ДО geo-rename — хиты кеша
+    # вообще не ходят в провайдеров. Инцидент-2026-10-09: без кеша
+    # geoip-стадия (~8k IP, 8 воркеров) сама жрала ~20 мин из 45м-лимита
+    # job'а. Со второго прогона geoip почти мгновенный.
+    geo_cache_loaded = 0
+    if args.geo_rename and args.geo_cache and nodes:
+        geo_cache_loaded = _geo_cache_seed_and_load(args.geo_cache, log)
+        if geo_cache_loaded:
+            log(f"[gha] geo-cache: {geo_cache_loaded} entries preloaded from {args.geo_cache}")
+
     if args.geo_rename and nodes:
         _geo_rename_nodes(
             nodes,
@@ -1491,6 +1598,9 @@ def main(argv: list[str]) -> int:
             log_sink=log,
             known_ips=ping_host_ips,
         )
+
+    if args.geo_cache and nodes:
+        _geo_cache_flush(args.geo_cache, geo_cache_loaded, log)
 
     # drop-geo-fallback: узел без гео после цепочки провайдеров и без флага
     # в имени → бесполезен для GEO-обхода, жрёт слот в финальной подписке.

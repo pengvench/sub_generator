@@ -3,12 +3,17 @@
 
 Пайплайн (Linux, без ядер xray/sing-box):
   fetch (urllib/curl/local files) -> parse -> dedup по node.key
+  -> [optional] дедуп по серверу с выбором fp=chrome/firefox
+     (--dedup-by-server, default ON — ДО пинга и гео: fp-варианты одного
+     сервера живут на одном host:port, TCP-результат идентичен)
   -> [optional] SNI-сортировка БС-первыми (--sort-by-sni)
-  -> [optional] TCP-ping фильтр мёртвых (--with-ping), порядок сохраняется
+  -> [optional] TCP-ping фильтр мёртвых (--with-ping; пингует УНИКАЛЬНЫЕ
+     host:port — endpoint-dedup; захваченные через getpeername IP
+     переиспользуются в geo-rename), порядок входа сохраняется
   -> append known_good (--known-good, фильтр через --known-good-mode)
-  -> [optional] geo-переименование (--geo-rename)
+  -> [optional] geo-переименование (--geo-rename; DNS-resolve только для
+     хостов без захваченного при пинге IP — known_good и т.п.)
   -> split БС/ЧС по секциям sources.txt + протоколу (--split-bs-chs)
-  -> dedup по серверу с выбором fp=chrome/firefox (--dedup-by-server)
   -> запись preload.txt / preload_bs.txt / preload_chs.txt.
 
 Антифейк-фильтры (ON по умолчанию; калиброваны на known_good и ручных
@@ -379,14 +384,19 @@ def _is_valid_hostname(host: str, *, drop_cdn_ips: bool = False) -> bool:
         return False
     return True
 
-def _tcp_ping(node: XrayNode, timeout: float,
-              min_ping_ms: float = 80.0,
-              drop_cdn_ips: bool = True) -> tuple[bool, float]:
-    """Быстрый TCP-ping. True если удалось подключиться за timeout сек.
+def _tcp_ping_endpoint(host: str, port: int, timeout: float,
+                       min_ping_ms: float = 80.0,
+                       drop_cdn_ips: bool = True) -> tuple[bool, float, str]:
+    """Быстрый TCP-ping одного endpoint'а (host, port).
 
     Просто socket.connect() с таймаутом — дешёвый фильтр мёртвых узлов
     (TCP RST / timeout / DNS-fail / IDNA-fail). Реальная проверка узла —
     alive_test.py.
+
+    Возвращает (ok, latency_sec, resolved_ipv4). resolved_ipv4 — IP, к
+    которому РЕАЛЬНО подключились (getpeername), либо "". Пинг и так
+    делает DNS-resolve внутри create_connection — захватываем результат
+    бесплатно и переиспользуем в --geo-rename (без повторного DNS).
 
     min_ping_ms > 0 — отбраковка подозрительно быстрых connect'ов:
     замеры на known_good — рабочие узлы 185-320ms; Railway/Vercel/CDN —
@@ -394,36 +404,66 @@ def _tcp_ping(node: XrayNode, timeout: float,
     US-хостинг рядом с раннером GHA тоже даёт < 80ms — принятый обмен
     для РФ-подписки.
     """
-    host = (node.host or "").strip()
-    port = int(node.port or 0)
+    host = (host or "").strip()
+    port = int(port or 0)
     if not host or port <= 0:
-        return False, 0.0
+        return False, 0.0, ""
     # Санитизация host ДО DNS-запроса: IDNA-некорректные имена (метка > 63,
     # пустые метки, недопустимые символы) вызывают UnicodeError из
     # encodings.idna ВНУТРИ socket.create_connection. Это ValueError, не
     # OSError — except (OSError, ...) не ловит. Отбраковываем на старте.
     if not _is_valid_hostname(host, drop_cdn_ips=drop_cdn_ips):
-        return False, 0.0
+        return False, 0.0, ""
     t0 = time.perf_counter()
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with socket.create_connection((host, port), timeout=timeout) as sock:
             latency = time.perf_counter() - t0
             if min_ping_ms > 0 and latency < min_ping_ms / 1000.0:
-                return False, 0.0
-            return True, latency
+                return False, 0.0, ""
+            # Захватываем IP подключенного сокета (для --geo-rename без
+            # повторного DNS). Держим только IPv4 — гео-цепочка консистентна
+            # с _resolve_host_to_ip (AF_INET).
+            ip = ""
+            try:
+                peer = sock.getpeername()[0]
+                ipaddress.IPv4Address(peer)  # валидация: IPv4 или исключение
+                ip = peer
+            except (OSError, ValueError, IndexError):
+                pass
+            return True, latency, ip
     except Exception:
-        return False, 0.0
+        return False, 0.0, ""
+
+def _tcp_ping(node: XrayNode, timeout: float,
+              min_ping_ms: float = 80.0,
+              drop_cdn_ips: bool = True) -> tuple[bool, float]:
+    """Обёртка над _tcp_ping_endpoint для одиночного узла (совместимость)."""
+    ok, latency, _ip = _tcp_ping_endpoint(
+        (node.host or "").strip(), int(node.port or 0), timeout,
+        min_ping_ms=min_ping_ms, drop_cdn_ips=drop_cdn_ips)
+    return ok, latency
 
 def _ping_filter(nodes: list[XrayNode], *, timeout: float, workers: int,
                  log_sink, max_nodes: int = 0,
                  max_ping_ms: float = 0, min_ping_ms: float = 80.0,
-                 drop_cdn_ips: bool = True) -> list[XrayNode]:
+                 drop_cdn_ips: bool = True,
+                 host_ips_out: dict[str, str] | None = None) -> list[XrayNode]:
     """Пропинговать узлы параллельно, оставить только TCP-доступные.
+
+    ENDPOINT-DEDUP: все конфиги на одном host:port имеют ИДЕНТИЧНЫЙ
+    TCP-результат (fp/sni/uuid не меняют TCP-connect) — пингуем каждый
+    уникальный endpoint ОДИН раз и мапим результат на все его конфиги.
+    Замер GHA 2026-10-09: 197694 конфигов → ~90k уникальных серверов —
+    вдвое меньше сокетов при том же вердикте для каждого конфига.
 
     Порядок входного списка СОХРАНЯЕТСЯ (стабильный фильтр) — SNI-сортировка
     и порядок known_good не ломаются. Latency логируется в статистику,
     но НЕ используется для сортировки: пинг идёт с раннера GitHub (США),
     для пользователя в РФ этот порядок — шум.
+
+    host_ips_out: если передан dict — заполняется host → IPv4 (getpeername
+    успешных подключений). Используется --geo-rename'ом, чтобы НЕ делать
+    повторный DNS-resolve тех же хостов (см. _geo_rename_nodes).
 
     max_nodes > 0: пингуем только первые max_nodes (с предупреждением —
     остальное будет ПОТЕРЯНО).
@@ -435,55 +475,85 @@ def _ping_filter(nodes: list[XrayNode], *, timeout: float, workers: int,
                  f"{len(nodes)} → {max_nodes}. Неотпингованные {len(nodes) - max_nodes} "
                  f"узлов БУДУТ ПОТЕРЯНЫ. Уберите --max-ping-nodes или поставьте 0.")
         nodes = nodes[:max_nodes]
-    alive_set: dict[int, float | None] = {}  # id(node) -> latency
+
+    # Группируем конфиги по уникальным endpoint'ам (host, port).
+    endpoint_nodes: dict[tuple[str, int], list[XrayNode]] = {}
+    for n in nodes:
+        host = (n.host or "").strip()
+        try:
+            port = int(n.port or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not host or port <= 0:
+            continue  # невалидный узел — до сокетов не дойдёт, будет отброшен
+        endpoint_nodes.setdefault((host, port), []).append(n)
+    endpoints = list(endpoint_nodes.keys())
+    log_sink(f"[gha] ping: {len(nodes)} configs → {len(endpoints)} unique "
+             f"host:port endpoints (endpoint-dedup, результат мапится на все конфиги)")
+
+    alive_eps: dict[tuple[str, int], float] = {}  # endpoint -> latency
     lock = threading.Lock()
     done = 0
-    total = len(nodes)
+    total = len(endpoints)
     skipped_bad_host = 0
     slow_filtered = 0
 
-    def probe(node: XrayNode) -> tuple[XrayNode, float | None]:
-        ok, latency = _tcp_ping(node, timeout, min_ping_ms=min_ping_ms,
-                                drop_cdn_ips=drop_cdn_ips)
-        return node, latency if ok else None
+    def probe(ep: tuple[str, int]) -> tuple[tuple[str, int], bool, float, str]:
+        host, port = ep
+        ok, latency, ip = _tcp_ping_endpoint(host, port, timeout,
+                                             min_ping_ms=min_ping_ms,
+                                             drop_cdn_ips=drop_cdn_ips)
+        return ep, ok, latency, ip
 
     with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="ping") as ex:
-        futures = {ex.submit(probe, n): n for n in nodes}
+        futures = {ex.submit(probe, ep): ep for ep in endpoints}
         for fut in as_completed(futures):
+            ep, ok, latency, ip = fut.result()
             done += 1
-            node, latency = fut.result()
             with lock:
-                if latency is not None:
+                if ok:
                     if max_ping_ms > 0 and latency > max_ping_ms / 1000.0:
                         slow_filtered += 1
                     else:
-                        alive_set[id(node)] = latency
+                        alive_eps[ep] = latency
+                        if host_ips_out is not None and ip and ep[0] not in host_ips_out:
+                            host_ips_out[ep[0]] = ip
                 else:
-                    if not _is_valid_hostname((node.host or "").strip(),
-                                              drop_cdn_ips=drop_cdn_ips):
+                    if not _is_valid_hostname(ep[0], drop_cdn_ips=drop_cdn_ips):
                         skipped_bad_host += 1
-            if done % 25 == 0 or done == total:
-                alive_count = len(alive_set)
-                log_sink(f"[gha] ping progress {done}/{total} ({alive_count} alive"
-                         + (f", {slow_filtered} slow (>{max_ping_ms}ms)" if max_ping_ms > 0 else "")
+            # Лог не чаще каждых 500 endpoint'ов (90k/25 = 3600 строк —
+            # старый прогресс-спам раздувал логи GHA).
+            if done % 500 == 0 or done == total:
+                alive_count = len(alive_eps)
+                log_sink(f"[gha] ping progress {done}/{total} endpoints ({alive_count} alive"
+                         + (f", {slow_filtered} slow (>{max_ping_ms:g}ms)" if max_ping_ms > 0 else "")
                          + (f", {skipped_bad_host} bad-host" if skipped_bad_host else "")
                          + ")")
 
-    # Возвращаем в исходном порядке (стабильно).
-    result = [n for n in nodes if id(n) in alive_set]
+    # Мапим результат endpoint'а обратно на конфиги (в исходном порядке).
+    def _ep_of(n: XrayNode) -> tuple[str, int] | None:
+        host = (n.host or "").strip()
+        try:
+            port = int(n.port or 0)
+        except (TypeError, ValueError):
+            return None
+        if not host or port <= 0:
+            return None
+        return (host, port)
 
-    latencies = sorted(v for v in alive_set.values() if v is not None)
+    alive_ep_set = set(alive_eps)
+    result = [n for n in nodes if _ep_of(n) in alive_ep_set]
+
+    latencies = sorted(alive_eps.values())
     if latencies:
         p50 = latencies[len(latencies) // 2]
         p95 = latencies[int(len(latencies) * 0.95)] if len(latencies) > 1 else latencies[0]
         log_sink(f"[gha] ping stats: p50={p50*1000:.0f}ms p95={p95*1000:.0f}ms "
-                 f"max={latencies[-1]*1000:.0f}ms ({len(latencies)} alive"
-                 + (f", {slow_filtered} slow filtered (>{max_ping_ms}ms)" if max_ping_ms > 0 and slow_filtered > 0 else "")
+                 f"max={latencies[-1]*1000:.0f}ms ({len(latencies)} alive endpoints"
+                 + (f", {slow_filtered} slow filtered (>{max_ping_ms:g}ms)" if max_ping_ms > 0 and slow_filtered > 0 else "")
                  + ")")
-        for n in result[:3]:
-            lat = alive_set.get(id(n))
-            if lat is not None:
-                log_sink(f"[gha]   fastest-sample: {lat*1000:.0f}ms  {n.host}:{n.port}")
+        for ep, lat in list(alive_eps.items())[:3]:
+            log_sink(f"[gha]   fastest-sample: {lat*1000:.0f}ms  {ep[0]}:{ep[1]}")
 
     return result
 
@@ -583,13 +653,21 @@ def _geoip_lookup_ip(ip: str, timeout: float = 8.0) -> tuple[str, str]:
     return code, flag
 
 def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
-                      log_sink) -> None:
+                      log_sink, known_ips: dict[str, str] | None = None) -> None:
     """Переименовать узлы как основное приложение: «<флаг> <ISO> peppo».
 
     ВХОД: список XrayNode (mutates node.name + node.raw_url).
     Гео берётся через цепочку провайдеров (api.ip.sb → ip-api.com → ipwho.is)
     для host узла (IP берётся напрямую, для домена — DNS-resolve). Кеш по IP —
     до 10000 узлов делают ~5000 запросов (IP дублируются у CDN-узлов).
+
+    ЗАЧЕМ DNS-RESOLVE ВООБЩЕ: гео-провайдеры принимают только IP, не домен —
+    чтобы узнать страну узла, нужно сначала узнать его IP. Но TCP-ping и так
+    резолвит каждый host внутри socket.create_connection — поэтому с v7
+    успешные подключения захватывают свой IP (getpeername) и передаются сюда
+    через known_ips: для этих хостов DNS-резолв ПРОПУСКАЕТСЯ. Реальный DNS
+    остаётся только для known_good-узлов (не проходили пинг) и хостов,
+    чей endpoint был мёртв (их и так нет в финале).
 
     Имя формата: «🇩🇪 DE peppo» (с пробелом перед peppo, как в serialize_working).
     На fallback (geo недоступно): «🌐 peppo» (земля вместо "??").
@@ -605,30 +683,48 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
     log_sink(f"[gha] --geo-rename: looking up geo for {len(nodes)} nodes "
              f"(workers={workers}, timeout={timeout}s)")
 
-    # Собираем уникальные хосты → IP (для кеширования DNS-resolve).
-    host_to_ip: dict[str, str] = {}
+    # Собираем уникальные хосты → IP.
+    # Сначала берём IP, уже захваченные во время TCP-ping (getpeername) —
+    # для них DNS-resolve НЕ нужен (см. докстринг).
     unique_hosts = {n.host for n in nodes if n.host}
-    log_sink(f"[gha] --geo-rename: {len(unique_hosts)} unique hosts to resolve")
+    host_to_ip: dict[str, str] = {}
+    to_resolve: list[str] = []
+    reused_from_ping = 0
+    for h in unique_hosts:
+        known = (known_ips or {}).get(h, "")
+        if known:
+            host_to_ip[h] = known
+            reused_from_ping += 1
+        else:
+            to_resolve.append(h)
+    if known_ips:
+        log_sink(f"[gha] --geo-rename: {reused_from_ping}/{len(unique_hosts)} hosts "
+                 f"reuse IPs captured during ping (no DNS needed)")
+    if not to_resolve:
+        log_sink(f"[gha] --geo-rename: DNS-resolve skipped — all IPs known from ping")
+    else:
+        log_sink(f"[gha] --geo-rename: DNS-resolve {len(to_resolve)} hosts "
+                 f"(known_good / непингованные)")
 
-    # Резолвим домены параллельно (IP-хосты проходят instantly).
-    def _resolve_one(host: str) -> tuple[str, str]:
-        return host, _resolve_host_to_ip(host, timeout=min(3.0, timeout))
+        # Резолвим домены параллельно (IP-хосты проходят instantly).
+        def _resolve_one(host: str) -> tuple[str, str]:
+            return host, _resolve_host_to_ip(host, timeout=min(3.0, timeout))
 
-    resolved_count = 0
-    failed_resolve = 0
-    with ThreadPoolExecutor(max_workers=max(4, workers), thread_name_prefix="dns") as ex:
-        futures = {ex.submit(_resolve_one, h): h for h in unique_hosts}
-        for fut in as_completed(futures):
-            host, ip = fut.result()
-            host_to_ip[host] = ip
-            resolved_count += 1
-            if not ip:
-                failed_resolve += 1
-            if resolved_count % 50 == 0 or resolved_count == len(unique_hosts):
-                log_sink(f"[gha] --geo-rename: DNS-resolve progress "
-                         f"{resolved_count}/{len(unique_hosts)} ({failed_resolve} failed)")
-    log_sink(f"[gha] --geo-rename: DNS done, {len(unique_hosts) - failed_resolve} resolved, "
-             f"{failed_resolve} failed")
+        resolved_count = 0
+        failed_resolve = 0
+        with ThreadPoolExecutor(max_workers=max(4, workers), thread_name_prefix="dns") as ex:
+            futures = {ex.submit(_resolve_one, h): h for h in to_resolve}
+            for fut in as_completed(futures):
+                host, ip = fut.result()
+                host_to_ip[host] = ip
+                resolved_count += 1
+                if not ip:
+                    failed_resolve += 1
+                if resolved_count % 50 == 0 or resolved_count == len(to_resolve):
+                    log_sink(f"[gha] --geo-rename: DNS-resolve progress "
+                             f"{resolved_count}/{len(to_resolve)} ({failed_resolve} failed)")
+        log_sink(f"[gha] --geo-rename: DNS done, {len(to_resolve) - failed_resolve} resolved, "
+                 f"{failed_resolve} failed")
 
     # Уникальные IP → geo lookup (кеш; цепочка api.ip.sb → ip-api.com → ipwho.is).
     unique_ips = {ip for ip in host_to_ip.values() if ip}
@@ -695,6 +791,38 @@ def _geo_rename_nodes(nodes: list[XrayNode], *, workers: int, timeout: float,
     log_sink(f"[gha] --geo-rename: {renamed_count} renamed (chain ip.sb→ip-api→ipwho), "
              f"{flag_from_name_count} from name (flag extracted), "
              f"{real_fallback_count} real fallback (no flag)")
+
+# ---------------------------------------------------------------------- dedup
+
+def _dedup_by_server(nodes: list[XrayNode], log_sink, label: str) -> list[XrayNode]:
+    """Дедупликация по серверу (host:port:pbk:sid:sni) — держать fp=chrome+firefox.
+
+    Один сервер с 5-49 разными fp — оставляем только chrome и firefox
+    (если их нет — первый попавшийся). Вызывается ДО TCP-ping и geo-rename
+    (по вердикту владельца: незачем 5 раз пинговать/резолвить один сервер —
+    fp не меняет ни TCP-connect, ни IP). Порядок внутри — по первому
+    вхождению группы; SNI-сортировка ниже наведёт итоговый порядок.
+    """
+    groups: dict[str, list[XrayNode]] = {}
+    for n in nodes:
+        key = f"{n.host}:{n.port}:{n.query.get('pbk','')}:{n.query.get('sid','')}:{n.query.get('sni','')}"
+        groups.setdefault(key, []).append(n)
+    deduped: list[XrayNode] = []
+    for group in groups.values():
+        chrome = [n for n in group if (n.query.get("fp") or "").lower() == "chrome"]
+        firefox = [n for n in group if (n.query.get("fp") or "").lower() == "firefox"]
+        kept = []
+        if chrome:
+            kept.append(chrome[0])  # первый chrome
+        if firefox:
+            kept.append(firefox[0])  # первый firefox
+        if not kept:
+            # Нет chrome/firefox — оставляем первый (random/qq/safari)
+            kept = [group[0]]
+        deduped.extend(kept)
+    log_sink(f"[gha] {label} server-dedup: {len(nodes)} → {len(deduped)} "
+             f"({len(nodes) - len(deduped)} duplicates removed, kept chrome+firefox per server)")
+    return deduped
 
 # ---------------------------------------------------------------------- known-good
 
@@ -887,11 +1015,15 @@ def main(argv: list[str]) -> int:
                         "CDN/Railway/Vercel 10-50ms (TCP ок, прокси нет). "
                         "Default 80, 0 = выключено. Побочка: US-хостинг "
                         "рядом с раннером GHA отбрасывается.")
-    p.add_argument("--max-ping-ms", type=float, default=1000,
-                   help="Максимальный TCP-ping (latency), мс. Узлы с ping выше этого "
-                        "значения отбраковываются (FakeDNS/медленные серверы). "
-                        "По умолчанию 1000 (1 сек). 500 = строже. 0 = без лимита. "
-                        "Фильтрует медленные TCP-connect (FakeDNS и т.п.).")
+    p.add_argument("--max-ping-ms", type=float, default=2000,
+                   help="Максимальный TCP-connect (latency), мс. Узлы с ping выше "
+                        "этого значения отбраковываются (FakeDNS/медленные серверы). "
+                        "Default 2000 — по вердикту владельца (1000 был слишком "
+                        "жёстким: GHA-замер 2026-10-09 — p50=173ms p95=424ms "
+                        "max=997ms у живых + 764 узла срезано в диапазоне "
+                        "1000-1500ms). 0 = без лимита. ВАЖНО: --ping-timeout "
+                        "должен быть БОЛЬШЕ этого значения (connect дольше "
+                        "таймаута убивается таймаутом раньше фильтра).")
     p.add_argument("--fetch-timeout", type=float, default=20.0,
                    help="Таймаут загрузки одной подписки, сек (по умолчанию: 20.0).")
     p.add_argument("--max-servers", type=int, default=0,
@@ -988,7 +1120,10 @@ def main(argv: list[str]) -> int:
     p.add_argument("--dedup-by-server", action="store_true", default=True,
                    help="Дедуплицировать по host:port:pbk:sid:sni. "
                         "Оставлять только fp=chrome и fp=firefox на сервер. "
-                        "Default: ON. Убирает большинство дублей одного сервера.")
+                        "Default: ON. Работает В НАЧАЛЕ пайплайна (сразу после "
+                        "сбора, ДО TCP-ping и geo-rename): fp-варианты одного "
+                        "сервера живут на одном host:port — TCP-результат "
+                        "идентичен, пинговать каждый незачем.")
     p.add_argument("--no-dedup-by-server", dest="dedup_by_server",
                    action="store_false",
                    help="НЕ дедуплицировать (все fp остаются).")
@@ -1194,6 +1329,17 @@ def main(argv: list[str]) -> int:
         for name, count in top_sources:
             log(f"[gha]   {count:6d} configs  ← {name}")
 
+    # ДЕДУП ПО СЕРВЕРУ — В НАЧАЛЕ ПАЙПЛАЙНА (по вердикту владельца v7:
+    # «дедупликаты логично проводить в начале, а не в конце»). fp-варианты
+    # одного сервера (chrome/firefox/safari/qq) живут на одном host:port —
+    # TCP-результат у них ИДЕНТИЧЕН, поэтому дедуп ДО пинга срезает ~50%
+    # сокетов (замер GHA 2026-10-09: BS 10211→4717, ChS 8381→4414), а
+    # geo-rename получает меньше уникальных хостов. Порядок наводится
+    # SNI-сортировкой ниже. known_good-узлы аппендятся ПОЗЖЕ пинга и этому
+    # дедупу не подвергаются — конфиги проверены владельцем вручную.
+    if args.dedup_by_server and nodes:
+        nodes = _dedup_by_server(nodes, log, "pool")
+
     # --vless-only — отсев НЕ-vless конфигов (trojan/ss/vmess/hy2/tuic).
     # Применяется ПОСЛЕ collect, ДО ping (чтобы не пинговать то, что всё равно отбросим).
     if args.vless_only:
@@ -1285,20 +1431,25 @@ def main(argv: list[str]) -> int:
 
     # 4) Опциональный TCP-ping — дешёвый фильтр мёртвых TCP-эндпоинтов.
     #    Порядок узлов СОХРАНЯЕТСЯ (SNI-сортировка не ломается).
+    #    Пингуем уникальные host:port; успешные подключения захватывают IP
+    #    (getpeername) — он переиспользуется в geo-rename без повторного DNS.
+    ping_host_ips: dict[str, str] = {}  # host -> IPv4 с пинга (для --geo-rename)
     if args.with_ping and nodes:
         log(f"[gha] TCP-ping {len(nodes)} nodes (workers={args.ping_workers}, "
             f"timeout={args.ping_timeout}s"
-            + (f", min_ping={args.min_ping_ms}ms" if args.min_ping_ms > 0 else "")
+            + (f", min_ping={args.min_ping_ms:g}ms" if args.min_ping_ms > 0 else "")
             + (f", max_nodes={args.max_ping_nodes}" if args.max_ping_nodes > 0 else "")
-            + (f", max_ping={args.max_ping_ms}ms" if args.max_ping_ms > 0 else "")
+            + (f", max_ping={args.max_ping_ms:g}ms" if args.max_ping_ms > 0 else "")
             + ")")
         alive = _ping_filter(nodes, timeout=args.ping_timeout,
                              workers=args.ping_workers, log_sink=log,
                              max_nodes=args.max_ping_nodes,
                              max_ping_ms=args.max_ping_ms,
                              min_ping_ms=args.min_ping_ms,
-                             drop_cdn_ips=args.drop_cdn_ips)
-        log(f"[gha] ping: {len(alive)}/{len(nodes)} alive")
+                             drop_cdn_ips=args.drop_cdn_ips,
+                             host_ips_out=ping_host_ips)
+        log(f"[gha] ping: {len(alive)}/{len(nodes)} alive "
+            f"({len(ping_host_ips)} host IPs captured для geo-rename)")
         nodes = alive
 
     # 5) --max-servers применяется в самом конце (после geo-rename и сплита).
@@ -1338,6 +1489,7 @@ def main(argv: list[str]) -> int:
             workers=args.geo_rename_workers,
             timeout=args.geo_rename_timeout,
             log_sink=log,
+            known_ips=ping_host_ips,
         )
 
     # drop-geo-fallback: узел без гео после цепочки провайдеров и без флага
@@ -1377,39 +1529,9 @@ def main(argv: list[str]) -> int:
         log(f"[gha] SPLIT (before max-servers): BS={len(bs_nodes)}, "
             f"ChS={len(chs_nodes)}, total={len(nodes)}")
 
-        # Дедупликация по серверу (host:port:pbk:sid:sni).
-        # Один сервер с 5-49 разными fp — оставляем только chrome + firefox.
-        if args.dedup_by_server:
-            for label, node_list in [("BS", bs_nodes), ("ChS", chs_nodes)]:
-                before = len(node_list)
-                # Группируем по server_key
-                groups: dict[str, list[XrayNode]] = {}
-                for n in node_list:
-                    key = f"{n.host}:{n.port}:{n.query.get('pbk','')}:{n.query.get('sid','')}:{n.query.get('sni','')}"
-                    groups.setdefault(key, []).append(n)
-
-                # Из каждой группы — оставляем только chrome и firefox.
-                # Если нет chrome/firefox — оставляем random.
-                deduped: list[XrayNode] = []
-                for key, group in groups.items():
-                    chrome = [n for n in group if (n.query.get("fp") or "").lower() == "chrome"]
-                    firefox = [n for n in group if (n.query.get("fp") or "").lower() == "firefox"]
-                    kept = []
-                    if chrome:
-                        kept.append(chrome[0])  # первый chrome
-                    if firefox:
-                        kept.append(firefox[0])  # первый firefox
-                    if not kept:
-                        # Нет chrome/firefox — оставляем первый (random/qq/safari)
-                        kept = [group[0]]
-                    deduped.extend(kept)
-
-                if label == "BS":
-                    bs_nodes = deduped
-                else:
-                    chs_nodes = deduped
-                log(f"[gha] {label} dedup: {before} → {len(deduped)} "
-                    f"({before - len(deduped)} duplicates removed, kept chrome+firefox per server)")
+        # Дедуп по серверу перенесён В НАЧАЛО пайплайна (см. вызов
+        # _dedup_by_server сразу после collect) — по вердикту владельца v7.
+        # Здесь остаётся только cross-dedup и обрезка --max-servers.
 
         # Cross-dedup БС↔ЧС по (host, port, protocol) — по умолчанию ВЫКЛ:
         # host:port:proto ≠ идентичность конфига (разные uuid = разные аккаунты

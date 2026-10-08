@@ -1,42 +1,57 @@
 # GitHub Actions: авто-обновление подписок по cron'у.
 #
-# Пайплайн:
-#   1. sync_sni_whitelist.py — обновляет data/sni_whitelist.txt
-#      (~910 SNI-доменов, community-curated) для SNI-сортировки БС-первыми.
-#   2. fetch_tg_subs.py — парсит t.me/s/happvpn (happ://crypt5/...) и
-#      mifa.world (категории) -> data/tg_subs.txt.
-#   3. refresh_subs.py — сбор URL'ов из data/sources.txt + tg_subs.txt +
-#      data/saved_subs/* -> fetch -> parse -> dedup -> SNI-сортировка
-#      -> TCP-ping ALL (фильтр мёртвых; БЕЗ сортирующего эффекта —
-#      порядок входного списка сохраняется, latency только в лог:
-#      пинг идёт с раннера GitHub, для юзера в РФ это шум) ->
-#      known_good append (проверенные вручную конфиги) -> geo-rename
-#      (косметика имён) -> split БС/ЧС -> dedup по серверу.
-#   4. alive_test.py — sing-box/xray SOCKS5 + HTTP-пробы через прокси:
-#      exit-IP (api.ipify.org) + заблокированные сервисы (ig/yt/tg).
-#      Порог --max-latency-ms применяется к TTFB пробы exit-IP.
-#      В лог пишутся фазы: connect / tls / ttfb / total.
-#   5. subs.txt = base64(preload_bs.txt), subs_chs.txt = base64(preload_chs.txt)
-#      -> git-auto-commit.
+# АРХИТЕКТУРА v9 — 4 ПАРАЛЛЕЛЬНЫХ JOB, ПОЛНЫЙ ПАЙПЛАЙН НА GITHUB:
 #
-# Важно:
-#   - latency-порог применяется к ОДНОЙ величине (TTFB exit-IP пробы),
-#     поэтому в логе больше нет абсурда «2006ms -> DEAD, 5563ms -> ALIVE».
-#   - Гео: цепочка api.ip.sb → ip-api.com → ipwho.is (гео — метаданные,
-#     НЕ критерий жизни). Узлы «🌐 peppo» (гео неизвестно после всей цепочки
-#     и нет флага в имени) отбрасываются: не дают предсказуемой страны выхода,
-#     бесполезны для GEO-обхода и занимают слот в финальной подписке.
-#   - Антифейк: --min-ping-ms 80 (CDN/PaaS: connect 10-50ms, прокси нет;
-#     рабочие узлы по known_good 185-320ms) и --drop-cdn-ips (CDN IP =
-#     фейк; проверено вручную по v2rayN) — ВКЛЮЧЕНЫ.
-#   - Порог latency --max-latency-ms — вход workflow (default 4000):
-#     2000 убивал рабочие узлы (замер на корпусе из TG-чата: у 45/56
-#     сменился exit-IP, порог 2000 отсеял 18 из них, ttfb 2061-6964ms).
-#   - Классификация БС/ЧС: гадайка по ключевым словам (wl/bl/white/black
-#     в URL и теле подписки) — ВКЛЮЧЕНА по вердикту владельца (распределение
-#     соответствует реальности). Явные секции sources.txt приоритетнее.
-#   - Недоказанные эвристики (cross-dedup) по умолчанию ВЫКЛЮЧЕНЫ.
-#     Список — в справке scripts/refresh_subs.py --help.
+#   refresh ──→ alive-bs ──┐
+#        │                 ├──→ publish (merge + fallback'и + коммит)
+#        └──→ alive-chs ──┘
+#
+#   1. refresh  — sync SNI → fetch TG → refresh_subs.py:
+#      fetch -> parse -> dedup по node.key -> ДЕДУП ПО СЕРВЕРУ (в начале,
+#      до пинга: fp-варианты одного сервера живут на одном host:port,
+#      TCP-результат идентичен — замер: 197020 конфигов → 97313 серверов)
+#      -> SNI-сортировка -> TCP-ping по УНИКАЛЬНЫМ host:port (endpoint-dedup;
+#      успешные подключения захватывают IP через getpeername)
+#      -> known_good append -> geo-rename (DNS-resolve только для хостов
+#      без захваченного IP) -> split БС/ЧС -> artifact stage-pool.
+#   2. alive-bs / alive-chs — ПАРАЛЛЕЛЬНО: sing-box/xray SOCKS5 + HTTP-пробы
+#      через прокси (exit-IP api.ipify.org + ig/yt/tg; порог --max-latency-ms
+#      на TTFB пробы exit-IP). Раньше шли последовательно в одном job
+#      (26 мин); параллельно — ~10-15 мин на job.
+#   3. publish — merge результатов, fallback'и, base64 → subs.txt /
+#      subs_chs.txt, коммит в main (git-auto-commit).
+#
+# GITVERSE (v9) — ОТДЕЛЬНЫЙ репозиторий sub_generator_alive (второй архив):
+# там работает ТОЛЬКО alive-test из РФ-датацентра (РФ-vantage), пулы он
+# берёт по публичному raw-ссылкам ЭТОГО репо (data/preload_bs.txt /
+# data/preload_chs.txt коммитятся ниже в main). Никакого mirror-push и
+# GITVERSE_TOKEN здесь НЕТ и не нужно. Подробности: docs/GHA_REFRESH.md,
+# раздел «GitVerse: отдельный репо alive-test».
+#
+# Guard `if: github.server_url == 'https://github.com'` в каждом job —
+# ЧИСТАЯ страховка: на GitHub условие ВСЕГДА истинно (job'ы никогда не
+# скипаются). Но если этот main случайно запушить в зеркало на GitVerse —
+# тяжёлые job'ы там скипнутся и не сожгут квоту (30 мин/задача,
+# ~1000 мин/мес public).
+#
+# ВАЖНОЕ (накоплено v5-v9):
+#   - Отчёты alive_test_report.json / alive_test_chs_report.json в git
+#     БОЛЬШЕ НЕ КОММИТЯТСЯ (инцидент 2026-10-09: 148 МБ + 931 МБ — push
+#     отклонён лимитом GitHub 100 МБ/файл). С v8 в отчётах вообще НЕТ тел
+#     HTTP-проб (только коды и фазы) — отчёт ~1 КБ/узел, живёт в
+#     artifact'ах (90 дней), из репо вычищается (git rm --cached).
+#   - latency-порог alive-test применяется к ОДНОЙ величине (TTFB exit-IP);
+#     вход workflow max_latency_ms (default 4000: 2000 убивал 18/45
+#     РАБОЧИХ узлов, ttfb 2061-6964ms).
+#   - Порог TCP-ping --max-ping-ms: 2000 (владелец: 1000 слишком жёстко;
+#     замер GHA: p50=173ms p95=424ms max=997ms у живых). --ping-timeout 2.5
+#     поднят с 1.5 — иначе порог 2000 мёртв (timeout убивает connect раньше).
+#   - Гео: цепочка api.ip.sb → ip-api.com → ipwho.is (метаданные, НЕ критерий
+#     жизни). Узлы «🌐 peppo» отбрасываются (drop-geo-fallback).
+#   - Антифейк: --min-ping-ms 80 и --drop-cdn-ips — ВКЛЮЧЕНЫ.
+#   - Классификация БС/ЧС: гадайка по ключевым словам — ВКЛЮЧЕНА.
+#   - User-Agent (v6): феч подписок = v2rayNG/1.10.8; пробы = Chrome 141.
+#   - Недоказанные эвристики (cross-dedup) — ВЫКЛЮЧЕНЫ (см. --help).
 name: Refresh subs
 
 on:
@@ -62,8 +77,12 @@ on:
         description: "Отбрасывать '🌐 peppo' (гео неизвестно после цепочки ip.sb→ip-api→ipwho и нет флага в имени). Default ON"
         type: boolean
         default: true
+      max_ping_ms:
+        description: "Порог TCP-connect в refresh (мс). Default 2000: 1000 был слишком жёстким (p95 живых=424ms, срезано 764 узла в диапазоне 1000-1500ms)."
+        type: number
+        default: 2000
       max_latency_ms:
-        description: "Порог TTFB пробы exit-IP, мс. Default 4000: замер на рабочем корпусе показал, что 2000 убивал 18/45 РАБОЧИХ узлов (ip сменился, ttfb 2061-6964ms)."
+        description: "Порог TTFB пробы exit-IP в alive-test (мс). Default 4000: 2000 убивал 18/45 РАБОЧИХ узлов (ttfb 2061-6964ms)."
         type: number
         default: 4000
 
@@ -76,10 +95,16 @@ permissions:
   contents: write  # нужен для пуша коммита в main
 
 jobs:
+  # ==========================================================================
+  # JOB 1/4: сбор + фильтры. Пишет stage-pool artifact для alive-jobs.
+  # ==========================================================================
   refresh:
     runs-on: ubuntu-24.04
-    # 180 минут: запас для больших списков (TCP-ping ~200k узлов).
-    timeout-minutes: 180
+    # Страховка от случайного зеркала (на GitHub всегда true, см. шапку).
+    if: github.server_url == 'https://github.com'
+    # 45 минут: ping ~90k уникальных endpoint'ов с 256 воркерами (~10-15 мин)
+    # + fetch источников (~5-10 мин) + geo (~3-5 мин). Запас на рост списков.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -104,7 +129,6 @@ jobs:
 
       - name: Sync community SNI whitelist
         # ~910 SNI-доменов из hxehex upstream — для сортировки БС-первыми.
-        # CIDR-список НЕ качаем: в этом пайплайне он не используется.
         run: |
           python scripts/sync_sni_whitelist.py
 
@@ -119,6 +143,90 @@ jobs:
             --timeout 20.0
           echo "=== data/tg_subs.txt ==="
           cat data/tg_subs.txt 2>/dev/null || echo "(not generated — see logs above)"
+
+      - name: Refresh subs (fetch + server-dedup + ping endpoints + geo + split)
+        # Порядок: collect -> ДЕДУП ПО СЕРВЕРУ (до пинга!) -> SNI-сорт ->
+        # ping по уникальным host:port (IP захватываются для geo) ->
+        # known_good -> geo-rename (без повторного DNS) -> split БС/ЧС.
+        # --ping-timeout 2.5 поднят с 1.5: порог --max-ping-ms 2000 должен
+        # успеть сработать (timeout убивает connect раньше фильтра).
+        # --ping-workers 256: TCP-ping IO-bound, 128 → ~20 мин на 90k,
+        # 256 → ~10-12 мин (раннер 4 vCPU держит спокойно).
+        env:
+          SUBGEN_DEBUG: "1"
+        run: |
+          ulimit -n 4096 2>/dev/null || true
+          python scripts/refresh_subs.py \
+            --sources-file data/sources.txt \
+            --extra-sources-file data/tg_subs.txt \
+            --output data/preload.txt \
+            --report data/preload_report.json \
+            ${{ inputs.with_ping != false && '--with-ping' || '' }} \
+            --min-ping-ms 80 \
+            --max-ping-ms ${{ inputs.max_ping_ms || 2000 }} \
+            --ping-timeout 2.5 \
+            --ping-workers 256 \
+            --max-ping-nodes 0 \
+            --drop-cdn-ips \
+            --guess-source-type \
+            --fetch-timeout 25.0 \
+            --sort-by-sni \
+            --geo-rename \
+            --geo-rename-workers 8 \
+            --geo-rename-timeout 8.0 \
+            --known-good data/known_good.txt \
+            --known-good-mode none \
+            --split-bs-chs \
+            ${{ inputs.vless_only == true && '--vless-only' || '' }} \
+            ${{ inputs.drop_geo_fallback != false && '--drop-geo-fallback' || '--no-drop-geo-fallback' }} \
+            --max-servers 0
+
+      - name: Upload stage-pool artifact
+        # Прелоад-файлы для alive-jobs и publish (артефакт = замена общего
+        # диска между job'ами). Пулы в main коммитит publish; сырые пулы
+        # по raw-ссылкам отсюда же забирает GitVerse-репо sub_generator_alive.
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-pool
+          path: |
+            data/preload.txt
+            data/preload_bs.txt
+            data/preload_chs.txt
+            data/preload_report.json
+            data/source_map.json
+            data/tg_subs.txt
+            data/sni_whitelist.txt
+          retention-days: 3
+          if-no-files-found: error
+
+  # ==========================================================================
+  # JOB 2/4: alive-test БС (мобилка РФ). Параллелен alive-chs.
+  # ==========================================================================
+  alive-bs:
+    runs-on: ubuntu-24.04
+    needs: refresh
+    # Страховка от случайного зеркала (на GitHub всегда true, см. шапку).
+    if: github.server_url == 'https://github.com'
+    # ~7 мин на 4.7k узлов с 32 воркерами (замер v7-разбивки: 9.1k узлов
+    # двумя последовательными прогонами = 26 мин; теперь параллельно).
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          # pip install НЕ нужен: alive_test.py — чистый stdlib
+          # (cryptography нужен только фечу happ:// в refresh).
+
+      - name: Download stage-pool
+        uses: actions/download-artifact@v5
+        with:
+          name: stage-pool
+          path: data
 
       - name: Download sing-box + xray Linux binaries
         # sing-box — основной рантайм alive-test; xray — для raw/xhttp
@@ -145,104 +253,209 @@ jobs:
           chmod +x bin/xray
           bin/xray version
 
-      - name: Refresh subs (fetch + parse + dedup + ping + geo + split БС/ЧС)
-        # known_good: mode=none — только append проверенных вручную конфигов.
-        # --max-ping-ms не передаём: при --ping-timeout 1.5s он мёртв по
-        # определению (connect дольше 1.5с уже убит таймаутом).
-        env:
-          SUBGEN_DEBUG: "1"
+      - name: Alive-test БС (sing-box/xray SOCKS5 + HTTP-пробы)
+        # Порог --max-latency-ms применяется к TTFB пробы exit-IP (одна
+        # величина для всех узлов). alive_test.py выходит с кодом 1 при
+        # 0 alive — это НЕ фейл шага: гасим код (|| echo), publish
+        # ветвится по числу строк-узлов в output-файле.
         run: |
-          python scripts/refresh_subs.py \
-            --sources-file data/sources.txt \
-            --extra-sources-file data/tg_subs.txt \
-            --output data/preload.txt \
-            --report data/preload_report.json \
-            --with-ping \
-            --min-ping-ms 80 \
-            --drop-cdn-ips \
-            --guess-source-type \
-            --ping-timeout 1.5 \
-            --ping-workers 128 \
-            --max-ping-nodes 0 \
-            --fetch-timeout 25.0 \
-            --sort-by-sni \
-            --geo-rename \
-            --geo-rename-workers 8 \
-            --geo-rename-timeout 8.0 \
-            --known-good data/known_good.txt \
-            --known-good-mode none \
-            --split-bs-chs \
-            ${{ inputs.vless_only == true && '--vless-only' || '' }} \
-            ${{ inputs.drop_geo_fallback != false && '--drop-geo-fallback' || '--no-drop-geo-fallback' }} \
-            --max-servers 0
-
-      - name: Alive-test (sing-box/xray SOCKS5 + HTTP-пробы — ВСЕ узлы)
-        # --max-latency-ms применяется к TTFB пробы exit-IP (одна величина
-        # для всех узлов). Фазы connect/tls/ttfb/total пишутся в лог и отчёт.
-        # alive_test.py выходит с кодом 1 при 0 alive — это НЕ фейл шага:
-        # гасим код (|| echo) и ветвимся по числу alive в output-файле.
-        # output-файл содержит header-строку → [ -s ] всегда true, поэтому
-        # считаем СТРОКИ-УЗЛЫ (wc -l - 1), а не размер файла.
-        run: |
-          if [ ! -x bin/sing-box ]; then
-            echo "[gha] sing-box not found — skipping alive-test"
-            exit 0
-          fi
           python scripts/alive_test.py \
             --input data/preload_bs.txt \
-            --output data/preload_alive.txt \
+            --output data/preload_bs_alive.txt \
             --report data/alive_test_report.json \
             --singbox-bin bin/sing-box \
             --xray-bin bin/xray \
             --source-map data/source_map.json \
             --max-nodes 0 \
-            --workers 16 \
+            --workers 32 \
             --head-timeout 8 \
             --startup-timeout 5 \
             --max-latency-ms ${{ inputs.max_latency_ms || 4000 }} \
             || echo "[gha] alive-test BS: exit=$? (0 alive или ошибка прогона)"
           BS_ALIVE=0
-          if [ -f data/preload_alive.txt ]; then
-            BS_ALIVE=$(($(wc -l < data/preload_alive.txt) - 1))
+          if [ -f data/preload_bs_alive.txt ]; then
+            BS_ALIVE=$(($(wc -l < data/preload_bs_alive.txt) - 1))
           fi
-          if [ "$BS_ALIVE" -gt 0 ]; then
+          echo "[gha] alive-test BS: $BS_ALIVE alive"
+
+      - name: Upload alive-bs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alive-bs-out
+          path: |
+            data/preload_bs_alive.txt
+            data/alive_test_report.json
+          retention-days: 3
+          if-no-files-found: warn
+
+  # ==========================================================================
+  # JOB 3/4: alive-test ЧС (WiFi / не-РФ). Параллелен alive-bs.
+  # ==========================================================================
+  alive-chs:
+    runs-on: ubuntu-24.04
+    needs: refresh
+    # Страховка от случайного зеркала (на GitHub всегда true, см. шапку).
+    if: github.server_url == 'https://github.com'
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download stage-pool
+        uses: actions/download-artifact@v5
+        with:
+          name: stage-pool
+          path: data
+
+      - name: Download sing-box + xray Linux binaries
+        run: |
+          mkdir -p bin
+          echo "=== Downloading sing-box-linux-64 ==="
+          SB_VERSION=v1.13.16
+          SB_VERSION_NO_V=${SB_VERSION#v}
+          curl -sSL -o /tmp/sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${SB_VERSION}/sing-box-${SB_VERSION_NO_V}-linux-amd64.tar.gz"
+          if ! file /tmp/sb.tar.gz | grep -q "gzip compressed"; then
+            echo "FATAL: sing-box download is not gzip"
+            exit 1
+          fi
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          cp /tmp/sing-box-*/sing-box bin/sing-box
+          chmod +x bin/sing-box
+          bin/sing-box version
+          echo "=== Downloading xray-linux-64 ==="
+          XRAY_VERSION=v26.3.27
+          curl -sSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/xray-linux-64.zip"
+          unzip -o /tmp/xray.zip -d /tmp/xray
+          cp /tmp/xray/xray bin/xray
+          chmod +x bin/xray
+          bin/xray version
+
+      - name: Alive-test ЧС (sing-box/xray SOCKS5 + HTTP-пробы)
+        run: |
+          if [ ! -s data/preload_chs.txt ]; then
+            echo "[gha] preload_chs.txt пуст/отсутствует — alive-test ChS пропущен"
+            exit 0
+          fi
+          python scripts/alive_test.py \
+            --input data/preload_chs.txt \
+            --output data/preload_chs_alive.txt \
+            --report data/alive_test_chs_report.json \
+            --singbox-bin bin/sing-box \
+            --xray-bin bin/xray \
+            --source-map data/source_map.json \
+            --max-nodes 0 \
+            --workers 32 \
+            --head-timeout 8 \
+            --startup-timeout 5 \
+            --max-latency-ms ${{ inputs.max_latency_ms || 4000 }} \
+            || echo "[gha] alive-test ChS: exit=$? (0 alive или ошибка прогона)"
+          CHS_ALIVE=0
+          if [ -f data/preload_chs_alive.txt ]; then
+            CHS_ALIVE=$(($(wc -l < data/preload_chs_alive.txt) - 1))
+          fi
+          echo "[gha] alive-test ChS: $CHS_ALIVE alive"
+
+      - name: Upload alive-chs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alive-chs-out
+          path: |
+            data/preload_chs_alive.txt
+            data/alive_test_chs_report.json
+          retention-days: 3
+          if-no-files-found: warn
+
+  # ==========================================================================
+  # JOB 4/4: merge результатов, fallback'и, base64, коммит в main.
+  # ==========================================================================
+  publish:
+    runs-on: ubuntu-24.04
+    needs: [refresh, alive-bs, alive-chs]
+    # always() — publish живёт даже если alive-job упал (тогда остаются
+    # пингованные списки из stage-pool). Но если упал refresh — публиковать
+    # нечего, пропускаем. Страховка от случайного зеркала — как у всех.
+    if: always() && github.server_url == 'https://github.com' && needs.refresh.result == 'success'
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Download stage-pool
+        uses: actions/download-artifact@v5
+        with:
+          name: stage-pool
+          path: data
+
+      - name: Download alive-bs result
+        # continue-on-error: если alive-bs упал/артефакт не создан —
+        # используем пингованный preload_bs.txt из stage-pool (fail-safe).
+        uses: actions/download-artifact@v5
+        with:
+          name: alive-bs-out
+          path: data
+        continue-on-error: true
+
+      - name: Download alive-chs result
+        uses: actions/download-artifact@v5
+        with:
+          name: alive-chs-out
+          path: data
+        continue-on-error: true
+
+      - name: Merge results + fallbacks + base64
+        # Правила слияния:
+        #   BS: alive-файл есть И >0 узлов → заменяем; alive-файл ЕСТЬ, но
+        #       0 узлов → пол known_good (0 alive — не отдаём мусор и не
+        #       отдаём пустоту); alive-файла НЕТ (job упал) → оставляем
+        #       пингованный preload_bs.txt из stage-pool.
+        #   ChS: alive>0 → заменяем; иначе — оставляем исходный (ЧС —
+        #       WiFi-список, known_good-пол не нужен).
+        # output-файл содержит header-строку → [ -s ] всегда true, считаем
+        # СТРОКИ-УЗЛЫ (wc -l - 1), а не размер файла.
+        #
+        # ПОЛЫ ДЛЯ GITVERSE: до замены сохраняем сырые пинг-фильтрованные
+        # пулы в data/pool_bs.txt / data/pool_chs.txt — их по raw-ссылкам
+        # забирает ОТДЕЛЬНЫЙ репо sub_generator_alive на GitVerse и гоняет
+        # по ним alive-test ИЗ РФ (vantage РФ ≠ vantage GitHub). Пулы в
+        # коммите живут рядом с alive-списками.
+        run: |
+          set -u
+          cp data/preload_bs.txt data/pool_bs.txt 2>/dev/null || : > data/pool_bs.txt
+          cp data/preload_chs.txt data/pool_chs.txt 2>/dev/null || : > data/pool_chs.txt
+          echo "[gha] raw pools for GitVerse alive-test: pool_bs=$(wc -l < data/pool_bs.txt) pool_chs=$(wc -l < data/pool_chs.txt) строк"
+
+          if [ -f data/preload_bs_alive.txt ] && [ "$(($(wc -l < data/preload_bs_alive.txt) - 1))" -gt 0 ]; then
+            BS_ALIVE=$(($(wc -l < data/preload_bs_alive.txt) - 1))
             echo "[gha] alive-test BS: $BS_ALIVE alive — replacing preload_bs.txt"
-            cp data/preload_alive.txt data/preload_bs.txt
-          else
-            # 0 alive: НЕ оставляем мусорный preload_bs (тысячи мёртвых
-            # конфигов с раннера) и НЕ отдаём пустую подписку. Пол =
-            # known_good.txt — конфиги, проверенные владельцем вручную
-            # (его ground truth > замеры с US-раннера).
+            cp data/preload_bs_alive.txt data/preload_bs.txt
+          elif [ -f data/preload_bs_alive.txt ]; then
             echo "[gha] alive-test BS: 0 alive — FALLBACK: preload_bs.txt = known_good.txt"
             { echo "# alive-test fallback: 0 alive nodes — держим known_good"; \
               cat data/known_good.txt 2>/dev/null || echo "# (known_good.txt отсутствует)"; \
             } > data/preload_bs.txt
+          else
+            echo "[gha] alive-test BS: артефакт не найден (job упал?) — оставляем пингованный preload_bs.txt"
           fi
-          if [ -s data/preload_chs.txt ]; then
-            python scripts/alive_test.py \
-              --input data/preload_chs.txt \
-              --output data/preload_chs_alive.txt \
-              --report data/alive_test_chs_report.json \
-              --singbox-bin bin/sing-box \
-              --xray-bin bin/xray \
-              --source-map data/source_map.json \
-              --max-nodes 0 \
-              --workers 16 \
-              --head-timeout 8 \
-              --startup-timeout 5 \
-              --max-latency-ms ${{ inputs.max_latency_ms || 4000 }} \
-              || echo "[gha] alive-test ChS: exit=$? (0 alive или ошибка прогона)"
-            CHS_ALIVE=0
-            if [ -f data/preload_chs_alive.txt ]; then
-              CHS_ALIVE=$(($(wc -l < data/preload_chs_alive.txt) - 1))
-            fi
-            if [ "$CHS_ALIVE" -gt 0 ]; then
-              echo "[gha] alive-test ChS: $CHS_ALIVE alive — replacing preload_chs.txt"
-              cp data/preload_chs_alive.txt data/preload_chs.txt
-            else
-              echo "[gha] alive-test ChS: 0 alive — keeping original preload_chs.txt"
-            fi
+
+          if [ -f data/preload_chs_alive.txt ] && [ "$(($(wc -l < data/preload_chs_alive.txt) - 1))" -gt 0 ]; then
+            CHS_ALIVE=$(($(wc -l < data/preload_chs_alive.txt) - 1))
+            echo "[gha] alive-test ChS: $CHS_ALIVE alive — replacing preload_chs.txt"
+            cp data/preload_chs_alive.txt data/preload_chs.txt
+          else
+            echo "[gha] alive-test ChS: 0 alive / артефакт не найден — keeping original preload_chs.txt"
           fi
+
           echo "[gha] generating subs.txt (БС alive-confirmed base64)..."
           cat data/preload_bs.txt | base64 -w 0 > subs.txt
           echo "[gha] subs.txt (БС): $(wc -c < subs.txt) bytes ($(wc -l < data/preload_bs.txt) configs)"
@@ -267,25 +480,34 @@ jobs:
           echo "=== preload_report.json ==="
           cat data/preload_report.json 2>/dev/null || true
 
-      - name: Cleanup + force-add
-        # cleanup удаляет устаревшие файлы; force-add нужен, потому что
-        # .gitignore содержит data/* (без -f git не видит новые файлы).
+      - name: Cleanup + untrack big reports + force-add
+        # 1) Устаревшие артефакты прошлых версий.
+        # 2) git rm --cached: отчёты alive-test больше НЕ трекаются в git
+        #    (инцидент 100 МБ-лимита; теперь они только в artifacts).
+        # 3) force-add нужен, потому что .gitignore содержит data/*.
         run: |
-          # Устаревшие артефакты прошлых версий + больше не используемый CIDR-список.
           rm -f data/preload_speed.txt data/preload_working.txt \
                 data/preload_report_full.json data/speedtest_report.json \
                 data/cidr_whitelist.txt \
                 subs_all.txt 2>/dev/null || true
           echo "[gha] cleaned up old artifacts"
+          # Untrack отчётов (идемпотентно: на второй запуск файлы уже не в index).
+          for f in data/alive_test_report.json data/alive_test_chs_report.json; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              git rm --cached "$f"
+              echo "[gha] untracked $f (теперь живёт только в artifacts)"
+            fi
+          done
           # Гарантируем существование subs_chs.txt (если split failed).
           if [ ! -f subs_chs.txt ]; then
             > subs_chs.txt
           fi
           # Force-add data/ файлы — .gitignore содержит data/*, без -f
-          # git-auto-commit НЕ видит новые файлы.
+          # git-auto-commit НЕ видит новые файлы. Отчёты сознательно НЕ
+          # добавляем (см. выше).
           for f in data/tg_subs.txt data/preload_bs.txt data/preload_chs.txt \
+                   data/pool_bs.txt data/pool_chs.txt \
                    data/preload.txt data/preload_report.json \
-                   data/alive_test_report.json data/alive_test_chs_report.json \
                    data/source_map.json \
                    data/sni_whitelist.txt \
                    data/sni_whitelist_custom.txt data/known_good.txt \
@@ -297,7 +519,8 @@ jobs:
           echo "[gha] force-added data/ files (bypass .gitignore data/* rule)"
 
       - name: Upload logs as artifacts
-        # Логи/отчёты как GHA artifact (Actions -> Run -> Artifacts, 90 дней).
+        # Отчёты alive-test (компактные — тела проб не хранятся) и итоговые
+        # списки. 90 дней, не в git.
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -306,6 +529,8 @@ jobs:
             data/preload.txt
             data/preload_bs.txt
             data/preload_chs.txt
+            data/pool_bs.txt
+            data/pool_chs.txt
             data/preload_report.json
             data/alive_test_report.json
             data/alive_test_chs_report.json
@@ -313,8 +538,11 @@ jobs:
             data/sni_whitelist.txt
             subs.txt
             subs_chs.txt
+          retention-days: 90
+          if-no-files-found: ignore
 
       - name: Commit & push if changed
+        id: autocommit
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "auto: refresh subs (preload + subs + report)"

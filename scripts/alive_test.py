@@ -18,6 +18,13 @@
 TTFB пробы exit-IP. В лог/отчёт пишутся все четыре фазы каждой пробы,
 итоговая latency_ms = ttfb пробы exit-IP (ровно то, с чем сравнивается порог).
 
+User-Agent (v6): все HTTP-пробы идут с UA обычного Chrome (_PROBE_UA) —
+антиботы (Instagram/Cloudflare и др.) режут не-браузерные UA (curl/8.x):
+часть серверов отдаёт curl'у другой ответ, чем браузеру, и живой узел
+ловил ложный DEAD. Феч подписок, наоборот, представляется клиентом
+v2rayNG/1.10.8 (runtime/types.py: SUBSCRIPTION_USER_AGENT) — подписочные
+серверы гейтят unknown-клиентов по UA.
+
 Запуск:
   python scripts/alive_test.py \\
       --input data/preload_bs.txt \\
@@ -28,7 +35,12 @@ TTFB пробы exit-IP. В лог/отчёт пишутся все четыре
 Артефакты:
   <output> — только alive-узлы (исходные URL, порядок входа сохранён
              при сортировке по latency);
-  <report> — JSON-отчёт со статусами и фазами всех проб.
+  <report> — JSON-отчёт со статусами и фазами всех проб. ТЕЛА ОТВЕТОВ
+             В ОТЧЁТЕ НЕ ХРАНЯТСЯ (v8): exit-IP извлекается из тела
+             ipify-пробы на лету и возвращается из _curl_probe ОТДЕЛЬНО
+             от dict'а пробы; HTML-страницы instagram/youtube в отчёт
+             не пишутся вообще — только http-коды и фазы. Отчёт на ~5k
+             узлов = единицы МБ, живёт в CI-artifacts.
 """
 from __future__ import annotations
 
@@ -63,6 +75,23 @@ _TEST_URLS = [
 # Формат curl -w: http_code + фазы запроса (в секундах), отделяется переводом строки.
 _CURL_WRITE_OUT = "\\n%{http_code} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}"
 
+# UA HTTP-проб (все запросы через прокси к api.ipify.org/instagram/
+# youtube/telegram): обычный десктопный Chrome. Без -A curl шлёт
+# «curl/8.x» — часть серверов и CDN (антиботы Instagram, Cloudflare)
+# отдаёт не-браузерным клиентам другой ответ или режет соединение:
+# живой узел получает ложный DEAD. Проба должна видеть то же, что
+# увидит браузер юзера через этот прокси.
+_PROBE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+
+# v8: тела HTTP-проб в отчёте НЕ хранятся вовсе (ни префиксом). Тело
+# нужно ровно в одном месте — извлечь exit-IP из ответа api.ipify.org —
+# и _curl_probe возвращает его ОТДЕЛЬНО от dict'а пробы. История: до v7
+# хранились полные тела (931 МБ отчёт, push отклонён лимитом GitHub
+# 100 МБ/файл), v7 — префикс 80 символов, v8 — ничего: http-коды и фазы
+# дают всю диагностику, HTML-страницы — балласт под лимиты платформ.
 _PORT_POOL = list(range(11001, 11201))
 _PORT_INDEX = 0
 _PORT_LOCK = threading.Lock()
@@ -100,30 +129,34 @@ def _geo_lookup_code(ip: str) -> tuple[str, str]:
         return ("??", "")
 
 
-def _curl_probe(listen_port: int, url: str, timeout: float) -> dict:
-    """Один GET через SOCKS5-прокси с телом ответа и замером фаз.
+def _curl_probe(listen_port: int, url: str, timeout: float) -> tuple[dict, str]:
+    """Один GET через SOCKS5-прокси с замером фаз.
 
-    Возвращает dict:
-      ok, http_code, body, error,
-      connect_ms, tls_ms, ttfb_ms, total_ms  (None, если curl не дошёл).
+    Возвращает (result, body):
+      result — ok, http_code, error,
+               connect_ms, tls_ms, ttfb_ms, total_ms (None, если curl
+               не дошёл). Тела ответа в dict'е НЕТ (v8);
+      body   — тело ответа целиком; нужно ТОЛЬКО вызывающему коду для
+               извлечения exit-IP (ipify), в отчёт не попадает.
     """
     result: dict = {
-        "ok": False, "http_code": 0, "body": "", "error": None,
+        "ok": False, "http_code": 0, "error": None,
         "connect_ms": None, "tls_ms": None, "ttfb_ms": None, "total_ms": None,
     }
     try:
         proc = subprocess.run(
             ["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{listen_port}",
              "--max-time", str(timeout),
+             "-A", _PROBE_UA,
              "-w", _CURL_WRITE_OUT, url],
             capture_output=True, text=True, timeout=timeout + 5,
         )
     except subprocess.TimeoutExpired:
         result["error"] = "timeout"
-        return result
+        return result, ""
     if proc.returncode != 0:
         result["error"] = (proc.stderr.strip() or f"curl exit {proc.returncode}")[:120]
-        return result
+        return result, ""
     # stdout = тело ответа + "\n" + строка статистики "code connect tls ttfb total".
     body, _, stats_line = proc.stdout.rpartition("\n")
     parts = stats_line.split()
@@ -140,9 +173,9 @@ def _curl_probe(listen_port: int, url: str, timeout: float) -> dict:
     else:
         # Нет строки статистики (пустое тело у 204 и т.п.) — пробуем как тело.
         body = proc.stdout
-    result["body"] = body.strip()
+    # Тело НЕ кладём в result (v8) — возвращаем отдельно (см. докстринг).
     result["ok"] = True
-    return result
+    return result, body
 
 
 def _build_xray_config(node: XrayNode, listen_port: int) -> tuple[dict | None, str | None]:
@@ -284,14 +317,14 @@ def _test_node(node: XrayNode, singbox_bin: Path,
             return result
 
         # Проба 1: exit-IP. Один запрос: тело (IP) + фазы = профиль узла.
-        ip_probe = _curl_probe(listen_port, _TEST_URLS[0][1], head_timeout)
+        ip_probe, ip_body = _curl_probe(listen_port, _TEST_URLS[0][1], head_timeout)
         result["timings"]["exit_ip"] = ip_probe
         if not ip_probe["ok"]:
             result["status"] = "dead"
             result["error"] = f"exit-ip probe: {ip_probe['error']}"
             return result
 
-        exit_ip = (ip_probe.get("body") or "").strip()
+        exit_ip = ip_body.strip()
         if not exit_ip:
             result["status"] = "dead"
             result["error"] = "exit-ip probe: empty body"
@@ -329,7 +362,7 @@ def _test_node(node: XrayNode, singbox_bin: Path,
         service_ok = 0
         first_ok_code: int | None = None
         for svc_name, svc_url in _TEST_URLS[1:]:
-            probe = _curl_probe(listen_port, svc_url, head_timeout)
+            probe, _svc_body = _curl_probe(listen_port, svc_url, head_timeout)
             result["timings"][svc_name] = probe
             code = probe.get("http_code") or 0
             if probe["ok"] and code in (200, 204, 301, 302, 303, 307, 308):

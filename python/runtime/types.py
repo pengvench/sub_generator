@@ -117,7 +117,14 @@ NODE_LINK_RE = re.compile(
     r"(?:vless|vmess|trojan|ss|hysteria2|hy2|hysteria)://[^\s\"'<>]+",
     re.IGNORECASE,
 )
-SUBSCRIPTION_USER_AGENT = "v2rayN/6.23 MTProxyAutoSwitch/1.0"
+# UA, под которым пайплайн представляется подписочным серверам. Идёт во все
+# три транспорта runtime/fetch.py: urllib-заголовок, системный curl -A,
+# PowerShell -UserAgent. Для многих публичных подписок UA — единственное,
+# по чему сервер понимает, кто пришёл: unknown-клиентам (curl/*,
+# Python-urllib/*) отдают 403/HTML-заглушку вместо тела. v2rayNG/1.10.8 —
+# самый массовый клиент, сервер отвечает ему тем же, что реальным юзерам.
+# Вердикт владельца 2026-10-09.
+SUBSCRIPTION_USER_AGENT = "v2rayNG/1.10.8"
 @dataclass
 class XrayRuntimeConfig:
     subscription_urls: list[str] = field(default_factory=list)

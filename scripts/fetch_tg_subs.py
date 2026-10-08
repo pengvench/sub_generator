@@ -151,17 +151,20 @@ def _strip_html(html_fragment: str) -> str:
 def _find_subscription_in_post(post_html: str) -> str | None:
     """Извлечь URL подписки из HTML одного поста.
 
-    Возвращает happ://crypt5/... ИЛИ https://... URL. Если пост не содержит
-    подписки — None. Сначала ищем happ:// (более специфичный паттерн),
-    потом — обычный URL с /sub/ /exec?url= /auto.
+    v76: Приоритет — ПРЯМАЯ https://...exec?url=... ссылка (уже расшифрованная).
+    В посте t.me/happvpn идут 2 ссылки рядом: happ://crypt5/... (зашифрованная)
+    и https://tetragidropiranilciklopentiltetragidropiridopiridinovye.ru/exec?url=...
+    (расшифрованная, домен меняется). Берём прямую — refresh_subs.py сам её скачает.
+    Если прямой ссылки нет (или пост без нею) — fallback на happ://crypt5/...
+    (расшифруем в fetch_tg_subs.py через runtime.happ_decrypt).
     """
     plain = _strip_html(post_html)
-    # 1) happ://crypt5/... (приоритет — это явно подписка).
-    m = _HAPP_URL_RE.search(plain)
+    # 1) v76: ПРЯМАЯ ссылка https://...exec?url=... (приоритет).
+    m = _SUB_URL_RE.search(plain)
     if m:
         return m.group(0)
-    # 2) Обычный URL подписки.
-    m = _SUB_URL_RE.search(plain)
+    # 2) happ://crypt5/... — fallback (нужна расшифровка).
+    m = _HAPP_URL_RE.search(plain)
     if m:
         return m.group(0)
     return None
@@ -328,125 +331,72 @@ def main(argv: list[str]) -> int:
         log("[tg] FATAL: 0 URLs collected. Existing tg_subs.txt (if any) is KEPT.")
         return 1
 
-    # v50: СКАЧИВАЕМ подписки и парсим в КОНФИГИ (vless://, vmess://, ...).
-    # Раньше писали URL'ы подписок в tg_subs.txt, потом refresh_subs.py их
-    # скачивал. Теперь — пишем сразу готовые конфиги, юзер видит в файле
-    # именно vless://..., а не URL подписки.
-    #
-    # v50b: ОТФИЛЬТРОВЫВАЕМ фейковые конфиги. Mifa.world отдаёт ОДНУ рабочую
-    # категорию в день, остальные — заглушки с фейковым конфигом
-    # (uuid=00000000-0000-0000-0000-000000000000, host=127.0.0.1). Фильтруем
-    # их, оставляя только реальные.
-    log(f"[tg] downloading {len(unique)} subscription(s) and parsing to configs...")
+    # v76: Расшифровать happ://crypt5/... → https://... URL подписки.
+    # Пишем в tg_subs.txt URL'ы (НЕ готовые конфиги!). refresh_subs.py
+    # сам скачает каждую подписку и разберёт в vless:// / vmess:// / ...
+    # Это значит: tg_subs.txt = ~15-20 URL источников, а не 179 готовых
+    # конфигов. Каждый URL = ОДНА подписка = ОДИН источник в отчёте GHA.
     REPO = Path(__file__).resolve().parent.parent
     sys.path.insert(0, str(REPO / "python"))
     try:
-        from runtime.fetch import _fetch_text
-        from runtime.parse import _node_links_from_text
+        from runtime.happ_decrypt import decrypt_happ_link
     except ImportError as exc:
-        log(f"[tg] FATAL: cannot import runtime.fetch/parse: {exc}")
-        log("[tg] Make sure you're running from sub_generator/ root.")
-        return 1
+        log(f"[tg] WARNING: cannot import runtime.happ_decrypt: {exc}")
+        log("[tg] happ://crypt5 URLs will be skipped (cannot decrypt)")
+        decrypt_happ_link = None  # type: ignore
 
-    # Признаки фейкового конфига (заглушка mifa.world):
-    _FAKE_HOSTS = {"127.0.0.1", "0.0.0.0", "localhost", "example.com"}
-    _FAKE_UUID_PART = "00000000-0000-0000-0000-000000000000"
-
-    def _is_fake_config(cfg_url: str) -> bool:
-        """Проверить, фейковый ли конфиг (заглушка mifa.world)."""
-        if _FAKE_UUID_PART in cfg_url:
-            return True
-        # Извлечь host:port из URL (после @, до : или ?).
-        # vless://uuid@host:port?... — host между @ и : port.
-        if "@" in cfg_url:
-            after_at = cfg_url.split("@", 1)[1]
-            # host:port? или host:port/
-            host_part = after_at.split(":")[0] if ":" in after_at else after_at.split("?")[0]
-            if host_part in _FAKE_HOSTS:
-                return True
-        return False
-
-    all_configs: list[str] = []
-    failed_subs: list[str] = []
-    fake_filtered = 0
-    for sub_url in unique:
-        try:
-            body = _fetch_text(sub_url, timeout=args.timeout, log_sink=log)
-            if not body:
-                log(f"[tg] fetch returned empty: {sub_url[:80]}")
-                failed_subs.append(sub_url)
+    final_urls: list[str] = []
+    happ_decrypted = 0
+    happ_failed = 0
+    for u in unique:
+        if u.startswith("happ://"):
+            if decrypt_happ_link is None:
+                log(f"[tg] skip happ:// (no decryptor): {u[:60]}")
+                happ_failed += 1
                 continue
-            # v55b: Если body — это чистый base64 (одной строкой, без переносов),
-            # _node_links_from_text НЕ парсит. Декодируем вручную, потом парсим.
-            # mifa.world/nitrino отдаёт 87KB base64 одной строкой — парсер не справляется.
-            configs = _node_links_from_text(body)
-            if not configs:
-                # Попробуем декодировать base64.
-                import base64 as _b64
-                try:
-                    # Уберём ВСЁ кроме base64-символов (A-Z a-z 0-9 + / =).
-                    # Иногда body содержит HTML-обрамление или не-ASCII — это ломает b64decode.
-                    clean = re.sub(r"[^A-Za-z0-9+/=]", "", body).strip()
-                    if not clean.endswith("="):
-                        clean += "=" * (-len(clean) % 4)
-                    decoded_bytes = _b64.b64decode(clean)
-                    decoded = decoded_bytes.decode("utf-8", errors="replace")
-                    if decoded and ("vless://" in decoded or "vmess://" in decoded
-                                    or "trojan://" in decoded or "ss://" in decoded
-                                    or "hysteria" in decoded):
-                        log(f"[tg] {sub_url[:60]}: base64-decoded body "
-                            f"({len(body)} → {len(decoded)} bytes)")
-                        configs = _node_links_from_text(decoded)
-                except Exception as decode_exc:
-                    log(f"[tg] {sub_url[:60]}: base64 decode failed: {decode_exc}")
-            # v50b: отфильтровать фейковые (заглушки mifa.world).
-            real_configs = [c for c in configs if not _is_fake_config(c)]
-            fake_count = len(configs) - len(real_configs)
-            fake_filtered += fake_count
-            if real_configs:
-                log(f"[tg] {sub_url[:60]}: {len(real_configs)} real configs "
-                    f"({fake_count} fake filtered)")
-                all_configs.extend(real_configs)
-            elif configs:
-                log(f"[tg] {sub_url[:60]}: 0 real ({len(configs)} all fake — placeholder)")
-            else:
-                log(f"[tg] {sub_url[:60]}: parsed 0 configs (body length: {len(body)})")
-        except Exception as exc:
-            log(f"[tg] {sub_url[:60]}: FAILED: {type(exc).__name__}: {exc}")
-            failed_subs.append(sub_url)
+            try:
+                decrypted = decrypt_happ_link(u)
+                if decrypted and decrypted.startswith("http"):
+                    log(f"[tg] happ:// decrypted → {decrypted[:80]}")
+                    final_urls.append(decrypted)
+                    happ_decrypted += 1
+                else:
+                    log(f"[tg] happ:// decrypt returned non-URL: {decrypted!r}")
+                    happ_failed += 1
+            except Exception as exc:
+                log(f"[tg] happ:// decrypt failed: {type(exc).__name__}: {exc}")
+                happ_failed += 1
+        else:
+            # Прямая https://... ссылка — пишем как есть.
+            final_urls.append(u)
 
-    # Дедуплицируем конфиги (по полному URL).
-    seen_cfg: set[str] = set()
-    unique_cfgs: list[str] = []
-    for cfg in all_configs:
-        if cfg not in seen_cfg:
-            seen_cfg.add(cfg)
-            unique_cfgs.append(cfg)
-
-    if not unique_cfgs:
-        log("[tg] FATAL: 0 real configs parsed. Existing tg_subs.txt (if any) is KEPT.")
+    if not final_urls:
+        log("[tg] FATAL: 0 subscription URLs after happ:// decryption. "
+            "Existing tg_subs.txt (if any) is KEPT.")
         return 1
 
-    # Записываем конфиги (НЕ URL'ы подписок!).
+    # v76: Дедуплицируем (могут быть дубли между happ и mifa).
+    seen_final: set[str] = set()
+    unique_final: list[str] = []
+    for u in final_urls:
+        if u not in seen_final:
+            seen_final.add(u)
+            unique_final.append(u)
+
+    # Записываем URL'ы подписок (НЕ конфиги!).
     args.output.parent.mkdir(parents=True, exist_ok=True)
     header = (f"# Auto-generated by scripts/fetch_tg_subs.py at "
               f"{time.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
               f"# Sources: t.me/s/{args.channel} + {args.mifa_base}/\n"
-              f"# {len(unique)} subscription(s) → {len(unique_cfgs)} unique real configs "
-              f"({fake_filtered} fake filtered, {len(failed_subs)} failed subs)\n"
-              f"# Format: один vless:// / vmess:// / ... на строку\n")
-    body = "\n".join(unique_cfgs) + "\n"
+              f"# {len(unique_final)} subscription URL(s) "
+              f"({happ_decrypted} happ decrypted, {happ_failed} happ failed)\n"
+              f"# Format: один URL подписки на строку\n"
+              f"# refresh_subs.py (--extra-sources-file) скачает каждый URL\n"
+              f"# и разберёт в vless:// / vmess:// / ... конфиги.\n")
+    body = "\n".join(unique_final) + "\n"
     args.output.write_text(header + body, encoding="utf-8")
-    log(f"[tg] wrote {len(unique_cfgs)} real configs to {args.output} "
-        f"(from {len(unique)} subs, {fake_filtered} fake filtered, {len(failed_subs)} failed)")
-    # Лог топ-протоколов для прозрачности.
-    protos: dict[str, int] = {}
-    for cfg in unique_cfgs:
-        if "://" in cfg:
-            proto = cfg.split("://", 1)[0]
-            protos[proto] = protos.get(proto, 0) + 1
-    if protos:
-        log(f"[tg] protocols breakdown: {protos}")
+    log(f"[tg] wrote {len(unique_final)} subscription URLs to {args.output} "
+        f"({happ_decrypted} happ decrypted, {happ_failed} happ failed)")
     return 0
 
 

@@ -53,7 +53,7 @@ on:
         type: boolean
         default: true
       max_servers:
-        description: "Лимит узлов ПЕРЕД alive-test. 0 = ВСЕ (без лимита). Финальный обрез = 200 внутри alive-test"
+        description: "Устаревший v76: лимит узлов ПЕРЕД alive-test. Теперь всегда 0 (без лимита). Оставлен для обратной совместимости."
         type: string
         default: "0"
 
@@ -150,6 +150,16 @@ jobs:
         #   preload_bs.txt  — БС + серый + фейк + none → для мобилки РФ
         #   preload_chs.txt — только ЧС SNI → для WiFi / не-RU
         # subs.txt (общий base64) = preload_bs.txt (т.к. юзер в РФ на мобилке).
+        #
+        # v76: БЕЗ --max-servers в refresh_subs.py! Лимит обрезает ДО alive-test,
+        #      убивая рабочий материал. Теперь refresh_subs.py выдаёт ВСЕ узлы
+        #      после canonical-stack filter, alive-test проверяет ВСЕ, а финальный
+        #      обрез (если нужен) делает alive-test.py через --final-limit.
+        # v76: drop_geo_fallback — ИСПРАВЛЕН conditional. До этого был баг:
+        #      при schedule-trigger inputs.drop_geo_fallback = null,
+        #      `null == true` = false → fallback `--no-drop-geo-fallback`,
+        #      и в финале появлялись узлы без geo (🌐 peppo). Теперь
+        #      `inputs.drop_geo_fallback != false` — true по умолчанию.
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -174,18 +184,13 @@ jobs:
             --allow-canonical-stack \
             --split-bs-chs \
             ${{ inputs.vless_only == true && '--vless-only' || '' }} \
-            ${{ inputs.drop_geo_fallback == true && '--drop-geo-fallback' || '--no-drop-geo-fallback' }} \
-            --max-servers ${{ inputs.max_servers || '200' }}
-      - name: Alive-test (sing-box SOCKS5 + multi-service parallel — v75)
-        # v75: Параллельный тест 5 сервисов: api.ipify.org + ifconfig.me +
-        # Instagram + YouTube + Telegram. Узел ALIVE если:
-        #   - Exit IP ≠ runner IP (прокси работает) — ДАЖЕ если IG/YT/TG блокированы
-        #     с exit IP (Cloudflare WAF на AWS IP — на РФ мобилке может работать).
-        #   - Или хотя бы 1 из IG/YT/TG ответил 2xx/3xx (даже если ipify упал).
-        # Узел DEAD если все 5 упали или exit IP == runner IP (leak).
-        # v75b: --check-asn помечает cloud_exit (AWS/Azure → likely dead на РФ)
-        # vs hosting_exit (Hetzner/OVH → likely working). Не убивает — инфо.
-        # workers=12 × 5 parallel curls = 60 concurrent — норм для GHA runner.
+            ${{ inputs.drop_geo_fallback != false && '--drop-geo-fallback' || '--no-drop-geo-fallback' }} \
+            --max-servers 0
+      - name: Alive-test (sing-box SOCKS5 + HTTP HEAD — ВСЕ узлы)
+        # v65b: БЕЗ ОБРЕЗКИ. ВСЕ alive узлы из preload_bs.txt тестируются.
+        # max-servers=0 → refresh_subs даёт ВСЕ (~28k БС + ~920 ЧС).
+        # alive-test тестирует ВСЕ → ~200-500 alive → final-limit 200.
+        # workers=16 для скорости. 28k × 1s / 16 ≈ 30 минут.
         run: |
           if [ ! -x bin/sing-box ]; then
             echo "[gha] sing-box not found — skipping alive-test"
@@ -199,11 +204,10 @@ jobs:
             --xray-bin bin/xray \
             --source-map data/source_map.json \
             --max-nodes 0 \
-            --workers 12 \
+            --workers 16 \
             --head-timeout 8 \
             --startup-timeout 5 \
-            --max-latency-ms 3000 \
-            --check-asn
+            --max-latency-ms 2000
           if [ -s data/preload_alive.txt ]; then
             ALIVE_COUNT=$(($(wc -l < data/preload_alive.txt) - 1))
             echo "[gha] alive-test BS: $ALIVE_COUNT alive — replacing preload_bs.txt"
@@ -220,11 +224,10 @@ jobs:
               --xray-bin bin/xray \
               --source-map data/source_map.json \
               --max-nodes 0 \
-              --workers 12 \
+              --workers 16 \
               --head-timeout 8 \
               --startup-timeout 5 \
-              --max-latency-ms 3000 \
-              --check-asn
+              --max-latency-ms 2000
             if [ -s data/preload_chs_alive.txt ]; then
               cp data/preload_chs_alive.txt data/preload_chs.txt
             fi

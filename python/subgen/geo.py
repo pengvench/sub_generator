@@ -15,6 +15,8 @@ from urllib.request import Request, urlopen
 from subgen.config import (
     FLAG_EMOJI,
     GEOIP_API,
+    GEOIP_API_IPAPI,
+    GEOIP_API_IPWHO,
     GEOIP_FALLBACK_CODE,
     GEOIP_FALLBACK_FLAG,
     GEOIP_MAX_RATE_PER_SEC,
@@ -85,31 +87,46 @@ def country_flag(code: str) -> str:
         return GEOIP_FALLBACK_FLAG
 
 
+def _valid_geo_code(code: str) -> bool:
+    """Пригодный двухбуквенный ISO-код страны."""
+    code = str(code or "").strip().upper()
+    return len(code) == 2 and code.isalpha()
+
+
 def geoip_lookup(ip: str, *, timeout: float) -> tuple[str, str]:
-    """Вернуть (country_code, flag) для IP через https://api.ip.sb/geoip.
+    """Вернуть (country_code, flag) для IP.
 
-    Кешируется по IP. При любой ошибке/лимите возвращается fallback.
+    Цепочка провайдеров (порядок = приоритет):
+      1. api.ip.sb/geoip — DoH-резолв, соединение на IP с SNI, системный
+         hosts-файл НЕ читается (записи-подмены не искажают гео-слепок);
+         при недоступности DoH — обычный urlopen.
+      2. ip-api.com (free: HTTP-only, 45/мин; при 429/фейле — дальше).
+      3. ipwho.is (HTTPS, без ключа).
 
-    Запрос идёт через checkers.hostres.direct_https_get: домен api.ip.sb
-    резолвится по DoH на IP-literal серверах (1.1.1.1/8.8.8.8), соединение
-    открывается на IP с SNI — системный hosts-файл НЕ читается (записи-подмены
-    вида «<ip> api.ip.sb» не искажают гео-слепок). Fallback: обычный urlopen,
-    если DoH недоступен (жёстко заблокированная сеть).
+    Вся цепочка не смогла → код "??" — гео неизвестно. Это метаданные
+    о выходном IP, НЕ критерий жизни узла: вызывающая сторона решает,
+    что с ними делать (в подписке такие узлы отбрасываются отдельным
+    фильтром --drop-geo-fallback).
+
+    Кешируется по IP (общий кеш на весь запуск).
     """
     ip = str(ip or "").strip()
+    if not ip:
+        return (GEOIP_FALLBACK_CODE, GEOIP_FALLBACK_FLAG)
     with _geo_lock:
         cached = _geo_cache.get(ip)
     if cached is not None:
         return cached
     result = (GEOIP_FALLBACK_CODE, GEOIP_FALLBACK_FLAG)
-    try:
-        _status, body, _err = _geoip_fetch(ip, timeout)
-        payload = json.loads(body.decode("utf-8", errors="replace")) if body else {}
-        code = str((payload or {}).get("country_code") or "").strip().upper()
-        if len(code) == 2 and code.isalpha():
-            result = (code, country_flag(code))
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
-        result = (GEOIP_FALLBACK_CODE, GEOIP_FALLBACK_FLAG)
+    for provider in _GEOIP_CHAIN:
+        try:
+            code = provider(ip, timeout)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError,
+                json.JSONDecodeError):
+            continue
+        if _valid_geo_code(code):
+            result = (code.strip().upper(), country_flag(code))
+            break
     with _geo_lock:
         _geo_cache[ip] = result
     return result
@@ -142,6 +159,70 @@ def _geoip_fetch(ip: str, timeout: float) -> tuple[int, bytes, str]:
     )
     with urlopen(request, timeout=timeout) as resp:
         return int(resp.status), resp.read(64 * 1024), ""
+
+
+def _provider_ip_sb(ip: str, timeout: float) -> str:
+    """Провайдер 1: api.ip.sb/geoip/<ip> (DoH, мимо hosts). поле country_code."""
+    _status, body, _err = _geoip_fetch(ip, timeout)
+    payload = json.loads(body.decode("utf-8", errors="replace")) if body else {}
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("country_code") or "")
+
+
+def _provider_ip_api_com(ip: str, timeout: float) -> str:
+    """Провайдер 2: ip-api.com (free: HTTP-only, 45/мин). Поле countryCode.
+
+    Превышение лимита → HTTP 429 → исключение → geoip_lookup идёт дальше.
+    """
+    url = GEOIP_API_IPAPI.format(ip=ip)
+    request = Request(url, headers={
+        "User-Agent": "MTProxyAutoSwitch-sub-generator/1.0",
+        "Accept": "application/json",
+    })
+    with urlopen(request, timeout=timeout) as resp:
+        payload = json.loads(resp.read(64 * 1024).decode("utf-8", errors="replace"))
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        return ""
+    return str(payload.get("countryCode") or "")
+
+
+def _provider_ipwho_is(ip: str, timeout: float) -> str:
+    """Провайдер 3: ipwho.is (HTTPS, без ключа). Поле country_code."""
+    url = GEOIP_API_IPWHO.format(ip=ip)
+    try:
+        from checkers.hostres import direct_https_get
+        response = direct_https_get(
+            url, timeout=timeout, max_bytes=64 * 1024,
+            headers={"Accept": "application/json"},
+        )
+        if response.ok and response.status == 200 and response.body:
+            payload = json.loads(response.body.decode("utf-8", errors="replace"))
+        else:
+            payload = None
+    except Exception:
+        payload = None
+    if payload is None:
+        # Деградация — обычный urlopen.
+        request = Request(url, headers={
+            "User-Agent": "MTProxyAutoSwitch-sub-generator/1.0",
+            "Accept": "application/json",
+        })
+        with urlopen(request, timeout=timeout) as resp:
+            payload = json.loads(resp.read(64 * 1024).decode("utf-8", errors="replace"))
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("success") is False:
+        return ""
+    return str(payload.get("country_code") or "")
+
+
+# Порядок = приоритет. См. geoip_lookup.
+_GEOIP_CHAIN = (
+    _provider_ip_sb,
+    _provider_ip_api_com,
+    _provider_ipwho_is,
+)
 
 
 def rate_limit_sleep(last_call: list[float]) -> None:

@@ -261,13 +261,13 @@ def main(argv: list[str]) -> int:
             log(f"[tg] {args.channel}: parsed {len(posts)} posts")
             # Идём от свежих к старым (t.me/s/ отдаёт старые → свежие,
             # так что переворачиваем).
-            # v56b: Берём ВСЕ happ://crypt5 URL'ы из постов (не только первый).
+            # Берём ВСЕ happ://crypt5 URL'ы из постов (не только первый).
             # Причина: самый свежий happ://crypt5 может быть УСТАРЕВШИМ
             # (отдаёт заглушку "Подписка недействительна. Новая ссылка на канале").
             # Если взять только первый — получим 0 конфигов. Берём все, в цикле
             # скачивания отбракуем заглушки по _is_fake_config.
             #
-            # v56c: НО! Если брать ВСЕ happ://crypt5 (8+), каждый fetch по 10 сек
+            # НО! Если брать ВСЕ happ://crypt5 (8+), каждый fetch по 10 сек
             # = 80+ сек только на них. mifa.world не успеет обработаться.
             # Ограничиваем — берём только первые 3 happ://crypt5.
             tg_happ_count = 0
@@ -331,7 +331,7 @@ def main(argv: list[str]) -> int:
         log("[tg] FATAL: 0 URLs collected. Existing tg_subs.txt (if any) is KEPT.")
         return 1
 
-    # v76: Расшифровать happ://crypt5/... → https://... URL подписки.
+    # Расшифровать happ://crypt5/... → https://... URL подписки.
     # Пишем в tg_subs.txt URL'ы (НЕ готовые конфиги!). refresh_subs.py
     # сам скачает каждую подписку и разберёт в vless:// / vmess:// / ...
     # Это значит: tg_subs.txt = ~15-20 URL источников, а не 179 готовых
@@ -375,7 +375,7 @@ def main(argv: list[str]) -> int:
             "Existing tg_subs.txt (if any) is KEPT.")
         return 1
 
-    # v76: Дедуплицируем (могут быть дубли между happ и mifa).
+    # Дедуплицируем (могут быть дубли между happ и mifa).
     seen_final: set[str] = set()
     unique_final: list[str] = []
     for u in final_urls:

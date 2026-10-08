@@ -83,6 +83,14 @@ GEOIP_MAX_RATE_PER_SEC = 4.5  # чуть ниже лимита 5/сек, что�
 GEOIP_FALLBACK_FLAG = ""
 GEOIP_FALLBACK_CODE = "??"
 
+# Цепочка fallback-провайдеров гео (порядок = приоритет).
+# api.ip.sb (лимит 5/сек, DoH-резолв) → ip-api.com (free: HTTP-only,
+# 45 запросов/мин, при 429 переходим дальше) → ipwho.is (HTTPS, без ключа).
+# Если вся цепочка не смогла — код "??" (гео неизвестно; это метаданные,
+# НЕ критерий жизни узла).
+GEOIP_API_IPAPI = "http://ip-api.com/json/{ip}?fields=status,countryCode"
+GEOIP_API_IPWHO = "https://ipwho.is/{ip}"
+
 # Эмодзи-флаги: подмножество самых частых стран. Полную таблицу можно
 # расширить, но на практике достаточно основных.
 FLAG_EMOJI: dict[str, str] = {

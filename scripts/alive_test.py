@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
-"""Быстрый alive-test: sing-box SOCKS5 + HTTP HEAD к gstatic.com/generate_204.
+"""Alive-test: sing-box/xray SOCKS5 + HTTP-пробы через прокси.
 
-Для каждого узла:
-  1. Запускаем sing-box с конфигом узла (SOCKS5 на 127.0.0.1:<port>).
-  2. curl --socks5 → HTTP HEAD к https://www.gstatic.com/generate_204
-  3. Если HTTP 204 → узел ЖИВОЙ (прокси работает).
-  4. Если 403/429/TLS failure/timeout → МЁРТВЫЙ (отбрасываем).
+Порядок проверки узла:
+  1. Стартуем ядро (sing-box, для raw/xhttp — xray) с SOCKS5 на 127.0.0.1:<port>.
+  2. Через прокси: GET https://api.ipify.org — проверка смены exit-IP.
+     exit_ip == runner_ip → прокси не работает, узел отбраковывается.
+  3. Через прокси: GET заблокированных в РФ сервисов (см. _TEST_URLS).
+     Узел alive, если хотя бы --min-services из них ответили HTTP 2xx/3xx.
 
-Это ИМБА — отличает реальные VPN-сервера от CDN/хостинг/фейк:
-  - CDN (Cloudflare/Fastly) → 403 Forbidden (CDN не прокси)
-  - Railway.app/Vercel → TLS handshake failure (не VPN)
-  - Реальные VPN → HTTP 204 (прокси работает)
+Замеры latency (curl -w, миллисекунды, по каждой пробе отдельно):
+  connect — TCP connect до сервера (через SOCKS);
+  tls     — TLS/Reality handshake (time_appconnect);
+  ttfb    — время до первого байта ответа (time_starttransfer);
+  total   — полное время запроса (time_total).
 
-Скорость: ~2-5 сек на узел (HTTP HEAD = 0 bytes download).
-200 узлов × 3с / 8 workers ≈ 75 секунд.
+Фильтр --max-latency-ms применяется к ОДНОЙ величине для всех узлов —
+TTFB пробы exit-IP. В лог/отчёт пишутся все четыре фазы каждой пробы,
+итоговая latency_ms = ttfb пробы exit-IP (ровно то, с чем сравнивается порог).
 
 Запуск:
   python scripts/alive_test.py \\
       --input data/preload_bs.txt \\
       --output data/preload_alive.txt \\
       --singbox-bin bin/sing-box \\
-      --max-nodes 200 \\
-      --workers 8
+      --workers 16
 
 Артефакты:
-  data/preload_alive.txt — только confirmed-alive узлы.
-  data/alive_test_report.json — JSON-отчёт со статусами.
+  <output> — только alive-узлы (исходные URL, порядок входа сохранён
+             при сортировке по latency);
+  <report> — JSON-отчёт со статусами и фазами всех проб.
 """
 from __future__ import annotations
 
@@ -47,17 +50,18 @@ from runtime.parse import parse_node_link, _node_links_from_text
 from runtime.types import XrayNode
 from singbox_convert import sing_box_full_config
 
-# v73: Тестовые URL — ЗАБЛОКИРОВАННЫЕ в РФ сайты.
-# Если прокси может открыть Instagram/YouTube/TG → реально рабочий.
-# gstatic.com/cloudflare слишком лёгкие (0 bytes HEAD) — проходят даже
-# перегруженные/полумёртвые серверы. Реальные сайты требуют полный TLS +
-# HTTP response → отсеивает "handshake OK но traffic dead".
+# Пробы через прокси: сначала exit-IP, затем заблокированные в РФ сервисы.
+# Лёгкие generate_204-эндпоинты проходят даже на перегруженных серверах,
+# реальные сайты требуют полный TLS + HTTP-ответ.
 _TEST_URLS = [
-    "https://www.instagram.com/",           # Instagram — заблокирован в РФ
-    "https://www.youtube.com/",             # YouTube — замедлен в РФ
-    "https://api.telegram.org/",            # Telegram API — заблокирован в РФ
-    "https://www.gstatic.com/generate_204",  # Fallback (лёгкий, если все тяжёлые упали)
+    ("ipify", "https://api.ipify.org"),
+    ("instagram", "https://www.instagram.com/"),
+    ("youtube", "https://www.youtube.com/"),
+    ("telegram", "https://api.telegram.org/"),
 ]
+
+# Формат curl -w: http_code + фазы запроса (в секундах), отделяется переводом строки.
+_CURL_WRITE_OUT = "\\n%{http_code} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}"
 
 _PORT_POOL = list(range(11001, 11201))
 _PORT_INDEX = 0
@@ -73,8 +77,8 @@ def _find_free_port() -> int:
 
 
 def _wait_for_socks5(port: int, timeout: float) -> bool:
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return True
@@ -83,11 +87,66 @@ def _wait_for_socks5(port: int, timeout: float) -> bool:
     return False
 
 
-def _build_xray_config(node: XrayNode, listen_port: int) -> tuple[dict | None, str | None]:
-    """v69: Build minimal xray config для raw/xhttp транспорта (sing-box не поддерживает).
+def _geo_lookup_code(ip: str) -> tuple[str, str]:
+    """Страна exit-IP через цепочку subgen.geo (ip.sb → ip-api.com → ipwho.is).
 
-    xray config формат: inbounds[socks] + outbounds[proto].
+    Метаданные для отчёта: {country, geo_status}. Никак не влияет на вердикт
+    alive/dead. При полной недоступности цепочки — ("??", "").
     """
+    try:
+        from subgen.geo import geoip_lookup
+        return geoip_lookup(ip, timeout=6.0)
+    except Exception:
+        return ("??", "")
+
+
+def _curl_probe(listen_port: int, url: str, timeout: float) -> dict:
+    """Один GET через SOCKS5-прокси с телом ответа и замером фаз.
+
+    Возвращает dict:
+      ok, http_code, body, error,
+      connect_ms, tls_ms, ttfb_ms, total_ms  (None, если curl не дошёл).
+    """
+    result: dict = {
+        "ok": False, "http_code": 0, "body": "", "error": None,
+        "connect_ms": None, "tls_ms": None, "ttfb_ms": None, "total_ms": None,
+    }
+    try:
+        proc = subprocess.run(
+            ["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{listen_port}",
+             "--max-time", str(timeout),
+             "-w", _CURL_WRITE_OUT, url],
+            capture_output=True, text=True, timeout=timeout + 5,
+        )
+    except subprocess.TimeoutExpired:
+        result["error"] = "timeout"
+        return result
+    if proc.returncode != 0:
+        result["error"] = (proc.stderr.strip() or f"curl exit {proc.returncode}")[:120]
+        return result
+    # stdout = тело ответа + "\n" + строка статистики "code connect tls ttfb total".
+    body, _, stats_line = proc.stdout.rpartition("\n")
+    parts = stats_line.split()
+    if len(parts) == 5:
+        try:
+            code, connect_s, tls_s, ttfb_s, total_s = parts
+            result["http_code"] = int(code)
+            result["connect_ms"] = round(float(connect_s) * 1000, 1)
+            result["tls_ms"] = round(float(tls_s) * 1000, 1) if float(tls_s) > 0 else None
+            result["ttfb_ms"] = round(float(ttfb_s) * 1000, 1)
+            result["total_ms"] = round(float(total_s) * 1000, 1)
+        except ValueError:
+            pass
+    else:
+        # Нет строки статистики (пустое тело у 204 и т.п.) — пробуем как тело.
+        body = proc.stdout
+    result["body"] = body.strip()
+    result["ok"] = True
+    return result
+
+
+def _build_xray_config(node: XrayNode, listen_port: int) -> tuple[dict | None, str | None]:
+    """Минимальный xray-конфиг для raw/xhttp (sing-box их не поддерживает)."""
     proto = (node.protocol or "").lower()
     q = node.query
     host = node.host
@@ -164,32 +223,28 @@ def _test_node(node: XrayNode, singbox_bin: Path,
                xray_bin: Path | None = None, *,
                head_timeout: float = 8.0, startup_timeout: float = 5.0,
                max_latency_ms: float = 2000,
+               min_services: int = 1,
                runner_ip: str = "") -> dict:
-    """v74: IP verification + multi-service test.
-    1. Get runner IP (before proxy).
-    2. Through proxy: get exit IP (ipify.org).
-    3. Through proxy: test Instagram, YouTube, Telegram.
-    4. If exit_ip == runner_ip → proxy NOT working (leaking).
-    5. If Instagram/YouTube/TG all timeout → proxy overloaded.
-    """
-    result = {
+    """Полная проверка узла. latency-порог применяется к TTFB пробы exit-IP."""
+    result: dict = {
         "host": node.host, "port": node.port, "protocol": node.protocol,
         "name": node.name, "status": "unknown",
-        "http_code": None, "error": None, "latency_ms": None, "dns_ms": None,
+        "http_code": None, "error": None,
+        "latency_ms": None,           # TTFB пробы exit-IP (та же величина, что в пороге)
         "exit_ip": None, "ip_changed": None,
+        "country": None, "geo_status": "unknown",   # гео exit-IP — метаданные, не критерий жизни
         "instagram": None, "youtube": None, "telegram": None,
+        "timings": {},                # все фазы всех проб
     }
 
     listen_port = _find_free_port()
 
-    # v69: Try sing-box first, then xray for raw/xhttp.
     config, reason = sing_box_full_config(node, "127.0.0.1", listen_port)
     binary = singbox_bin
     binary_name = "sing-box"
 
     if config is None and xray_bin is not None and xray_bin.exists():
-        # sing-box can't build config → try xray (supports raw/xhttp).
-        xray_config, xray_reason = _build_xray_config(node, listen_port)
+        xray_config, _xray_reason = _build_xray_config(node, listen_port)
         if xray_config is not None:
             config = xray_config
             binary = xray_bin
@@ -209,137 +264,112 @@ def _test_node(node: XrayNode, singbox_bin: Path,
         result["error"] = f"config write: {exc}"
         return result
 
-    # Запускаем binary (sing-box или xray).
-    sb_proc = None
+    core_proc = None
     try:
-        if binary_name == "xray":
-            sb_proc = subprocess.Popen(
-                [str(binary), "run", "-c", str(config_path)],
+        run_arg = "-c" if binary_name == "xray" else "--config"
+        try:
+            core_proc = subprocess.Popen(
+                [str(binary), "run", run_arg, str(config_path)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-        else:
-            sb_proc = subprocess.Popen(
-                [str(binary), "run", "--config", str(config_path)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-    except OSError as exc:
-        result["status"] = "dead"
-        result["error"] = f"{binary_name} start: {exc}"
-        config_path.unlink(missing_ok=True)
-        return result
+        except OSError as exc:
+            result["status"] = "dead"
+            result["error"] = f"{binary_name} start: {exc}"
+            config_path.unlink(missing_ok=True)
+            return result
 
-    try:
         if not _wait_for_socks5(listen_port, startup_timeout):
             result["status"] = "dead"
             result["error"] = f"{binary_name} did not start in {startup_timeout}s"
             return result
 
-        t0 = time.monotonic()
-
-        # v74: ШАГ 1 — Проверка IP (выходим через прокси или нет?)
-        try:
-            curl_ip = subprocess.run(
-                ["curl", "-sS", "--socks5-hostname", f"127.0.0.1:{listen_port}",
-                 "--max-time", str(head_timeout),
-                 "https://api.ipify.org"],
-                capture_output=True, text=True, timeout=head_timeout + 5,
-            )
-        except subprocess.TimeoutExpired:
+        # Проба 1: exit-IP. Один запрос: тело (IP) + фазы = профиль узла.
+        ip_probe = _curl_probe(listen_port, _TEST_URLS[0][1], head_timeout)
+        result["timings"]["exit_ip"] = ip_probe
+        if not ip_probe["ok"]:
             result["status"] = "dead"
-            result["error"] = "ipify timeout"
+            result["error"] = f"exit-ip probe: {ip_probe['error']}"
             return result
 
-        if curl_ip.returncode != 0:
+        exit_ip = (ip_probe.get("body") or "").strip()
+        if not exit_ip:
             result["status"] = "dead"
-            result["error"] = f"ipify: {curl_ip.stderr.strip()[:100]}"
+            result["error"] = "exit-ip probe: empty body"
             return result
-
-        exit_ip = curl_ip.stdout.strip()
         result["exit_ip"] = exit_ip
 
+        # Гео exit-IP — метаданные для отчёта (модель {alive, exit_ip, country,
+        # geo_status}). На вердикт alive/dead НЕ влияет никак.
+        geo_code, _geo_flag = _geo_lookup_code(exit_ip)
+        if geo_code not in ("", "??", "🌐"):
+            result["country"] = geo_code
+            result["geo_status"] = "ok"
+
         if runner_ip and exit_ip and exit_ip == runner_ip:
-            # IP не изменился — прокси НЕ работает, трафик идёт напрямую!
             result["status"] = "dead"
             result["ip_changed"] = False
             result["error"] = f"IP leaked: exit={exit_ip} == runner={runner_ip}"
             return result
-
         result["ip_changed"] = True
-        latency = (time.monotonic() - t0) * 1000.0
-        result["latency_ms"] = latency
 
-        # v72: latency > max → dead.
-        if max_latency_ms > 0 and latency > max_latency_ms:
+        # Порог latency: TTFB пробы exit-IP. Одна величина для всех узлов.
+        ttfb = ip_probe.get("ttfb_ms")
+        if ttfb is None:
+            ttfb = ip_probe.get("total_ms") or 0.0
+        result["latency_ms"] = ttfb
+        if max_latency_ms > 0 and ttfb > max_latency_ms:
             result["status"] = "dead"
-            result["error"] = f"latency {latency:.0f}ms (>{max_latency_ms:.0f}ms)"
+            result["error"] = (f"ttfb {ttfb:.0f}ms (>{max_latency_ms:.0f}ms); "
+                               f"connect={ip_probe.get('connect_ms')} "
+                               f"tls={ip_probe.get('tls_ms')} "
+                               f"total={ip_probe.get('total_ms')}")
             return result
 
-        # v74: ШАГ 2 — Multi-service test (Instagram, YouTube, Telegram).
-        # Проверяем может ли прокси открыть ЗАБЛОКИРОВАННЫЕ сайты.
-        services = {
-            "instagram": "https://www.instagram.com/",
-            "youtube": "https://www.youtube.com/",
-            "telegram": "https://api.telegram.org/",
-        }
+        # Пробы 2..N: заблокированные сервисы, каждый со своими фазами.
         service_ok = 0
-        service_results = {}
-        for svc_name, svc_url in services.items():
-            try:
-                curl_svc = subprocess.run(
-                    ["curl", "-sS", "-L", "--socks5-hostname", f"127.0.0.1:{listen_port}",
-                     "--max-time", str(head_timeout),
-                     "-o", "/dev/null",
-                     "-w", "%{http_code}",
-                     svc_url],
-                    capture_output=True, text=True, timeout=head_timeout + 5,
-                )
-                if curl_svc.returncode == 0:
-                    try:
-                        code = int(curl_svc.stdout.strip())
-                    except ValueError:
-                        code = 0
-                    service_results[svc_name] = code
-                    result[svc_name] = code
-                    if code in (200, 204, 301, 302, 303, 307, 308):
-                        service_ok += 1
-                    else:
-                        service_results[svc_name] = f"HTTP {code}"
-                else:
-                    service_results[svc_name] = "timeout"
-                    result[svc_name] = "timeout"
-            except subprocess.TimeoutExpired:
-                service_results[svc_name] = "timeout"
-                result[svc_name] = "timeout"
+        first_ok_code: int | None = None
+        for svc_name, svc_url in _TEST_URLS[1:]:
+            probe = _curl_probe(listen_port, svc_url, head_timeout)
+            result["timings"][svc_name] = probe
+            code = probe.get("http_code") or 0
+            if probe["ok"] and code in (200, 204, 301, 302, 303, 307, 308):
+                service_ok += 1
+                if first_ok_code is None:
+                    first_ok_code = code
+                result[svc_name] = code
+            else:
+                result[svc_name] = "timeout" if not probe["ok"] else f"HTTP {code}"
 
-        # v74: Если хотя бы 1 сервис работает → alive.
-        # Если все 3 timeout → "overloaded" (IP changed, но трафик не идёт).
-        if service_ok > 0:
-            total_latency = (time.monotonic() - t0) * 1000.0
-            result["latency_ms"] = total_latency
-            result["http_code"] = 200
+        result["http_code"] = first_ok_code
+        if service_ok >= min_services:
             result["status"] = "alive"
-            return result
         else:
-            total_latency = (time.monotonic() - t0) * 1000.0
-            result["latency_ms"] = total_latency
             result["status"] = "dead"
-            result["error"] = f"ip_changed={exit_ip[:20]} but all services timeout"
-            return result
+            result["error"] = (f"ip_changed={exit_ip[:20]} but only "
+                               f"{service_ok}/{len(_TEST_URLS) - 1} services ok "
+                               f"(min {min_services})")
+        return result
 
     finally:
-        if sb_proc is not None and sb_proc.poll() is None:
-            sb_proc.terminate()
+        if core_proc is not None and core_proc.poll() is None:
+            core_proc.terminate()
             try:
-                sb_proc.wait(timeout=1.0)
+                core_proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
-                sb_proc.kill()
-                sb_proc.wait(timeout=1.0)
+                core_proc.kill()
+                core_proc.wait(timeout=1.0)
         config_path.unlink(missing_ok=True)
+
+
+def _fmt_ms(value) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.0f}"
 
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
-        description="Быстрый alive-test через sing-box + HTTP HEAD.",
+        description="Alive-test через sing-box/xray + HTTP-пробы с фазовыми замерами.",
     )
     p.add_argument("--input", type=Path, required=True,
                    help="Файл с конфигами (vless://, vmess://, ...).")
@@ -350,32 +380,26 @@ def main(argv: list[str]) -> int:
     p.add_argument("--singbox-bin", type=Path, required=True,
                    help="Путь к sing-box binary.")
     p.add_argument("--xray-bin", type=Path, default=None,
-                   help="Путь к xray binary (v69: для raw/xhttp транспорта).")
+                   help="Путь к xray binary (для raw/xhttp транспорта).")
     p.add_argument("--source-map", type=Path, default=None,
-                   help="JSON маппинг URL → source (v70: для статистики alive/dead по источникам).")
+                   help="JSON маппинг URL → source (статистика alive/dead по источникам).")
     p.add_argument("--max-nodes", type=int, default=200,
-                   help="Лимит числа узлов для тестирования (default: 200).")
+                   help="Лимит числа узлов для тестирования (default: 200). 0 = без лимита.")
     p.add_argument("--workers", type=int, default=8,
                    help="Параллелизм (default: 8).")
     p.add_argument("--head-timeout", type=float, default=8.0,
-                   help="Таймаут HTTP запроса, сек (default: 8.0). "
-                        "v73: увеличен с 5 до 8 — реальные сайты (Instagram/YouTube) "
-                        "отвечают дольше чем gstatic.")
+                   help="Таймаут одной HTTP-пробы, сек (default: 8.0).")
     p.add_argument("--startup-timeout", type=float, default=5.0,
-                   help="Таймаут запуска sing-box, сек (default: 5.0).")
-    # v72: max latency — alive конфиги с latency > X ms → dead (reject).
+                   help="Таймаут запуска ядра, сек (default: 5.0).")
     p.add_argument("--max-latency-ms", type=float, default=2000,
-                   help="Максимальная latency (через прокси) в ms. "
-                        "Alive с latency > X → dead (reject). "
-                        "Default: 2000. 1000 = строже (только быстрые). "
-                        "User: 'какого хрена проходят конфиги с 5к пинга'.")
-    # v65: --final-limit — обрез ПОСЛЕ alive-test (не ДО!).
-    # Раньше refresh_subs обрезал до 200 ДО alive-test → из 200 выживало 11.
-    # Теперь: refresh_subs даёт 1000, alive-test проверяет 1000,
-    # --final-limit 200 берёт топ-200 из alive.
+                   help="Порог на TTFB пробы exit-IP, мс (default: 2000). "
+                        "0 = без лимита. Применяется к одной и той же величине "
+                        "для всех узлов.")
+    p.add_argument("--min-services", type=int, default=1,
+                   help="Сколько из 3 сервисов должны ответить 2xx/3xx, "
+                        "чтобы узел считался alive (default: 1).")
     p.add_argument("--final-limit", type=int, default=0,
-                   help="ФИНАЛЬНЫЙ обрез ПОСЛЕ alive-test. 200 = топ-200 alive "
-                        "(по latency). 0 = без лимита (все alive). Default: 0.")
+                   help="Обрез ПОСЛЕ alive-test: топ-N alive по TTFB. 0 = без лимита.")
     args = p.parse_args(argv)
 
     def log(msg: str) -> None:
@@ -384,7 +408,6 @@ def main(argv: list[str]) -> int:
     if not args.singbox_bin.exists():
         log(f"[alive] FATAL: sing-box not found at {args.singbox_bin}")
         return 1
-
     if not args.input.exists():
         log(f"[alive] FATAL: input not found: {args.input}")
         return 1
@@ -406,7 +429,6 @@ def main(argv: list[str]) -> int:
         log("[alive] FATAL: 0 valid nodes")
         return 1
 
-    # v70: Загрузить source_map для статистики alive/dead по источникам.
     source_map: dict[str, str] = {}
     if args.source_map and args.source_map.exists():
         try:
@@ -414,16 +436,12 @@ def main(argv: list[str]) -> int:
             log(f"[alive] loaded source_map: {len(source_map)} entries")
         except Exception as exc:
             log(f"[alive] source_map load failed: {exc}")
-    else:
-        log("[alive] no source_map — source stats will be unavailable")
 
     if args.max_nodes > 0 and len(nodes) > args.max_nodes:
         log(f"[alive] truncating to {args.max_nodes} (--max-nodes)")
         nodes = nodes[:args.max_nodes]
-    elif args.max_nodes == 0:
-        log(f"[alive] --max-nodes 0 = NO LIMIT, testing ALL {len(nodes)} nodes")
 
-    # v74: Получаем IP runner'а для проверки утечки.
+    # IP раннера для проверки утечки (прокси не сменил IP → не работает).
     runner_ip = ""
     try:
         ip_result = subprocess.run(
@@ -437,85 +455,70 @@ def main(argv: list[str]) -> int:
         log("[alive] WARNING: could not get runner IP")
 
     log(f"[alive] testing {len(nodes)} nodes with {args.workers} workers "
-        f"(head_timeout={args.head_timeout}s, startup={args.startup_timeout}s, "
+        f"(probe_timeout={args.head_timeout}s, startup={args.startup_timeout}s, "
+        f"max_ttfb={args.max_latency_ms}ms, min_services={args.min_services}, "
         f"runner_ip={runner_ip or 'unknown'})")
 
-    results: list[dict] = []
-    alive_urls: list[str] = []
-    done = 0
-    alive_count = 0
-    dead_count = 0
-    lock = threading.Lock()
-
+    results: dict[str, dict] = {}   # url -> result
+    node_by_url = {url: n for n, url in nodes}
     with ThreadPoolExecutor(max_workers=args.workers, thread_name_prefix="sb") as ex:
         futures = {ex.submit(_test_node, n, args.singbox_bin,
                              args.xray_bin if args.xray_bin else None,
                              head_timeout=args.head_timeout,
                              startup_timeout=args.startup_timeout,
                              max_latency_ms=args.max_latency_ms,
-                             runner_ip=runner_ip): (n, url)
+                             min_services=args.min_services,
+                             runner_ip=runner_ip): url
                    for n, url in nodes}
+        done = 0
         for fut in as_completed(futures):
-            node, url = futures[fut]
+            url = futures[fut]
+            node = node_by_url[url]
             done += 1
             try:
                 r = fut.result()
             except Exception as exc:
                 r = {"host": node.host, "port": node.port, "protocol": node.protocol,
                      "status": "dead", "error": str(exc)}
+            results[url] = r
 
-            with lock:
-                results.append(r)
-                if r["status"] == "alive":
-                    alive_count += 1
-                    alive_urls.append(url)
-                else:
-                    dead_count += 1
-
-            latency_str = f"{r.get('latency_ms', 0):.0f}ms" if r.get("latency_ms") else "—"
+            lat = r.get("latency_ms")
+            t = r.get("timings", {}).get("exit_ip", {})
+            lat_str = (f"ttfb={lat:.0f}ms c={_fmt_ms(t.get('connect_ms'))} "
+                       f"tls={_fmt_ms(t.get('tls_ms'))} tot={_fmt_ms(t.get('total_ms'))}"
+                       if lat is not None else "—")
             ip_str = f"ip={r.get('exit_ip', '?')[:15]}" if r.get("exit_ip") else ""
-            svc_str = f"ig={r.get('instagram','?')} yt={r.get('youtube','?')} tg={r.get('telegram','?')}"
+            svc_str = (f"ig={r.get('instagram', '?')} yt={r.get('youtube', '?')} "
+                       f"tg={r.get('telegram', '?')}")
             log(f"[alive] {done}/{len(nodes)}: {r['host']}:{r['port']} "
-                f"({r['protocol']}) = {r['status']} {latency_str} {ip_str} {svc_str}"
+                f"({r['protocol']}) = {r['status']} {lat_str} {ip_str} {svc_str}"
                 + (f" {r.get('error', '')[:60]}" if r.get("error") else ""))
 
+    alive_urls = [url for url, _ in nodes if results[url]["status"] == "alive"]
+    alive_count = len(alive_urls)
+    dead_count = len(nodes) - alive_count
     log(f"[alive] done: {alive_count} alive, {dead_count} dead")
 
-    # v70: Source stats — alive/dead по источникам.
     if source_map:
-        src_alive: dict[str, int] = {}
-        src_dead: dict[str, int] = {}
         src_total: dict[str, int] = {}
+        src_alive: dict[str, int] = {}
         for n, url in nodes:
             src = source_map.get(url, source_map.get(url.split("#")[0], "?"))
             src_total[src] = src_total.get(src, 0) + 1
-        for url in alive_urls:
-            src = source_map.get(url, source_map.get(url.split("#")[0], "?"))
-            src_alive[src] = src_alive.get(src, 0) + 1
-        for src in src_total:
-            src_dead[src] = src_total[src] - src_alive.get(src, 0)
-
-        log(f"[alive] source stats (alive/dead/total):")
-        for src in sorted(src_total.keys(), key=lambda s: -src_alive.get(s, 0)):
+            if results[url]["status"] == "alive":
+                src_alive[src] = src_alive.get(src, 0) + 1
+        log("[alive] source stats (alive/dead/total):")
+        for src in sorted(src_total, key=lambda s: -src_alive.get(s, 0)):
             a = src_alive.get(src, 0)
-            d = src_dead.get(src, 0)
             t = src_total[src]
-            pct = (a / t * 100) if t > 0 else 0
-            log(f"[alive]   {a:4d}/{t:4d} ({pct:5.1f}%) alive  ← {src}")
+            log(f"[alive]   {a:4d}/{t:4d} ({a / t * 100:5.1f}%) alive  ← {src}")
 
-    # v65: --final-limit — обрез ПОСЛЕ alive-test, по latency (быстрые первыми).
-    # Сортируем alive по latency, берём топ-N.
-    if args.final_limit > 0 and len(alive_urls) > args.final_limit:
-        # Нужно отсортировать alive по latency. Перестроим alive_urls по latency.
-        alive_results = [(url, r) for url, r in zip(alive_urls, results)
-                         if r["status"] == "alive"]
-        alive_results.sort(key=lambda x: x[1].get("latency_ms") or 9999)
-        before = len(alive_urls)
-        alive_urls = [url for url, _ in alive_results[:args.final_limit]]
-        log(f"[alive] FINAL --final-limit: {before} → {args.final_limit} "
-            f"(по latency, быстрые первыми)")
+    # Топ-N alive по TTFB (latency_ms уже = TTFB exit-IP пробы).
+    if args.final_limit > 0 and alive_count > args.final_limit:
+        alive_urls.sort(key=lambda u: results[u].get("latency_ms") or 9_999_999)
+        alive_urls = alive_urls[:args.final_limit]
+        log(f"[alive] FINAL --final-limit: {alive_count} → {args.final_limit} (по TTFB)")
 
-    # Записываем alive узлы.
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | "
@@ -524,13 +527,12 @@ def main(argv: list[str]) -> int:
             f.write(url + "\n")
     log(f"[alive] wrote {alive_count} alive nodes to {args.output}")
 
-    # JSON-отчёт.
     report = {
         "timestamp": int(time.time()),
         "total_tested": len(nodes),
         "alive": alive_count,
         "dead": dead_count,
-        "results": results,
+        "results": [results[url] for url, _ in nodes],
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2),

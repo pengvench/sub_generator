@@ -494,7 +494,11 @@ def main(argv: list[str]) -> int:
                 f"({r['protocol']}) = {r['status']} {lat_str} {ip_str} {svc_str}"
                 + (f" {r.get('error', '')[:60]}" if r.get("error") else ""))
 
-    alive_urls = [url for url, _ in nodes if results[url]["status"] == "alive"]
+    # nodes = [(XrayNode, url), ...] — НОДА ПЕРВОЙ (см. сборку выше).
+    # Регрессия v5: раньше здесь было `for url, _ in nodes` — порядок был
+    # перепутан, results[<XrayNode>] кидал TypeError: unhashable type
+    # 'XrayNode' ПОСЛЕ полного прогона (весь прогон впустую). Фикс: `for _, url`.
+    alive_urls = [url for _, url in nodes if results[url]["status"] == "alive"]
     alive_count = len(alive_urls)
     dead_count = len(nodes) - alive_count
     log(f"[alive] done: {alive_count} alive, {dead_count} dead")
@@ -532,7 +536,7 @@ def main(argv: list[str]) -> int:
         "total_tested": len(nodes),
         "alive": alive_count,
         "dead": dead_count,
-        "results": [results[url] for url, _ in nodes],
+        "results": [results[url] for _, url in nodes],
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2),

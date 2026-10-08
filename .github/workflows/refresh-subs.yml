@@ -29,6 +29,9 @@
 #   - Антифейк: --min-ping-ms 80 (CDN/PaaS: connect 10-50ms, прокси нет;
 #     рабочие узлы по known_good 185-320ms) и --drop-cdn-ips (CDN IP =
 #     фейк; проверено вручную по v2rayN) — ВКЛЮЧЕНЫ.
+#   - Порог latency --max-latency-ms — вход workflow (default 4000):
+#     2000 убивал рабочие узлы (замер на корпусе из TG-чата: у 45/56
+#     сменился exit-IP, порог 2000 отсеял 18 из них, ttfb 2061-6964ms).
 #   - Классификация БС/ЧС: гадайка по ключевым словам (wl/bl/white/black
 #     в URL и теле подписки) — ВКЛЮЧЕНА по вердикту владельца (распределение
 #     соответствует реальности). Явные секции sources.txt приоритетнее.
@@ -59,6 +62,10 @@ on:
         description: "Отбрасывать '🌐 peppo' (гео неизвестно после цепочки ip.sb→ip-api→ipwho и нет флага в имени). Default ON"
         type: boolean
         default: true
+      max_latency_ms:
+        description: "Порог TTFB пробы exit-IP, мс. Default 4000: замер на рабочем корпусе показал, что 2000 убивал 18/45 РАБОЧИХ узлов (ip сменился, ttfb 2061-6964ms)."
+        type: number
+        default: 4000
 
 # Чтобы параллельные запуски не затирали друг друга.
 concurrency:
@@ -172,6 +179,10 @@ jobs:
       - name: Alive-test (sing-box/xray SOCKS5 + HTTP-пробы — ВСЕ узлы)
         # --max-latency-ms применяется к TTFB пробы exit-IP (одна величина
         # для всех узлов). Фазы connect/tls/ttfb/total пишутся в лог и отчёт.
+        # alive_test.py выходит с кодом 1 при 0 alive — это НЕ фейл шага:
+        # гасим код (|| echo) и ветвимся по числу alive в output-файле.
+        # output-файл содержит header-строку → [ -s ] всегда true, поэтому
+        # считаем СТРОКИ-УЗЛЫ (wc -l - 1), а не размер файла.
         run: |
           if [ ! -x bin/sing-box ]; then
             echo "[gha] sing-box not found — skipping alive-test"
@@ -188,13 +199,24 @@ jobs:
             --workers 16 \
             --head-timeout 8 \
             --startup-timeout 5 \
-            --max-latency-ms 2000
-          if [ -s data/preload_alive.txt ]; then
-            ALIVE_COUNT=$(($(wc -l < data/preload_alive.txt) - 1))
-            echo "[gha] alive-test BS: $ALIVE_COUNT alive — replacing preload_bs.txt"
+            --max-latency-ms ${{ inputs.max_latency_ms || 4000 }} \
+            || echo "[gha] alive-test BS: exit=$? (0 alive или ошибка прогона)"
+          BS_ALIVE=0
+          if [ -f data/preload_alive.txt ]; then
+            BS_ALIVE=$(($(wc -l < data/preload_alive.txt) - 1))
+          fi
+          if [ "$BS_ALIVE" -gt 0 ]; then
+            echo "[gha] alive-test BS: $BS_ALIVE alive — replacing preload_bs.txt"
             cp data/preload_alive.txt data/preload_bs.txt
           else
-            echo "[gha] alive-test BS: 0 alive — keeping original preload_bs.txt"
+            # 0 alive: НЕ оставляем мусорный preload_bs (тысячи мёртвых
+            # конфигов с раннера) и НЕ отдаём пустую подписку. Пол =
+            # known_good.txt — конфиги, проверенные владельцем вручную
+            # (его ground truth > замеры с US-раннера).
+            echo "[gha] alive-test BS: 0 alive — FALLBACK: preload_bs.txt = known_good.txt"
+            { echo "# alive-test fallback: 0 alive nodes — держим known_good"; \
+              cat data/known_good.txt 2>/dev/null || echo "# (known_good.txt отсутствует)"; \
+            } > data/preload_bs.txt
           fi
           if [ -s data/preload_chs.txt ]; then
             python scripts/alive_test.py \
@@ -208,9 +230,17 @@ jobs:
               --workers 16 \
               --head-timeout 8 \
               --startup-timeout 5 \
-              --max-latency-ms 2000
-            if [ -s data/preload_chs_alive.txt ]; then
+              --max-latency-ms ${{ inputs.max_latency_ms || 4000 }} \
+              || echo "[gha] alive-test ChS: exit=$? (0 alive или ошибка прогона)"
+            CHS_ALIVE=0
+            if [ -f data/preload_chs_alive.txt ]; then
+              CHS_ALIVE=$(($(wc -l < data/preload_chs_alive.txt) - 1))
+            fi
+            if [ "$CHS_ALIVE" -gt 0 ]; then
+              echo "[gha] alive-test ChS: $CHS_ALIVE alive — replacing preload_chs.txt"
               cp data/preload_chs_alive.txt data/preload_chs.txt
+            else
+              echo "[gha] alive-test ChS: 0 alive — keeping original preload_chs.txt"
             fi
           fi
           echo "[gha] generating subs.txt (БС alive-confirmed base64)..."

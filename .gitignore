@@ -29,18 +29,11 @@ pip-selfcheck.json
 .vscode/
 .idea/
 
-# Runtime data (создаётся при запуске).
-# data/sources.txt в репо НЕ хранится: при первом запуске создаётся пустым
-# (ui/paths.py::ensure_sources_file); сборка тоже генерирует пустышку.
-data/*
+
 !data/happ_keys/
 data/happ_keys/*
 !data/happ_keys/README.md
 
-# v48c: Разрешаем отслеживать GHA-генерируемые файлы в data/ — иначе
-# git-auto-commit-action НЕ видит их (т.к. data/* в .gitignore).
-# preload.txt, sources.txt, known_good.txt и т.д. — force-added ранее,
-# но tg_subs.txt терялся (git-auto-commit уважает .gitignore).
 !data/tg_subs.txt
 !data/preload.txt
 !data/preload_bs.txt
@@ -48,25 +41,15 @@ data/happ_keys/*
 !data/pool_bs.txt
 !data/pool_chs.txt
 !data/preload_report.json
+!data/alive_test_report.json
+!data/alive_test_chs_report.json
 !data/source_map.json
 !data/sources.txt
 !data/known_good.txt
 !data/sni_whitelist.txt
-!data/cidr_whitelist.txt
 !data/sni_whitelist_custom.txt
 !data/settings.json
 !data/geo_cache.json
-# v7+: отчёты alive_test_report.json / alive_test_chs_report.json в git
-# НЕ ТРЕКАЮТСЯ (инцидент 2026-10-09: push отклонён лимитом GitHub
-# 100 МБ/файл — 148 МБ + 931 МБ). С v8 в отчётах нет тел HTTP-проб
-# (~1 КБ/узел), они живут только в CI-artifacts. Publish-job вычищает
-# отслеживаемые копии идемпотентным git rm --cached.
-
-# v9: subs.txt / subs_chs.txt СНОВА трекаются — GitHub снова гоняет
-# полный пайплайн (4 job, включая alive-test). data/pool_bs.txt и
-# data/pool_chs.txt — СЫРЫЕ пинг-фильтрованные пулы: их по raw-ссылкам
-# забирает ОТДЕЛЬНЫЙ репо sub_generator_alive на GitVerse и тестирует
-# из РФ — см. docs/GHA_REFRESH.md.
 
 # Секреты happ-ключей — никогда в репо (README выше — единственное исключение).
 *.pem

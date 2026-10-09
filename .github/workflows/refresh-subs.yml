@@ -170,6 +170,12 @@ jobs:
         # --ping-ips-out: host→ip с пинга — их читает geo-job (без DNS).
         # ГЕО ФЛАГОВ ЗДЕСЬ БОЛЬШЕ НЕТ: --geo-rename уехал в job geo
         # (scripts/geo_stage.py; см. шапку).
+        #
+        # schedule-safe (инцидент run#64, 2026-10-09): на cron контекст
+        # inputs ПУСТ (null), а `null != false` в GHA — ЛОЖЬ (loose
+        # equality: null->0, false->0). Старая запись `inputs.with_ping
+        # != false && ...` из-за этого отключала пинг на каждом
+        # автозапуске. Новый флаг = «не dispatch ИЛИ не выключали явно».
         env:
           SUBGEN_DEBUG: "1"
         run: |
@@ -179,7 +185,7 @@ jobs:
             --extra-sources-file data/tg_subs.txt \
             --output data/preload.txt \
             --report data/preload_report.json \
-            ${{ inputs.with_ping != false && '--with-ping' || '' }} \
+            ${{ (github.event_name != 'workflow_dispatch' || inputs.with_ping != false) && '--with-ping' || '' }} \
             --min-ping-ms 80 \
             --max-ping-ms ${{ inputs.max_ping_ms || 2000 }} \
             --ping-timeout 2.5 \
@@ -244,6 +250,12 @@ jobs:
         # кеш data/geo_cache.json) и «🌐 peppo» выбрасывается (кроме
         # --keep-unknown; инпут drop_geo_fallback как раньше).
         # IP-хосты — из ping_host_ips.json (захвачены пингом, без DNS).
+        #
+        # schedule-safe + фикс идиомы (2026-10-09): `X && '' || Y` в GHA
+        # даёт Y ВСЕГДА (пустая строка falsy) — --keep-unknown
+        # передавался на ЛЮБОМ триггере, и дроп «🌐 peppo» молча не
+        # работал с v11 даже при ручном запуске с default=true.
+        # Теперь: --keep-unknown ТОЛЬКО при dispatch с явным false.
         run: |
           python3 scripts/geo_stage.py \
             --pool data/preload_bs.txt \
@@ -253,7 +265,7 @@ jobs:
             --known-ips data/ping_host_ips.json \
             --workers 32 \
             --timeout 8.0 \
-            ${{ inputs.drop_geo_fallback != false && '' || '--keep-unknown' }}
+            ${{ (github.event_name == 'workflow_dispatch' && inputs.drop_geo_fallback == false) && '--keep-unknown' || '' }}
           echo "=== preload_bs.txt (first 3) ==="
           head -n 3 data/preload_bs.txt 2>/dev/null || true
 

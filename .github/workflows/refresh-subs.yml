@@ -57,6 +57,8 @@
 #     drop_geo_fallback; выключить — Run workflow → drop_geo_fallback=false).
 #   - Антифейк: --min-ping-ms 80 и --drop-cdn-ips — ВКЛЮЧЕНЫ.
 #   - Классификация БС/ЧС: гадайка по ключевым словам — ВКЛЮЧЕНА.
+#   - Только vless:// (--vless-only) — ВКЛЮЧЕНО, в т.ч. на cron
+#     (вердикт владельца 2026-10-11; отключить: ручной запуск → vless_only=false).
 #   - User-Agent (v6): феч подписок = v2rayNG/1.10.8; пробы = Chrome 141.
 #   - Недоказанные эвристики (cross-dedup) — ВЫКЛЮЧЕНЫ (см. --help).
 #   - v10 (инцидент 2026-10-09: job refresh убит на 45:00, geoip 7600/8132):
@@ -76,27 +78,23 @@ on:
     # Ручной запуск из вкладки Actions.
     inputs:
       with_ping:
-        description: "TCP-ping фильтр (медленнее, чистит мёртвые)"
-        type: boolean
-        default: true
-      sort_by_sni:
-        description: "Сортировать БС-узлы первыми в финальном списке"
+        description: "TCP-ping фильтр мёртвых узлов"
         type: boolean
         default: true
       vless_only:
-        description: "Собирать ТОЛЬКО vless:// конфиги. Default OFF"
+        description: "Только vless:// конфиги"
         type: boolean
-        default: false
+        default: true
       drop_geo_fallback:
-        description: "Отбрасывать '🌐 peppo' (гео неизвестно после цепочки ip.sb→ip-api→ipwho и нет флага в имени). Default ON"
+        description: "Отбрасывать '🌐 peppo' (гео неизвестно)"
         type: boolean
         default: true
       max_ping_ms:
-        description: "Порог TCP-connect в refresh (мс). Default 2000: 1000 был слишком жёстким (p95 живых=424ms, срезано 764 узла в диапазоне 1000-1500ms)."
+        description: "Порог TCP-connect в refresh, мс"
         type: number
         default: 2000
       max_latency_ms:
-        description: "Порог TTFB пробы exit-IP в alive-test (мс). Default 4000: 2000 убивал 18/45 РАБОЧИХ узлов (ttfb 2061-6964ms)."
+        description: "Порог TTFB exit-IP в alive-test, мс"
         type: number
         default: 4000
 
@@ -199,7 +197,7 @@ jobs:
             --known-good-mode none \
             --split-bs-chs \
             --ping-ips-out data/ping_host_ips.json \
-            ${{ inputs.vless_only == true && '--vless-only' || '' }} \
+            ${{ (github.event_name != 'workflow_dispatch' || inputs.vless_only != false) && '--vless-only' || '' }} \
             --max-servers 0
 
       - name: Upload stage-pool artifact

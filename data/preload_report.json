@@ -1,10 +1,10 @@
 {
-  "timestamp": 1791507698,
-  "total_sources": 147,
+  "timestamp": 1791652068,
+  "total_sources": 146,
   "failed_sources": [
     "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL"
   ],
-  "nodes_collected": 98211,
-  "ping_filter_applied": false,
+  "nodes_collected": 13090,
+  "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

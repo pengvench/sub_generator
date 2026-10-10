@@ -17,6 +17,7 @@
 # === БС (БЕЛЫЙ СПИСОК — для мобилки РФ) ===================================
 # SNI из белого списка: sberbank.ru, vk.com, gosuslugi.ru, ...
 # =========================================================================
+https://hub.mos.ru/akelladejavu/bunker/-/raw/main/WHITE_LIST.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt
@@ -55,12 +56,15 @@ https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/
 https://gitverse.ru/api/repos/bikinitw22/apelsintel/raw/branch/main/alive_bs.txt
 https://etoneya.su/whitelist
 https://whitelist.etoneya.baby
+https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/WlSubPiz.txt
 https://raw.githubusercontent.com/Diversan313/apex-parser/main/subs/main/alive_bs.txt
 # =========================================================================
 # === ЧС (ЧЁРНЫЙ СПИСОК — для WiFi / не-RU) ================================
 # SNI из чёрного списка: instagram.com, chatgpt.com, discord.com, ...
 # Эти конфиги НЕ работают на мобильной сети РФ (ТСПУ блокирует).
 # =========================================================================
+https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/sub.txt
+https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLACK_LIST.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_SS+All_RUS.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt
@@ -79,6 +83,8 @@ https://raw.githubusercontent.com/ksenkovsolo/HardVPN-bypass-WhiteLists-/refs/he
 # === MIXED (без явного маркера — по умолчанию БС) =========================
 # Источники, где в названии нет black/white. Все узлы попадут в БС.
 # =========================================================================
+https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/Mixer
+https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLWL_MIX.txt
 https://translate.yandex.ru/translate?url=https://raw.githubusercontent.com/ShadowException/VPN/refs/heads/main/configs/VPN-cat
 https://github.com/Epodonios/v2ray-configs/raw/main/All_Configs_base64_Sub.txt
 https://raw.githubusercontent.com/ANT1VEN0M/PODVAL-KOTA-VPN-/refs/heads/main/PODVALMIX.txt

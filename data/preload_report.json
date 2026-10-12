@@ -1,11 +1,10 @@
 {
-  "timestamp": 1791746918,
+  "timestamp": 1791764569,
   "total_sources": 153,
   "failed_sources": [
-    "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL",
-    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLWL_MIX.txt"
+    "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL"
   ],
-  "nodes_collected": 12356,
+  "nodes_collected": 12029,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

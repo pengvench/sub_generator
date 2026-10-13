@@ -41,8 +41,10 @@ data/happ_keys/*
 !data/pool_bs.txt
 !data/pool_chs.txt
 !data/preload_report.json
-!data/alive_test_report.json
-!data/alive_test_chs_report.json
+# Alive-отчёты — только в CI-artifacts, НЕ в git (v13: сплошной
+# `git add data/` возвращал их с диска после untrack — 148+931 МБ истории).
+data/alive_test_report.json
+data/alive_test_chs_report.json
 !data/source_map.json
 !data/sources.txt
 !data/known_good.txt

@@ -21,7 +21,8 @@
 #      SOCKS5 + HTTP-пробы через прокси (exit-IP api.ipify.org +
 #      ig/yt/tg; порог --max-latency-ms на TTFB пробы exit-IP).
 #   4. publish — merge результатов, fallback'и, base64 → subs.txt /
-#      subs_chs.txt, коммит в main (git-auto-commit).
+#      subs_chs.txt, коммит в main (явный git, v13: если main уехал за
+#      время прогона — перенос изменений прогона на свежий main).
 #
 # ТАЙМАУТЫ НА JOB'Ы УБРАНЫ (v11): в v9 при разбивке монолита я проставил
 # timeout-minutes 45/30/15 — их никто не просил, и refresh валился на
@@ -47,7 +48,13 @@
 #     БОЛЬШЕ НЕ КОММИТЯТСЯ (инцидент 2026-10-09: 148 МБ + 931 МБ — push
 #     отклонён лимитом GitHub 100 МБ/файл). С v8 в отчётах вообще НЕТ тел
 #     HTTP-проб (только коды и фазы) — отчёт ~1 КБ/узел, живёт в
-#     artifact'ах (90 дней), из репо вычищается (git rm --cached).
+#     artifact'ах (90 дней). v13: отчёты явно в .gitignore, publish
+#     коммитит только явный список файлов (сплошной git add data/
+#     возвращал их с диска — untrack был no-op, 148+931 МБ истории).
+#   - Publish (v13, инцидент 2026-10-13): push падал non-fast-forward —
+#     main был force-push'нут ВО ВРЕМЯ прогона, git-auto-commit не умеет
+#     подтягивать уехавший main. Теперь: перенос изменений прогона на
+#     свежий main (reset+selective add), push не падает.
 #   - latency-порог alive-test применяется к ОДНОЙ величине (TTFB exit-IP);
 #     вход workflow max_latency_ms (default 4000: 2000 убивал 18/45
 #     РАБОЧИХ узлов, ttfb 2061-6964ms).
@@ -603,9 +610,9 @@ jobs:
           if [ ! -f subs_chs.txt ]; then
             > subs_chs.txt
           fi
-          # Force-add data/ файлы — .gitignore содержит data/*, без -f
-          # git-auto-commit НЕ видит новые файлы. Отчёты сознательно НЕ
-          # добавляем (см. выше).
+          # Force-add data/ файлов (полный список коммитимых файлов —
+          # в шаге Publish ниже). Отчёты alive-test СОЗНАТЕЛЬНО не
+          # добавляем: только artifacts (v13: и явно в .gitignore).
           for f in data/tg_subs.txt data/preload_bs.txt data/preload_chs.txt \
                    data/pool_bs.txt data/pool_chs.txt data/geo_cache.json \
                    data/preload.txt data/preload_report.json \
@@ -642,11 +649,67 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
-      - name: Commit & push if changed
-        id: autocommit
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "auto: refresh subs (preload + subs + report)"
-          file_pattern: "data/ subs.txt subs_chs.txt"
-          commit_user_name: "github-actions[bot]"
-          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+      - name: "Publish: commit + sync + push"
+        # Замена stefanzweifel/git-auto-commit-action@v5 (инцидент
+        # 2026-10-13): action не умеет подтягивать main, уехавший за время
+        # прогона (force-push), и его push падал non-fast-forward. Теперь:
+        # селективный add (только файлы пайплайна — отчёты больше НЕ
+        # коммитятся) → фиксация списка изменений → fetch → если main
+        # уехал, перенос изменений на свежий main → push.
+        # HEAD:refs/heads/main вместо main — работает и из detached HEAD.
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Коммитим ТОЛЬКО файлы пайплайна, НЕ data/ целиком: сплошной add
+          # затаскивал alive-отчёты обратно с диска сразу после untrack-ритуала
+          # (инцидент 148+931 МБ истории). Отчёты живут в artifacts.
+          FILES="data/tg_subs.txt data/preload.txt data/preload_bs.txt data/preload_chs.txt \
+          data/preload_bs_alive.txt data/preload_chs_alive.txt \
+          data/pool_bs.txt data/pool_chs.txt data/preload_report.json \
+          data/ping_host_ips.json data/source_map.json data/sni_whitelist.txt \
+          data/geo_cache.json subs.txt subs_chs.txt"
+          for f in $FILES; do
+            if [ -f "$f" ] || git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              git add -f -- "$f"
+            fi
+          done
+
+          # Что изменил прогон (для переноса, если main уедет за время прогона).
+          git -c core.quotePath=false diff --cached --name-only -z > /tmp/publish_changed.z
+
+          git fetch origin
+
+          if git merge-base --is-ancestor HEAD origin/main; then
+            # main не уезжал — обычный путь.
+            if [ -s /tmp/publish_changed.z ]; then
+              git commit -m "auto: refresh subs (preload + subs + report)" \
+                --author="pengvench <47566889+pengvench@users.noreply.github.com>"
+              echo "[publish] commit: $(git rev-parse --short HEAD)"
+            else
+              echo "[publish] изменений нет"
+            fi
+          else
+            # main уехал за время прогона (инцидент 2026-10-13: force-push во
+            # время 40-минутного рана, push падал non-fast-forward). Переносим
+            # ИЗМЕНЁННЫЕ прогоном файлы на свежий main: код и чужие правки данных
+            # (sources.txt и т.п.) не трогаем, данные прогона приоритетны.
+            echo "[publish] main уехал за время прогона — переношу изменения на свежий main"
+            git reset --mixed origin/main
+            while IFS= read -r -d '' f; do
+              git add -f -A -- "$f" 2>/dev/null || true
+            done < /tmp/publish_changed.z
+            # Пара к untrack-шагу выше: отчёты не возвращаются в git.
+            git rm --cached --ignore-unmatch -q \
+              data/alive_test_report.json data/alive_test_chs_report.json || true
+            if git diff --cached --quiet; then
+              echo "[publish] изменения уже в main — нечего коммитить"
+            else
+              git commit -m "auto: refresh subs (preload + subs + report)" \
+                --author="pengvench <47566889+pengvench@users.noreply.github.com>"
+              echo "[publish] commit: $(git rev-parse --short HEAD)"
+            fi
+          fi
+
+          git push origin HEAD:refs/heads/main

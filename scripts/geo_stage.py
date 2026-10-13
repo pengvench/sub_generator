@@ -15,7 +15,10 @@
      НЕ делается.
   4. Дропает неопределившиеся «🌐 peppo» (поведение drop-geo-fallback
      из refresh_subs.py; опция --keep-unknown оставляет их).
-  5. Перезаписывает пулы (header-строка сохраняется), flush кеша.
+  5. [v12] Переносит «🇷🇺 RU»-узлы из ЧС-пула в БС-пул (--ru-from/--ru-to):
+     после определения флага по geoip никаких RU-серверов в ЧС не остаётся
+     (вердикт владельца: ЧС = WiFi/не-RU, RU-сервер там бесполезен).
+  6. Перезаписывает пулы (header-строка сохраняется), flush кеша.
 
 Пустые пулы (0 узлов) не трогаются — файл остаётся как есть.
 Выход: 0 — ок; 1 — ни одного читаемого пула.
@@ -71,6 +74,56 @@ def write_pool(path: Path, header: str, nodes: list) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _node_country(node) -> str:
+    """ISO-код из имени «🇩🇪 DE peppo» (после geo-rename). '' если формата нет.
+
+    Формат ставит _geo_rename_nodes: "<флаг> <ISO> peppo" (страна либо от
+    цепочки ip.sb→ip-api→ipwho, либо извлечена из исходного имени узла).
+    """
+    parts = (node.name or "").split()
+    if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha() and parts[1].isupper():
+        return parts[1]
+    return ""
+
+
+def _move_ru_to_bs(pools: list, chs_path: Path, bs_path: Path) -> int:
+    """Перенести «🇷🇺 RU»-узлы из ЧС-пула в БС-пул (in-place по pools).
+
+    Вердикт владельца (2026-10-13): никаких RU-серверов в ЧС-подписке —
+    все RU только в БС. Вызывается ПОСЛЕ _geo_rename_nodes (страна уже
+    определена по geoip) и ПОСЛЕ drop-unknown (у «🌐 peppo» страны нет).
+    Возвращает число перенесённых узлов. БС-пул может быть 0-узловым
+    (main() его скипнул) — запись создаётся здесь, файл перезапишется.
+    """
+    def find(path: Path) -> int | None:
+        want = path.resolve()
+        for i, (p, _, _) in enumerate(pools):
+            if p.resolve() == want:
+                return i
+        return None
+
+    chs_i = find(chs_path)
+    if chs_i is None:
+        log(f"ru-move: ЧС-пул {chs_path} пуст/отсутствует — переносить нечего")
+        return 0
+    bs_i = find(bs_path)
+    if bs_i is None:
+        header, _ = read_pool(bs_path)
+        pools.append((bs_path, header, []))
+        bs_i = len(pools) - 1
+        log(f"ru-move: БС-пул {bs_path} был 0-узловым — создан для приёма")
+
+    ru = [n for n in pools[chs_i][2] if _node_country(n) == "RU"]
+    if not ru:
+        log(f"ru-move: в {chs_path.name} нет «🇷🇺 RU» узлов — нечего переносить")
+        return 0
+    pools[chs_i] = (pools[chs_i][0], pools[chs_i][1],
+                    [n for n in pools[chs_i][2] if _node_country(n) != "RU"])
+    pools[bs_i][2].extend(ru)
+    log(f"ru-move: {len(ru)} «🇷🇺 RU» {chs_path.name} → {bs_path.name} "
+        f"(ЧС: {len(pools[chs_i][2])} ост., БС: {len(pools[bs_i][2])} стало)")
+    return len(ru)
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description="Geo-этап: rename «flag ISO peppo» + drop unknown")
     p.add_argument("--pool", type=Path, action="append", required=True,
@@ -85,7 +138,16 @@ def main(argv: list[str]) -> int:
     p.add_argument("--timeout", type=float, default=8.0)
     p.add_argument("--keep-unknown", action="store_true",
                    help="НЕ дропать «🌐 peppo» (узлы без гео после всей цепочки).")
+    p.add_argument("--ru-from", type=Path, default=None,
+                   help="ЧС-пул: узлы «🇷🇺 RU» после geo-rename переносятся "
+                        "в БС-пул (--ru-to). Никаких RU-серверов в ЧС.")
+    p.add_argument("--ru-to", type=Path, default=None,
+                   help="БС-пул: приёмник RU-узлов из --ru-from. "
+                        "Оба флага задаются вместе.")
     args = p.parse_args(argv)
+    if bool(args.ru_from) != bool(args.ru_to):
+        log("ОШИБКА: --ru-from и --ru-to задаются вместе (или оба не заданы)")
+        return 1
 
     # --- known IPs с пинга (без повторного DNS) ---
     known_ips: dict[str, str] = {}
@@ -140,6 +202,12 @@ def main(argv: list[str]) -> int:
         after = sum(len(ns) for _, _, ns in pools)
         log(f"drop-unknown: «🌐 peppo» выброшено {before - after} "
             f"(было {before}, осталось {after})")
+
+    # --- RU → БС (v12: после определения флага по geoip) ---
+    # Вердикт владельца: ЧС = WiFi/не-RU — RU-сервер в ЧС бесполезен.
+    # Переносим ПОСЛЕ rename (страна уже определена) и ПОСЛЕ drop-unknown.
+    if args.ru_from or args.ru_to:
+        _move_ru_to_bs(pools, args.ru_from, args.ru_to)
 
     # --- пишем ---
     for pth, hdr, ns in pools:

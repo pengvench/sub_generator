@@ -15,6 +15,8 @@
 #   2. geo — geo_stage.py: rename «🇩🇪 DE peppo» (цепочка ip.sb→ip-api→
 #      ipwho) + drop «🌐 peppo» + персистентный кеш data/geo_cache.json.
 #      IP-хосты берёт из ping_host_ips.json (без повторного DNS).
+#      v12: «🇷🇺 RU»-узлы переносятся из preload_chs в preload_bs
+#      (после определения флага; никаких RU-серверов в ЧС).
 #   3. alive-bs / alive-chs — ПАРАЛЛЕЛЬНО после geo: sing-box/xray
 #      SOCKS5 + HTTP-пробы через прокси (exit-IP api.ipify.org +
 #      ig/yt/tg; порог --max-latency-ms на TTFB пробы exit-IP).
@@ -52,6 +54,9 @@
 #   - Порог TCP-ping --max-ping-ms: 2000 (владелец: 1000 слишком жёстко;
 #     замер GHA: p50=173ms p95=424ms max=997ms у живых). --ping-timeout 2.5
 #     поднят с 1.5 — иначе порог 2000 мёртв (timeout убивает connect раньше).
+#   - RU-серверы — ТОЛЬКО в БС (v12, вердикт владельца 2026-10-13): после
+#     geoip «🇷🇺 RU»-узлы уезжают из preload_chs в preload_bs (geo_stage.py
+#     --ru-from/--ru-to). ЧС = WiFi/не-RU, RU-сервер там бесполезен.
 #   - Гео (job geo): цепочка api.ip.sb → ip-api.com → ipwho.is (метаданные,
 #     НЕ критерий жизни). Узлы «🌐 peppo» отбрасываются (инпут
 #     drop_geo_fallback; выключить — Run workflow → drop_geo_fallback=false).
@@ -248,6 +253,8 @@ jobs:
         # кеш data/geo_cache.json) и «🌐 peppo» выбрасывается (кроме
         # --keep-unknown; инпут drop_geo_fallback как раньше).
         # IP-хосты — из ping_host_ips.json (захвачены пингом, без DNS).
+        # v12: «🇷🇺 RU»-узлы переносятся из preload_chs в preload_bs —
+        # никаких RU-серверов в ЧС (вердикт владельца 2026-10-13).
         #
         # schedule-safe + фикс идиомы (2026-10-09): `X && '' || Y` в GHA
         # даёт Y ВСЕГДА (пустая строка falsy) — --keep-unknown
@@ -263,6 +270,8 @@ jobs:
             --known-ips data/ping_host_ips.json \
             --workers 32 \
             --timeout 8.0 \
+            --ru-from data/preload_chs.txt \
+            --ru-to data/preload_bs.txt \
             ${{ (github.event_name == 'workflow_dispatch' && inputs.drop_geo_fallback == false) && '--keep-unknown' || '' }}
           echo "=== preload_bs.txt (first 3) ==="
           head -n 3 data/preload_bs.txt 2>/dev/null || true

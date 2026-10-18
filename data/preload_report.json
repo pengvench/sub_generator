@@ -1,12 +1,13 @@
 {
-  "timestamp": 1792337556,
+  "timestamp": 1792354571,
   "total_sources": 153,
   "failed_sources": [
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
     "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL",
+    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLACK_LIST.txt",
     "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all"
   ],
-  "nodes_collected": 14544,
+  "nodes_collected": 12593,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

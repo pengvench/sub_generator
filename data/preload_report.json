@@ -1,12 +1,14 @@
 {
-  "timestamp": 1792293005,
+  "timestamp": 1792319521,
   "total_sources": 153,
   "failed_sources": [
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
     "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL",
-    "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all"
+    "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all",
+    "https://jamshut.online/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2FTWwySWs3LDE3OTIyOTc5NzkXaX7lP4U2A/auto",
+    "https://jamshut.online/exec?url=http%3A%2F%2F77.110.104.181%3A5002%2Fsub%2FQW53Unk1LDE3OTIyNjQyNDMPgh39CQBFA/auto"
   ],
-  "nodes_collected": 12308,
+  "nodes_collected": 12122,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

@@ -25,6 +25,13 @@ User-Agent (v6): все HTTP-пробы идут с UA обычного Chrome (
 v2rayNG/1.10.8 (runtime/types.py: SUBSCRIPTION_USER_AGENT) — подписочные
 серверы гейтят unknown-клиентов по UA.
 
+Честные флаги (v9): гео-этап (geo_stage.py) ставит «🇩🇪 DE peppo» по IP
+ХОСТА — endpoint'у, к которому подключаемся. У relay/CDN-узлов страна
+ВЫХОДА трафика другая (инцидент 2026-10-16: узел «🇷🇺 RU peppo», реальный
+exit-IP — Хельсинки). Проба exit-IP уже знает настоящую страну — живые
+узлы переименовываются по ней перед записью output (см. блок geo-fix
+в main). Гео exit-IP не определилась — имя не трогается.
+
 Запуск:
   python scripts/alive_test.py \\
       --input data/preload_bs.txt \\
@@ -33,8 +40,9 @@ v2rayNG/1.10.8 (runtime/types.py: SUBSCRIPTION_USER_AGENT) — подписоч�
       --workers 16
 
 Артефакты:
-  <output> — только alive-узлы (исходные URL, порядок входа сохранён
-             при сортировке по latency);
+  <output> — только alive-узлы (URL с честным именем «<флаг> <ISO> peppo»
+             по стране exit-IP — v9; порядок входа сохранён при
+             сортировке по latency);
   <report> — JSON-отчёт со статусами и фазами всех проб. ТЕЛА ОТВЕТОВ
              В ОТЧЁТЕ НЕ ХРАНЯТСЯ (v8): exit-IP извлекается из тела
              ipify-пробы на лету и возвращается из _curl_probe ОТДЕЛЬНО
@@ -127,6 +135,18 @@ def _geo_lookup_code(ip: str) -> tuple[str, str]:
         return geoip_lookup(ip, timeout=6.0)
     except Exception:
         return ("??", "")
+
+
+def _iso_from_name(name: str) -> str:
+    """ISO-код из имени «🇩🇪 DE peppo» (формат geo-этапа). '' если формата нет.
+
+    Тот же парсер, что geo_stage._node_country (продублирован, чтобы
+    alive_test не тянул refresh_subs ради одной функции).
+    """
+    parts = (name or "").split()
+    if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha() and parts[1].isupper():
+        return parts[1]
+    return ""
 
 
 def _curl_probe(listen_port: int, url: str, timeout: float) -> tuple[dict, str]:
@@ -557,11 +577,61 @@ def main(argv: list[str]) -> int:
         log(f"[alive] FINAL --final-limit: {alive_count} → {args.final_limit} (по TTFB)")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- v9: честные флаги — имя по фактической стране exit-IP ---
+    # Гео-этап ставит «🇩🇪 DE peppo» по IP ХОСТА (endpoint подключения),
+    # но у relay/CDN-узлов трафик ВЫХОДИТ из другой страны (инцидент
+    # 2026-10-16: «🇷🇺 RU peppo» с exit-IP в Хельсинки — юзер выбирает
+    # «российский» узел под РФ-сервисы и получает финский). Проба exit-IP
+    # уже измерила настоящую страну (results[url].country). Переименовываем
+    # ТОЛЬКО alive-узлы (dead в подписку не попадают):
+    #   country известна  → «<флаг> <ISO> peppo» (даже если было «🌐 peppo»);
+    #   country неизвестна → имя НЕ трогаем (лучше старое, чем мусор).
+    alive_set = set(alive_urls)
+    try:
+        from subgen.geo import set_node_name, country_flag
+        can_rename = True
+    except ImportError:
+        can_rename = False
+        log("[alive] WARNING: subgen.geo недоступен — флаги по exit-IP не выставлены")
+
+    if can_rename and alive_count > 0:
+        renamed = mismatched = unknown_geo = 0
+        # Бюджет на повторные гео-запросы: в прогоне цепочка могла лечь
+        # под rate-limit (32 параллельных воркера); сейчас кеш горячий,
+        # запросы последовательны — шансов пробиться больше.
+        retry_deadline = time.monotonic() + 60.0
+        for n, url in nodes:
+            if url not in alive_set:
+                continue
+            r = results[url]
+            code = r.get("country") or ""
+            if (not code or code in ("??", "🌐")) and r.get("exit_ip") \
+                    and time.monotonic() < retry_deadline:
+                code, _flag = _geo_lookup_code(r["exit_ip"])
+            if not code or code in ("??", "🌐"):
+                unknown_geo += 1
+                continue
+            code = code.strip().upper()
+            old_iso = _iso_from_name(n.name)
+            new_name = f"{country_flag(code)} {code} peppo"
+            if old_iso != code:
+                mismatched += 1
+                log(f"[alive] geo-fix: «{n.name}» → «{new_name}» "
+                    f"(гео хоста: {old_iso or '?'}, exit-IP: {r.get('exit_ip', '?')})")
+            set_node_name(n, new_name)
+            renamed += 1
+        log(f"[alive] geo-fix: {renamed} узлов с честным флагом по exit-IP "
+            f"({mismatched} исправлено — гео хоста врала, "
+            f"{unknown_geo} без гео — имя не тронуто)")
+
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} | "
                 f"{alive_count} alive nodes | tested: {len(nodes)}\n")
         for url in alive_urls:
-            f.write(url + "\n")
+            # raw_url, не исходный url: после geo-fix (v9) имя узла
+            # во фрагменте обновлено на страну exit-IP.
+            f.write(node_by_url[url].raw_url + "\n")
     log(f"[alive] wrote {alive_count} alive nodes to {args.output}")
 
     report = {

@@ -1,5 +1,5 @@
 {
-  "timestamp": 1792925593,
+  "timestamp": 1792942961,
   "total_sources": 153,
   "failed_sources": [
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
@@ -10,7 +10,7 @@
     "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLWL_MIX.txt",
     "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all"
   ],
-  "nodes_collected": 12109,
+  "nodes_collected": 11851,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

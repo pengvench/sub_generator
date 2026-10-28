@@ -1,16 +1,17 @@
 {
-  "timestamp": 1793189746,
+  "timestamp": 1793218354,
   "total_sources": 153,
   "failed_sources": [
-    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/WHITE_LIST.txt",
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
-    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLACK_LIST.txt",
-    "https://hub.mos.ru/nfajih/wildvf/-/raw/main/WVFBLACK",
+    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/WHITE_LIST.txt",
     "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL",
+    "https://hub.mos.ru/nfajih/wildvf/-/raw/main/WVFBLACK",
+    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLACK_LIST.txt",
+    "https://github.com/Epodonios/v2ray-configs/raw/main/All_Configs_base64_Sub.txt",
     "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLWL_MIX.txt",
     "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all"
   ],
-  "nodes_collected": 12060,
+  "nodes_collected": 12140,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

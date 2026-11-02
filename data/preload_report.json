@@ -1,16 +1,20 @@
 {
-  "timestamp": 1793578959,
+  "timestamp": 1793616172,
   "total_sources": 153,
   "failed_sources": [
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
     "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL",
     "https://github.com/Epodonios/v2ray-configs/raw/main/All_Configs_base64_Sub.txt",
     "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all",
+    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLWL_MIX.txt",
+    "https://walide.ru/exec?url=http%3A%2F%2F144.31.5.17%3A5051%2Fecnnqn%2Fsub%2FY0VraDc3LDE3OTM1NTkwNDUZOU5V1o-Cf/auto",
     "https://jamshut.online/exec?url=http%3A%2F%2F144.31.5.17%3A5051%2Fecnnqn%2Fsub%2FRDNnT3pPLDE3OTM1NTA1NjUMFTjWJw8N_/auto",
-    "https://jamshut.online/exec?url=http%3A%2F%2F144.31.5.17%3A5051%2Fecnnqn%2Fsub%2FZ0Q0alc2LDE3OTM1NDA0NjcXYlgizcUXk/auto",
-    "https://sub.vlessfo.ru/vlessforu/working_configs.txt"
+    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/BLACK_LIST.txt",
+    "https://sub.vlessfo.ru/vlessforu/working_configs.txt",
+    "https://hub.mos.ru/nfajih/wildvf/-/raw/main/WVFBLACK",
+    "https://hub.mos.ru/akelladejavu/bunker/-/raw/main/WHITE_LIST.txt"
   ],
-  "nodes_collected": 11779,
+  "nodes_collected": 11811,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

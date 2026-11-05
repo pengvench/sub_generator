@@ -1,15 +1,16 @@
 {
-  "timestamp": 1793841974,
+  "timestamp": 1793874640,
   "total_sources": 153,
   "failed_sources": [
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
     "https://raw.githubusercontent.com/ tankist939-afk/Obhod-WL/refs/heads/main/Obhod%20WL",
     "https://github.com/Epodonios/v2ray-configs/raw/main/All_Configs_base64_Sub.txt",
     "https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all",
-    "https://walide.ru/exec?url=http%3A%2F%2F144.31.5.17%3A5051%2Fecnnqn%2Fsub%2FNFBzM0dvLDE3OTM4MTI1OTc8e2SSbhZF3/auto",
-    "https://walide.ru/exec?url=http%3A%2F%2F144.31.5.17%3A5051%2Fecnnqn%2Fsub%2FU2NpcHBELDE3OTM3OTgzMzEsraVUHO2Ub/auto"
+    "https://walide.ru/exec?url=http%3A%2F%2F144.31.5.17%3A5051%2Fecnnqn%2Fsub%2FUjR2REowLDE3OTM4MjEwNDQBsbTb8LpR_/auto",
+    "https://doroguuuuu.ru/exec?url=http%3A%2F%2F144.31.5.17%3A5051%2Fecnnqn%2Fsub%2FY2p0a3FyLDE3OTM4NTg1NDAGsQIQfN3_9/auto",
+    "https://walide.ru/exec?url=http%3A%2F%2F144.31.5.17%3A5051%2Fecnnqn%2Fsub%2FNFBzM0dvLDE3OTM4MTI1OTc8e2SSbhZF3/auto"
   ],
-  "nodes_collected": 11656,
+  "nodes_collected": 11885,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

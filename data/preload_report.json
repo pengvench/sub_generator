@@ -1,14 +1,14 @@
 {
-  "timestamp": 1794164310,
-  "total_sources": 150,
+  "timestamp": 1794166133,
+  "total_sources": 159,
   "failed_sources": [
     "https://gitverse.ru/api/repos/gidro/white/raw/branch/master/subscription.txt",
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RosTun/utf-8_gen.txt#RosTunnel",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/Zieng2%2FZieng2_vless_lite.txt",
-    "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/Zieng2%2FZieng2_NowMeow.txt",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN%2FRKP_work.txt",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN%2FRKP_Check.txt",
+    "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/OutlineVPN%2FOutlineVPN.txt",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/KvRuVPN%2FKvRuVPN.txt",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/EtoNeYa%2FEtoNeYa_wl.txt",
     "https://panel.elix.lol/api/sub/MvrYyN9U5XS8AuAp",
@@ -17,12 +17,9 @@
     "https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/sub.txt",
     "https://warp-gen.cyb-portal.org/CP-016",
     "https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/Mixer",
-    "https://warp-gen.cyb-portal.org/CP-026",
-    "https://gitverse.ru/api/repos/soulcoil/Haven/raw/branch/master/Haven",
-    "https://mifa.world/bober",
-    "https://mifa.world/ronin"
+    "https://gitverse.ru/api/repos/soulcoil/Haven/raw/branch/master/Haven"
   ],
-  "nodes_collected": 11312,
+  "nodes_collected": 11105,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

@@ -27,13 +27,13 @@ User-Agent GHA уже был v2rayNG/1.10.8 и сохранён. В загруз
 - https://gitverse.ru/api/repos/Akres/VPN/raw/branch/master/all
   HTTP 400: репозиторий Akres/VPN отсутствует. Подтверждено с ПК и в нескольких прогонах GHA; ответы 429 отдельно не считались доказательством удаления.
 - https://freevpnhappcluchi.duckdns.org/sub/lew1ik2xiuohs9v3
-  Не отдаёт тело: TLS-сбой напрямую, тайм-аут через Karing; те же тайм-ауты в четырёх последовательных прогонах GHA 7–8 ноября.
+  Не отдаёт тело: TLS-сбой напрямую, тайм-аут через Karing; сетевые отказы в четырёх последовательных прогонах GHA 7–8 ноября.
 - https://freevpnhappcluchi.duckdns.org/sub/o20pq89rdo9e7afo
-  Не отдаёт тело: TLS-сбой напрямую, тайм-аут через Karing; те же тайм-ауты в четырёх последовательных прогонах GHA 7–8 ноября.
+  Не отдаёт тело: TLS-сбой напрямую, тайм-аут через Karing; сетевые отказы в четырёх последовательных прогонах GHA 7–8 ноября.
 - https://freevpnhappcluchi.duckdns.org/sub/c32dw5mfut31f3ri
-  Не отдаёт тело: TLS-сбой напрямую, тайм-аут через Karing; те же тайм-ауты в четырёх последовательных прогонах GHA 7–8 ноября.
+  Не отдаёт тело: TLS-сбой напрямую, тайм-аут через Karing; сетевые отказы в четырёх последовательных прогонах GHA 7–8 ноября.
 - https://freevpnhappcluchi.duckdns.org/sub/9kaf6wcp2eok5fbe
-  Не отдаёт тело: TLS-сбой напрямую, тайм-аут через Karing; те же тайм-ауты в четырёх последовательных прогонах GHA 7–8 ноября.
+  Не отдаёт тело: TLS-сбой напрямую, тайм-аут через Karing; сетевые отказы в четырёх последовательных прогонах GHA 7–8 ноября.
 
 ## Новые источники
 
@@ -68,3 +68,37 @@ CP-037 отдаёт 20 конфигов с ПК, хотя в последнем 
 Исправленный домашний экспорт использует только измеренные выходные IP конкретного узла. Узлы с выходами в разных странах и без подтверждённой страны не получают фиктивный флаг и не публикуются. Перенос RU в БС опирается на фактическую страну выхода. В GHA alive_test уже переименовывал по выходному IP; найденная ошибка касается домашнего экспортёра.
 
 Проверка источника означает получение разбираемого списка конфигов. Доступность каждого сервера проверяется отдельными существующими этапами GHA и домашней проверкой.
+
+## Применение
+
+Изменения списка и загрузчика опубликованы в main: d2504d7. На ПК установлены те же источники и загрузчик, а также исправленный домашний экспорт по выходным IP. Расписание подтверждено: ежедневно в 05:00 по Томску, ближайший запуск 9 ноября.
+
+Флаги в домашней публикации облака и GitHub/alive уже исправлены: переименовано 100 узлов, один узел с выходами в разных странах исключён. Итог: 148 узлов, БС — 9, ЧС — 139. Исправление использует измерения последнего успешного домашнего прогона от 8 ноября; доступность всех серверов заново не проверялась, дата последней проверки сохранена. Новые ключи и узлы при этом не добавлялись.
+
+Проверки кода: 4 проверки загрузчика (429/Retry-After/User-Agent/404/пустой ответ) и 2 проверки домашнего экспорта (разные выходы одного входного адреса, смена страны, отсутствие измерений, запрет старого гео-отчёта). Все пройдены.
+
+## Подтверждение на самом GHA
+
+[Новый запуск 187](https://github.com/pengvench/sub_generator/actions/runs/42511748469) работает на d2504d7. Этап refresh и геоэтап успешно завершены. Каждый из 18 различных адресов из сообщения пользователя (17 добавленных и один уже существовавший) отдал конфиги именно на GHA. Это подтверждено журналом штатного загрузчика с User-Agent v2rayNG/1.10.8.
+
+Полная проверка работоспособности отдельных VPN-серверов выполняется последующими alive-bs/alive-chs; она не нужна для подтверждения того, что URL подписки отдаёт список.
+
+HTTP 429 остался у 13 URL GitVerse после повторов; они сохранены как временно недоступные. Содержимое двух GitVerse-источников получено: TG-WLTGFF — 9 конфигов, OutlineVPN — 275. RKP_work вернул 200 с нулём конфигов в этом GHA; с ПК был 429, поэтому по одному пустому ответу он пока не удалён. panel.elix.lol также пуст на GHA, но с ПК через Karing отдаёт 2 конфига — источник сохранён.
+
+Решение сохранить перемежающиеся 502 подтверждено: CP-015 отдал на GHA 468 конфигов, CP-017 — 168, CP-030 — 267, несмотря на повторные 502 с ПК ранее. CP-016/026 в этом прогоне ответили 502; динамические mifa/bober и mifa/ronin завершились тайм-аутами.
+
+Подтверждённые 429 в новом GHA:
+
+- https://gitverse.ru/api/repos/gidro/white/raw/branch/master/subscription.txt
+- https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt
+- https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RosTun/utf-8_gen.txt#RosTunnel
+- https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/Zieng2%2FZieng2_vless_lite.txt
+- https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/Zieng2%2FZieng2_NowMeow.txt
+- https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN%2FRKP_Check.txt
+- https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/KvRuVPN%2FKvRuVPN.txt
+- https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/EtoNeYa%2FEtoNeYa_wl.txt
+- https://gitverse.ru/api/repos/bikinitw22/apelsintel/raw/branch/main/alive_bs.txt
+- https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/WlSubPiz.txt
+- https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/sub.txt
+- https://gitverse.ru/api/repos/Pizduk/PizdukVPN/raw/branch/master/Mixer
+- https://gitverse.ru/api/repos/soulcoil/Haven/raw/branch/master/Haven

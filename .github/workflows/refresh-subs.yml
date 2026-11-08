@@ -681,7 +681,7 @@ jobs:
 
           git fetch origin
 
-          if git merge-base --is-ancestor HEAD origin/main; then
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
             # main не уезжал — обычный путь.
             if [ -s /tmp/publish_changed.z ]; then
               git commit -m "auto: refresh subs (preload + subs + report)" \

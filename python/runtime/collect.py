@@ -184,8 +184,10 @@ def _collect_from_source(
         if per_source_limit > 0 and source_added >= per_source_limit:
             break
 
+    if log_sink is not None:
+        log_sink(f"[xray] source content {source_url}: {len(source_nodes)} configs")
     if on_source_result is not None:
-        on_source_result(source_url, ok=True)
+        on_source_result(source_url, ok=bool(source_nodes))
 
     return source_nodes
 

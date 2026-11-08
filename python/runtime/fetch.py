@@ -12,6 +12,8 @@ from __future__ import annotations
 
 
 import contextlib
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import gzip
 import os
 import re
@@ -20,6 +22,8 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -31,6 +35,7 @@ from .types import SUBSCRIPTION_USER_AGENT
 
 # Встроенный абсолютный URL внутри строки-обёртки (https://proxy/https://inner).
 _EMBEDDED_URL_RE = re.compile(r"https?://", re.IGNORECASE)
+_GITVERSE_FETCH_LOCK = threading.Lock()
 
 
 def _fetch_text(
@@ -108,6 +113,36 @@ def _fetch_candidate_body(
     errors: list[str],
     log_sink: Callable[[str], None] | None = None,
 ) -> str | None:
+    # Avoid bursts to GitVerse, which serves many sources and may return 429.
+    if urlparse(url).hostname == "gitverse.ru":
+        with _GITVERSE_FETCH_LOCK:
+            try:
+                return _fetch_candidate_body_unlocked(url, headers, timeout, errors, log_sink)
+            finally:
+                time.sleep(1.0)
+    return _fetch_candidate_body_unlocked(url, headers, timeout, errors, log_sink)
+
+
+def _rate_limit_delay(value: str, attempt: int) -> float:
+    """Honor Retry-After seconds or HTTP dates, with a bounded per-request wait."""
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        try:
+            deadline = parsedate_to_datetime(value)
+            delay = (deadline - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            delay = 2.0 ** (attempt + 1)
+    return min(60.0, max(0.0, delay))
+
+
+def _fetch_candidate_body_unlocked(
+    url: str,
+    headers: dict[str, str],
+    timeout: float,
+    errors: list[str],
+    log_sink: Callable[[str], None] | None = None,
+) -> str | None:
     """Все попытки загрузки одного кандидата.
 
     Цепочка транспортов: (1) urllib-лестница растущих таймаутов, где
@@ -116,7 +151,8 @@ def _fetch_candidate_body(
     прокси и SChannel. Возвращает тело подписки или None, когда кандидат
     исчерпан всеми транспортами.
     """
-    for current_timeout in _subscription_timeouts(timeout):
+    timeouts = _subscription_timeouts(timeout)
+    for attempt, current_timeout in enumerate(timeouts):
         for context in _subscription_ssl_contexts():
             try:
                 req = Request(url, headers=headers)
@@ -125,6 +161,14 @@ def _fetch_candidate_body(
                     return _decode_subscription_body(resp.read(), encoding=encoding)
             except HTTPError as exc:
                 _record_fetch_error(errors, url, f"HTTP_{exc.code}")
+                if exc.code == 429:
+                    if attempt + 1 < len(timeouts):
+                        delay = _rate_limit_delay((exc.headers or {}).get("Retry-After", ""), attempt)
+                        if log_sink is not None:
+                            log_sink(f"[xray] source rate-limited {url}; retry in {delay:g}s")
+                        time.sleep(delay)
+                        break
+                    return None
                 if exc.code < 500:
                     # 4xx — окончательный отказ (нет прав / не существует):
                     # перебор таймаутов и SSL-контекстов исход не изменит,

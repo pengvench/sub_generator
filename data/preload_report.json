@@ -1,17 +1,13 @@
 {
-  "timestamp": 1794222180,
+  "timestamp": 1794261853,
   "total_sources": 159,
   "failed_sources": [
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN%2FRKP_work.txt",
     "https://panel.elix.lol/api/sub/MvrYyN9U5XS8AuAp",
-    "https://pozor.bond/sub/obforum",
-    "https://mifa.world/ronin",
-    "https://mifa.world/jetico",
-    "https://mifa.world/flash",
-    "https://mifa.world/vmess"
+    "https://pozor.bond/sub/obforum"
   ],
-  "nodes_collected": 11902,
+  "nodes_collected": 11647,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

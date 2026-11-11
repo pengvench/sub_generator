@@ -1,16 +1,14 @@
 {
-  "timestamp": 1794345728,
+  "timestamp": 1794372800,
   "total_sources": 159,
   "failed_sources": [
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN%2FRKP_work.txt",
-    "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt",
     "https://panel.elix.lol/api/sub/MvrYyN9U5XS8AuAp",
     "https://pozor.bond/sub/obforum",
-    "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist",
-    "https://0dceb06f.withblancvpn.online/s/a91b6cba9cec463cb20cbb8d17e71b35#BlancVPN"
+    "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist"
   ],
-  "nodes_collected": 12004,
+  "nodes_collected": 11484,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

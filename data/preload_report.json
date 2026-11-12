@@ -1,6 +1,6 @@
 {
-  "timestamp": 1794462921,
-  "total_sources": 160,
+  "timestamp": 1794494759,
+  "total_sources": 159,
   "failed_sources": [
     "https://gitverse.ru/api/repos/Pizduk/Test/raw/branch/master/Test.txt",
     "https://gitverse.ru/api/repos/ru-wbl/wl/raw/branch/master/RkpVPN%2FRKP_work.txt",
@@ -9,7 +9,7 @@
     "https://pozor.bond/sub/aic7epxbdnnc",
     "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist"
   ],
-  "nodes_collected": 11921,
+  "nodes_collected": 11886,
   "ping_filter_applied": true,
   "output": "data/preload.txt"
 }

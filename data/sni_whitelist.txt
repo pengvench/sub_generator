@@ -1,6 +1,6 @@
 # community-curated SNI whitelist for RU mobile operators (TSPU).
 # Source: https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/whitelist.txt
-# Synced: 2026-11-25 03:56:39 UTC
+# Synced: 2026-11-25 16:48:14 UTC
 # Entry count: 910
 # Total size: 15648 bytes
 #
